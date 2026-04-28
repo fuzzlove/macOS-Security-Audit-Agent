@@ -1,6 +1,6 @@
 # macOS Security Audit Agent
 
-Liquidsky Network Security (C)
+Liquidsky Network Security 🔒
 
 Mac Audit Agent is a local-first macOS security auditing app built with Python and PySide6. It focuses on transparent, read-only collection, baseline comparison, review tracking, and a desktop UI that helps an investigator understand what changed and what needs follow-up.
 
