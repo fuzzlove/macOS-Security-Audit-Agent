@@ -1,3 +1,6 @@
+<img width="408" height="200" alt="image" src="https://github.com/user-attachments/assets/c9e316c0-5529-4713-9574-080faa508698" />
+
+
 # macOS Security Audit Agent
 
 Liquidsky Network Security 🔒
