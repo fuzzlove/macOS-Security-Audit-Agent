@@ -1,4 +1,5 @@
-<img width="408" height="200" alt="image" src="https://github.com/user-attachments/assets/c9e316c0-5529-4713-9574-080faa508698" />
+<img width="408" height="200" alt="image" src="https://github.com/user-attachments/assets/73fc617c-b7c9-4fda-9883-1f2530e01403" />
+
 
 
 # macOS Security Audit Agent
