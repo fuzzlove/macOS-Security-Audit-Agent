@@ -156,7 +156,7 @@ class PrivacyMonitor:
                 )
             )
 
-        if current.camera_active_api:
+        if current.camera_active_api and not (previous and previous.camera_active_api):
             events.append(
                 self._event(
                     timestamp=timestamp,
@@ -170,6 +170,22 @@ class PrivacyMonitor:
                     rule=rule_for_event("camera_activity_confirmed"),
                     previous_state="camera inactive",
                     current_state="camera active signal present",
+                )
+            )
+        elif previous and previous.camera_active_api and not current.camera_active_api:
+            events.append(
+                self._event(
+                    timestamp=timestamp,
+                    event_type="camera_activity_stopped",
+                    severity="info",
+                    source="AVFoundation",
+                    evidence="Public AVFoundation APIs no longer report an active camera indication.",
+                    confidence="high",
+                    recommendation="Correlate the camera stop transition with the expected application lifecycle.",
+                    metadata={"authorization": current.camera_authorization},
+                    rule=rule_for_event("camera_activity_stopped"),
+                    previous_state="camera active signal present",
+                    current_state="camera inactive",
                 )
             )
         else:
@@ -195,7 +211,8 @@ class PrivacyMonitor:
                         current_state=str(item.get("name", "")),
                     )
                 )
-            if current.capture_capable_processes and current.camera_helper_processes:
+            previous_had_correlation = bool(previous and previous.capture_capable_processes and previous.camera_helper_processes)
+            if current.capture_capable_processes and current.camera_helper_processes and not previous_had_correlation:
                 app_names = ", ".join(sorted({str(item.get("name", "")) for item in current.capture_capable_processes if item.get("name")}))
                 helper_names = ", ".join(sorted({str(item.get("name", "")) for item in current.camera_helper_processes if item.get("name")}))
                 events.append(

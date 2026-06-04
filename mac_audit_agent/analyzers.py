@@ -20,6 +20,7 @@ from mac_audit_agent.models import (
     UserSnapshot,
     safe_int,
 )
+from mac_audit_agent.privacy import redact_text
 
 
 HISTORY_PATTERNS: list[tuple[str, str, str]] = [
@@ -52,18 +53,15 @@ TRUSTED_PREFIXES = ("/System/", "/usr/libexec/", "/usr/bin/", "/bin/", "/sbin/",
 
 
 def redact_sensitive_text(text: str, config: AuditConfig) -> str:
-    redacted = text
-    if config.redact_url_secrets:
-        redacted = re.sub(r"([?&](?:token|auth|key|secret|sig|signature|password)=)[^&\s]+", r"\1[REDACTED]", redacted, flags=re.IGNORECASE)
-    if config.redact_ips:
-        redacted = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "[REDACTED_IP]", redacted)
-    if config.redact_paths:
-        redacted = re.sub(r"/Users/[^/\s]+", "/Users/[REDACTED_USER]", redacted)
-        redacted = re.sub(r"~/(?:[^\s]+)", "~/[REDACTED_PATH]", redacted)
-    if config.redact_usernames:
-        redacted = re.sub(r"\buser(?:name)?\s*[=:]\s*[^\s]+", "user=[REDACTED]", redacted, flags=re.IGNORECASE)
-        redacted = re.sub(r"\b(?:su|sudo)\s+-u\s+[A-Za-z0-9._-]+", lambda m: m.group(0).rsplit(" ", 1)[0] + " [REDACTED_USER]", redacted)
-    return redacted
+    return redact_text(
+        text,
+        redact_usernames=config.redact_usernames,
+        redact_paths=config.redact_paths,
+        redact_ips=config.redact_ips,
+        redact_hostnames=getattr(config, "redact_hostnames", True),
+        redact_macs=getattr(config, "redact_macs", True),
+        redact_url_secrets=config.redact_url_secrets,
+    )
 
 
 def extract_history_indicators(history_text: str, source_path: str, shell_type: str, config: AuditConfig) -> list[HistoryIndicator]:

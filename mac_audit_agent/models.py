@@ -17,6 +17,7 @@ ReviewState = Literal["not reviewed", "reviewed", "needs follow-up", "false posi
 MonitorEventType = Literal[
     "camera_activity_suspected",
     "camera_activity_confirmed",
+    "camera_activity_stopped",
     "microphone_activity_suspected",
     "capture_capable_process_observed",
     "capture_capable_process_closed",
@@ -52,14 +53,49 @@ MonitorEventType = Literal[
     "launchdaemon_added",
     "localhost_hidden_port_detected",
     "new_admin_user_detected",
+    "protected_monitor_tamper_detected",
     "packet_capture_started",
     "packet_capture_completed",
     "usb_device_connected",
+    "bluetooth_device_connected",
     "system_moisture_detected",
     "network_ip_assigned",
+    "new_network_connection_detected",
+    "new_outbound_connection_detected",
+    "new_inbound_connection_detected",
+    "new_gateway_detected",
+    "new_dns_server_detected",
+    "vpn_disconnected",
     "vpn_connected",
+    "launchagent_removed",
+    "launchdaemon_removed",
+    "login_item_added",
+    "admin_user_removed",
+    "remote_login_enabled",
+    "screen_sharing_enabled",
+    "monitor_blindness_detected",
+    "detector_stopped",
+    "heartbeat_stale",
+    "db_not_updating",
+    "notifier_not_running",
+    "unexpected_process_execution",
+    "execution_evidence_detected",
+    "unsigned_process_from_temp",
+    "temp_process_with_network_connection",
+    "browser_spawned_shell",
+    "mail_spawned_shell",
+    "preview_spawned_shell",
+    "office_app_spawned_shell",
+    "low_trust_binary_executed",
+    "port_open_no_process_owner",
+    "new_listener_detected",
+    "reverse_shell_pattern_detected",
+    "persistence_after_execution",
+    "admin_change_after_execution",
     "major_security_event",
     "alert_storm_detected",
+    "monitor_self_impact_warning",
+    "input_activity_idle_started",
     "monitor_self_test",
     "monitor_test_event",
 ]
@@ -679,6 +715,10 @@ class BackgroundMonitorEvent:
     notification_reason: str = ""
     cooldown_remaining_seconds: int = 0
     popup_allowed: bool = False
+    visible_alert_shown: bool = False
+    alert_style: str = "neutral_grey"
+    cooldown_suppressed: bool = False
+    last_suppression_reason: str = ""
     metadata_json: str = "{}"
     rule_id: str = ""
     rule_name: str = ""
@@ -728,6 +768,79 @@ class BackgroundMonitorEvent:
                         self.recommended_verification_steps = list(rule.verification_steps)
         except Exception:
             pass
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class EventAlertTrace:
+    trace_id: str
+    event_id: str
+    event_type: str
+    original_event_type: str = ""
+    normalized_event_type: str = ""
+    detector_source: str = ""
+    created_at: str = field(default_factory=utc_now_iso)
+    stored_db_path: str = ""
+    stored_success: bool = False
+    notifier_db_path: str = ""
+    notifier_poll_seen: bool = False
+    notifier_poll_time: str = ""
+    notifier_cursor_before: str = ""
+    notifier_cursor_after: str = ""
+    notifier_seen: bool = False
+    notifier_seen_at: str = ""
+    notification_policy_checked: bool = False
+    notification_policy_result: str = ""
+    notification_policy_reason: str = ""
+    severity_before_policy: str = ""
+    severity_after_policy: str = ""
+    cooldown_checked: bool = False
+    cooldown_result: str = ""
+    alert_required: bool = False
+    alert_suppressed: bool = False
+    alert_suppression_reason: str = ""
+    alert_queue_enqueued: bool = False
+    alert_queue_length_before: int = 0
+    alert_queue_length_after: int = 0
+    overlay_dispatch_attempted: bool = False
+    overlay_dispatch_at: str = ""
+    overlay_dispatch_result: str = ""
+    overlay_error: str = ""
+    visible_alert_id: str = ""
+    displayed_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class NotificationCapabilities:
+    overlay_available: bool = False
+    applescript_dialog_available: bool = False
+    notification_center_available: bool = False
+    osascript_exists: bool = False
+    last_test_time: str = ""
+    last_test_result: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class AlertDeliveryRecord:
+    event_id: str
+    alert_type: str
+    overlay_attempted: bool = False
+    overlay_success: bool = False
+    dialog_attempted: bool = False
+    dialog_success: bool = False
+    notification_attempted: bool = False
+    notification_success: bool = False
+    delivery_method_used: str = ""
+    updated_at: str = field(default_factory=utc_now_iso)
+    payload_json: str = "{}"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

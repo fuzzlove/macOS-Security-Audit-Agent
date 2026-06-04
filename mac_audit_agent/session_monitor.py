@@ -217,6 +217,31 @@ class SessionMonitor:
                         current_state=f"idle={current.hid_idle_seconds:.1f}s",
                     )
                 )
+            elif (
+                0 <= previous.hid_idle_seconds < INPUT_IDLE_ALERT_SECONDS
+                and current.hid_idle_seconds >= INPUT_IDLE_ALERT_SECONDS
+            ):
+                events.append(
+                    self._event(
+                        timestamp=timestamp,
+                        event_type="input_activity_idle_started",
+                        severity="info",
+                        source="hid_idle_time",
+                        evidence=(
+                            f"Aggregate keyboard, mouse, and trackpad input has been idle for at least "
+                            f"{int(INPUT_IDLE_ALERT_SECONDS)} seconds (current idle {current.hid_idle_seconds:.1f}s)."
+                        ),
+                        confidence="high",
+                        recommendation="Correlate this aggregate HID idle transition with expected workstation activity.",
+                        metadata={
+                            "previous_hid_idle_seconds": previous.hid_idle_seconds,
+                            "current_hid_idle_seconds": current.hid_idle_seconds,
+                        },
+                        rule=rule_for_event("input_activity_idle_started"),
+                        previous_state=f"idle={previous.hid_idle_seconds:.1f}s",
+                        current_state=f"idle={current.hid_idle_seconds:.1f}s",
+                    )
+                )
 
         new_markers = sorted(current.recent_markers - previous.recent_markers) if previous is not None else []
         for marker in new_markers:

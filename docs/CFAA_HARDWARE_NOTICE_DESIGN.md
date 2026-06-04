@@ -2,7 +2,7 @@
 
 ## Scope
 
-The user-session LaunchAgent records all monitor events locally. Visible notices are intentionally narrower than event storage so routine informational activity does not train users to ignore warnings.
+The root-owned system LaunchDaemon records monitor events locally. A user-session LaunchAgent companion handles visible notices after login. Visible notices are intentionally narrower than event storage so routine informational activity does not train users to ignore warnings.
 
 ## Legal Notice
 
@@ -10,7 +10,7 @@ Visible security notices include an authorized-use reminder and state that the i
 
 ## Login Acknowledgment
 
-The long-running user LaunchAgent opens one authorized-use acknowledgment dialog per GUI login session. The detector loop continues while the dialog is open. Acceptance is recorded locally with the GUI audit-session identifier and timestamp. Restarting the monitor within the same GUI session does not display a second acknowledgment.
+The user notification companion opens one authorized-use acknowledgment dialog per GUI login session. The system daemon detector loop continues while the dialog is open. Acceptance is recorded locally with the GUI audit-session identifier and timestamp. Restarting the companion within the same GUI session does not display a second acknowledgment.
 
 ## CVE Notices
 
@@ -30,4 +30,4 @@ An explicit new marker records `system_moisture_detected` and sends a critical n
 
 ## Persistent Overlay
 
-When enabled, high and critical events update one persistent bottom-right overlay window. The overlay remains visible until acknowledged, does not replace local event storage, and groups repeated events of the same type into a counter. The monitor launches the overlay as a separate user-session process so detector polling continues while the overlay remains visible.
+When enabled, high and critical events update one persistent bottom-right overlay window. The overlay remains visible until acknowledged, does not replace local event storage, and groups repeated events of the same type into a counter. The user notification companion launches the overlay as a separate user-session process so system-daemon detector polling continues while the overlay remains visible.

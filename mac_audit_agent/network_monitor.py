@@ -118,6 +118,8 @@ class NetworkMonitor:
                 f"Detected at {timestamp}."
             )
             rule = rule_for_event("network_ip_assigned")
+            connection_rule = rule_for_event("new_network_connection_detected")
+            outbound_rule = rule_for_event("new_outbound_connection_detected")
             events.append(
                 self._event(
                     timestamp=timestamp,
@@ -138,6 +140,50 @@ class NetworkMonitor:
                     rule=rule,
                     previous_state=f"{previous.interface or 'no interface'} had {previous.ip_address or 'no IP'}",
                     current_state=f"{current.interface} assigned {current.ip_address}",
+                )
+            )
+            events.append(
+                self._event(
+                    timestamp=timestamp,
+                    event_type="new_network_connection_detected",
+                    severity="high",
+                    source="network_state_observer",
+                    evidence=f"New active network connection observed on {current.interface}: {current.ip_address} (gateway {current.gateway or 'unknown'}). Detected at {timestamp}.",
+                    confidence="high",
+                    recommendation="Confirm the new connection matches expected network activity.",
+                    metadata={
+                        "interface": current.interface,
+                        "ip_address": current.ip_address,
+                        "netmask": current.netmask,
+                        "gateway": current.gateway,
+                        "subnet": current.subnet,
+                        "scope": current.scope,
+                    },
+                    rule=connection_rule,
+                    previous_state=f"{previous.interface or 'no interface'} had {previous.ip_address or 'no IP'}",
+                    current_state=f"{current.interface} assigned {current.ip_address}",
+                )
+            )
+            events.append(
+                self._event(
+                    timestamp=timestamp,
+                    event_type="new_outbound_connection_detected",
+                    severity="high",
+                    source="network_state_observer",
+                    evidence=f"New outbound network path observed on {current.interface}: {current.ip_address} (gateway {current.gateway or 'unknown'}). Detected at {timestamp}.",
+                    confidence="high",
+                    recommendation="Confirm the outbound path matches expected host and network activity.",
+                    metadata={
+                        "interface": current.interface,
+                        "ip_address": current.ip_address,
+                        "netmask": current.netmask,
+                        "gateway": current.gateway,
+                        "subnet": current.subnet,
+                        "scope": current.scope,
+                    },
+                    rule=outbound_rule,
+                    previous_state=f"{previous.interface or 'no interface'} had {previous.ip_address or 'no IP'}",
+                    current_state=f"{current.interface} outbound path active",
                 )
             )
         previous_vpn = {self._vpn_signature(item) for item in previous.vpn_interfaces}
@@ -165,6 +211,32 @@ class NetworkMonitor:
                     rule=rule,
                     previous_state="no new vpn interface observed",
                     current_state=f"vpn interfaces present: {summary}",
+                )
+            )
+        removed_vpn = [item for item in previous.vpn_interfaces if self._vpn_signature(item) not in {self._vpn_signature(v) for v in current.vpn_interfaces}]
+        if removed_vpn:
+            summary = "; ".join(
+                f"{item.get('interface', '')} {item.get('ip_address', '')}".strip()
+                for item in removed_vpn[:3]
+            )
+            if len(removed_vpn) > 3:
+                summary += f"; and {len(removed_vpn) - 3} more"
+            rule = rule_for_event("vpn_disconnected")
+            events.append(
+                self._event(
+                    timestamp=timestamp,
+                    event_type="vpn_disconnected",
+                    severity="medium",
+                    source="network_state_observer",
+                    evidence=f"VPN connection removed: {summary}. Detected at {timestamp}.",
+                    confidence="high",
+                    recommendation="Confirm the VPN disconnect is expected and review nearby session events.",
+                    metadata={
+                        "vpn_interfaces": removed_vpn,
+                    },
+                    rule=rule,
+                    previous_state=f"vpn interfaces present: {summary}",
+                    current_state="no vpn interface observed",
                 )
             )
         return events

@@ -490,3 +490,17 @@ def test_storage_migration_preserves_existing_tables(tmp_path: Path) -> None:
     assert row is not None
     assert row["value"] == "preserve-me"
     assert db.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'apple_security_forecasts'").fetchone() is not None
+
+
+def test_system_monitor_db_permissions_are_admin_group_writable(tmp_path: Path, monkeypatch) -> None:
+    system_db = tmp_path / "Library" / "Application Support" / "MacAuditAgent" / "mac_audit_agent.sqlite3"
+    chown_calls = []
+    monkeypatch.setattr("mac_audit_agent.storage.SYSTEM_MONITOR_DB_PATH", system_db)
+    monkeypatch.setattr("mac_audit_agent.storage.grp.getgrnam", lambda _name: type("Group", (), {"gr_gid": 80})())
+    monkeypatch.setattr("mac_audit_agent.storage.os.chown", lambda path, uid, gid: chown_calls.append((Path(path), uid, gid)))
+
+    AuditDatabase(system_db, tmp_path / "logs")
+
+    assert (system_db, 0, 80) in chown_calls
+    assert system_db.stat().st_mode & 0o777 == 0o660
+    assert system_db.parent.stat().st_mode & 0o777 == 0o775

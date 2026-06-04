@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install ruff
+
+      - name: Lint
+        run: |
+          ruff check mac_audit_agent
+
+      - name: Format check
+        run: |
+          ruff format --check mac_audit_agent
+
+      - name: Compile check
+        run: |
+          python -m compileall -q mac_audit_agent
+
+      - name: Tests
+        run: |
+          python -m pytest -q
+
+      - name: Git diff check
+        run: |
+          git diff --check

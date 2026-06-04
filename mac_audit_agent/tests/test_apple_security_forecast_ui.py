@@ -14,7 +14,7 @@ def test_apple_security_forecast_shows_not_checked_on_startup(tmp_path: Path) ->
     app = QApplication.instance() or QApplication([])
     window = MainWindow(tmp_path / "audit.sqlite")
     assert window.cve_radar_panel.status_label.text() == "Forecast not checked yet"
-    assert "No forecast has been checked yet." in window.cve_radar_panel.reason_label.text()
+    assert "No Apple Security Forecast has been checked yet." in window.cve_radar_panel.reason_label.text()
     window.close()
     app.processEvents()
 
@@ -83,6 +83,7 @@ def test_forecast_buttons_have_widths_labels_and_tooltips() -> None:
         "update": panel.update_button,
         "diagnostics": panel.diagnostics_button,
         "demo": panel.demo_button,
+        "safari_demo": panel.safari_demo_button,
         "clear_demo": panel.clear_demo_button,
         "export": panel.export_button,
         "details": panel.details_button,
@@ -100,6 +101,7 @@ def test_forecast_buttons_have_widths_labels_and_tooltips() -> None:
     assert buttons["update"].text() == "Update Forecast"
     assert buttons["diagnostics"].text() == "Diagnostics"
     assert buttons["demo"].text() == "Generate Demo"
+    assert buttons["safari_demo"].text() == "Safari/WebKit Demo"
     assert buttons["clear_demo"].text() == "Clear Demo"
     assert buttons["export"].text() == "Export Forecast"
     assert buttons["details"].text() == "View Details"
@@ -107,6 +109,23 @@ def test_forecast_buttons_have_widths_labels_and_tooltips() -> None:
     assert buttons["snooze"].text() == "Snooze"
     assert buttons["guidance"].text() == "Update Guide"
     panel.close()
+    app.processEvents()
+
+
+def test_safari_webkit_demo_forecast_renders_single_simulated_card(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(tmp_path / "audit.sqlite")
+    window.generate_safari_webkit_demo_apple_security_forecast()
+    assert window.cve_radar_panel.status_label.text() == "Elevated"
+    assert window.cve_radar_panel.cards.count() == 1
+    assert window.cve_radar_panel.current_card() is not None
+    assert window.cve_radar_panel.current_card().get("simulated") is True
+    assert window.cve_radar_panel.current_card().get("category") == "Safari/WebKit"
+    forecast = window.db.latest_apple_security_forecast()
+    assert forecast is not None
+    assert forecast.get("simulated") is True
+    assert forecast.get("source_mode") == "demo-safari-webkit"
+    window.close()
     app.processEvents()
 
 

@@ -1,0 +1,21 @@
+# Public Release Checklist
+
+- [ ] tests pass
+- [ ] compileall passes
+- [ ] git diff --check passes
+- [ ] no secrets in the repository
+- [ ] no stale logs or databases bundled in the app
+- [ ] no hardcoded personal paths in user-facing files
+- [ ] safe defaults remain intact
+- [ ] README is up to date
+- [ ] changelog is updated
+- [ ] security policy is present
+- [ ] contributing guide is present
+- [ ] code of conduct is present
+- [ ] deployment documentation is current
+- [ ] privacy documentation is current
+- [ ] operational safety documentation is current
+- [ ] system monitor audit and repair flows work
+- [ ] reports export from a clean install
+- [ ] uninstall is documented and works
+- [ ] the app can run in user mode without system install

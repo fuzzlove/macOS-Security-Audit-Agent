@@ -1,7 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('mac_audit_agent/assets', 'mac_audit_agent/assets'), ('README.md', '.')]
+datas = [
+    ('mac_audit_agent/assets', 'mac_audit_agent/assets'),
+    ('README.md', '.'),
+    ('LICENSE', '.'),
+    ('SECURITY.md', '.'),
+    ('CONTRIBUTING.md', '.'),
+    ('CODE_OF_CONDUCT.md', '.'),
+    ('CHANGELOG.md', '.'),
+    ('docs', 'docs'),
+]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('PySide6')

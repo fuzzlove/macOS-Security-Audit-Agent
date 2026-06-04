@@ -46,6 +46,18 @@ def _run_command(command: list[str], timeout: int = 5) -> str:
     return (completed.stdout or completed.stderr or "").strip()
 
 
+def _run_command_result(command: list[str], timeout: int = 5) -> tuple[str, bool]:
+    executable = command[0] if Path(command[0]).exists() else shutil.which(command[0])
+    if not executable:
+        return "", False
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return "", False
+    output = (completed.stdout or completed.stderr or "").strip()
+    return output, completed.returncode == 0
+
+
 def _parse_version(text: str) -> str:
     match = re.search(r"(\d+(?:\.\d+){0,4})", text)
     return match.group(1) if match else ""
@@ -755,23 +767,29 @@ def collect_apple_security_inventory() -> dict[str, Any]:
     inventory = {
         "collected_at": utc_now_iso(),
         "platform": platform.platform(),
-        "architecture": platform.machine(),
-        "device_model": _run_command(["sysctl", "-n", "hw.model"], timeout=4),
+        "architecture": _run_command(["/usr/bin/arch"], timeout=4) or platform.machine(),
+        "device_model": _run_command(["/usr/sbin/sysctl", "-n", "hw.model"], timeout=4),
         "macos_version": "",
         "macos_build": "",
         "safari_version": "",
+        "safari_build": "",
+        "safari_detection_method": "not detected",
         "webkit_version": "",
         "xcode_version": "",
         "command_line_tools_version": "",
         "apple_apps": [],
         "software_update_available": False,
         "software_update_items": [],
+        "software_update_check_status": "not checked",
+        "software_update_error": "",
+        "privacy_guarantee": "Safari Private Browsing does not affect this forecast. The forecast uses installed Safari/macOS version and Apple advisory/update data only.",
+        "why_no_cards": "",
         "products": [],
         "summary": {},
     }
 
-    sw_vers_version = _run_command(["sw_vers", "-productVersion"], timeout=4)
-    sw_vers_build = _run_command(["sw_vers", "-buildVersion"], timeout=4)
+    sw_vers_version = _run_command(["/usr/bin/sw_vers", "-productVersion"], timeout=4)
+    sw_vers_build = _run_command(["/usr/bin/sw_vers", "-buildVersion"], timeout=4)
     inventory["macos_version"] = sw_vers_version
     inventory["macos_build"] = sw_vers_build
 
@@ -793,27 +811,32 @@ def collect_apple_security_inventory() -> dict[str, Any]:
     if sw_vers_version:
         add("macOS", f"{sw_vers_version} ({sw_vers_build})" if sw_vers_build else sw_vers_version, family="macos", source="sw_vers")
 
-    safari_text = _run_command(["/Applications/Safari.app/Contents/MacOS/Safari", "--version"], timeout=5)
-    if safari_text:
-        safari_version = _parse_version(safari_text) or safari_text[:80]
+    safari_info_path = "/Applications/Safari.app/Contents/Info"
+    safari_version = _run_command(["/usr/bin/defaults", "read", safari_info_path, "CFBundleShortVersionString"], timeout=5)
+    safari_build = _run_command(["/usr/bin/defaults", "read", safari_info_path, "CFBundleVersion"], timeout=5)
+    if safari_version:
+        safari_version = _parse_version(safari_version) or safari_version[:80]
+        inventory["safari_detection_method"] = "Info.plist CFBundleShortVersionString via defaults"
+    else:
+        mdls_text = _run_command(["/usr/bin/mdls", "-name", "kMDItemVersion", "/Applications/Safari.app"], timeout=5)
+        safari_version = _parse_version(mdls_text) or ""
+        if safari_version:
+            inventory["safari_detection_method"] = "Spotlight metadata kMDItemVersion via mdls"
+    if safari_version:
         inventory["safari_version"] = safari_version
-        add("Safari", safari_version, family="safari", source="Safari.app")
+        inventory["safari_build"] = _parse_version(safari_build) or safari_build[:80]
+        add("Safari", safari_version, family="safari", source=inventory["safari_detection_method"])
 
-    webkit_text = _run_command(["/System/Library/StagedFrameworks/Safari/WebKit.framework/Versions/Current/Resources/webkit", "--version"], timeout=5)
-    if webkit_text:
-        webkit_version = _parse_version(webkit_text) or webkit_text[:80]
-        inventory["webkit_version"] = webkit_version
-        add("WebKit", webkit_version, family="webkit", source="WebKit.framework")
-    elif inventory["safari_version"]:
+    if inventory["safari_version"]:
         inventory["webkit_version"] = inventory["safari_version"]
-        add("WebKit", inventory["safari_version"], family="webkit", source="Safari.app", notes="Safari and WebKit often track together on the same build.")
+        add("WebKit", inventory["safari_version"], family="webkit", source="Safari installed version", notes="Forecast uses installed Safari metadata only; no browsing state is inspected.")
 
-    xcode_text = _run_command(["xcodebuild", "-version"], timeout=8)
+    xcode_text = _run_command(["/usr/bin/xcodebuild", "-version"], timeout=8)
     if xcode_text:
         xcode_version = extract_version(xcode_text) or xcode_text.splitlines()[0][:80]
         inventory["xcode_version"] = xcode_version
         add("Xcode", xcode_version, family="xcode", source="xcodebuild")
-    clt_text = _run_command(["pkgutil", "--pkg-info=com.apple.pkg.CLTools_Executables"], timeout=6)
+    clt_text = _run_command(["/usr/sbin/pkgutil", "--pkg-info=com.apple.pkg.CLTools_Executables"], timeout=6)
     if clt_text:
         clt_version = extract_version(clt_text) or clt_text[:80]
         inventory["command_line_tools_version"] = clt_version
@@ -826,16 +849,22 @@ def collect_apple_security_inventory() -> dict[str, Any]:
             add(name, "", family="apple_app", source="filesystem", notes="Apple-installed app detected")
             inventory["apple_apps"].append(name)
 
-    update_text = _run_command(["softwareupdate", "--list"], timeout=8)
-    if update_text:
+    update_text, update_ok = _run_command_result(["/usr/sbin/softwareupdate", "-l"], timeout=20)
+    if update_ok:
         items = [line.strip("* ").strip() for line in update_text.splitlines() if line.strip().startswith("*")]
         inventory["software_update_available"] = bool(items)
         inventory["software_update_items"] = items[:25]
+        inventory["software_update_check_status"] = "updates available" if items else "no updates reported"
+    else:
+        inventory["software_update_check_status"] = "failed"
+        inventory["software_update_error"] = update_text[:300]
 
     inventory["summary"] = {
         "product_count": len(inventory["products"]),
         "apple_app_count": len(inventory["apple_apps"]),
         "software_update_available": inventory["software_update_available"],
+        "safari_detection_method": inventory["safari_detection_method"],
+        "software_update_check_status": inventory["software_update_check_status"],
     }
     return inventory
 
@@ -1068,15 +1097,24 @@ class AppleSecurityForecastEngine:
 
     def _state_and_explanation(self, payload: dict[str, Any], cards: list[dict[str, Any]]) -> tuple[str, str]:
         if not payload and not cards:
-            return "Forecast not checked yet", "No forecast has been checked yet."
+            return "Forecast not checked yet", "No Apple Security Forecast has been checked yet."
         if payload.get("last_error") and not cards:
             if payload.get("catalog_update_status") in {"offline-cache", "offline-rules"}:
                 return "Unable to update forecast — using cache" if payload.get("timestamp") else "Unable to update forecast — no cache available", str(payload.get("last_error", ""))
             return "Unable to update forecast — no cache available", str(payload.get("last_error", ""))
         if not cards:
+            inventory = payload.get("inventory", {}) if isinstance(payload.get("inventory", {}), dict) else {}
+            if payload.get("catalog_update_status") in {"offline-rules"}:
+                return "Unable to update forecast — no cache available", "Offline and no cache is available."
+            if str(inventory.get("software_update_check_status", "")) == "failed":
+                return "Unable to update forecast — using cache", "Software update check failed; using cached advisory data."
+            if not inventory.get("safari_version") and payload.get("safari_required"):
+                return "Watch", "Safari version could not be detected."
+            if int(payload.get("hidden_review_needed_count", 0)) > 0:
+                return "Watch", "Only review-needed items were found and are hidden by default."
             if str(payload.get("why_no_cards", "")):
                 return str(payload.get("state_text", "Clear")), str(payload.get("why_no_cards", ""))
-            return "Clear — no applicable Apple security updates found", "No Apple-related high/critical items matched this Mac."
+            return "Clear — no applicable Apple security updates found", "No applicable Apple security advisories matched this Mac."
         level = str(payload.get("level") or payload.get("forecast_level") or "watch")
         if level == "urgent":
             return "Urgent", "Known-exploited or critical Apple security items likely apply to this Mac."
@@ -1183,6 +1221,7 @@ class AppleSecurityForecastEngine:
                 "catalog_update_status": catalog.get("catalog_update_status", "updated"),
                 "last_error": ", ".join(catalog.get("errors", [])),
                 "why_no_cards": summary,
+                "inventory": inventory,
             },
             cards,
         )
@@ -1311,6 +1350,67 @@ class AppleSecurityForecastEngine:
         )
         return forecast
 
+    def generate_safari_webkit_demo_forecast(self) -> AppleSecurityForecast:
+        inventory = collect_apple_security_inventory()
+        demo_card = AppleSecurityForecastCard(
+            card_id="demo-safari-webkit-only",
+            forecast_id="demo-safari-webkit-forecast",
+            title="Safari/WebKit Security Update",
+            category="Safari/WebKit",
+            forecast_level="elevated",
+            simulated=True,
+            affected_local_product="Safari",
+            detected_version=inventory.get("safari_version", "") or "not detected",
+            fixed_version="demo-fixed-version",
+            cves=["DEMO-CVE-APPLE-SAFARI-WEBKIT"],
+            kev_cves=[],
+            epss_high_cves=[],
+            applicability="likely_applicable",
+            confidence="medium",
+            why_shown="Demo Safari/WebKit forecast card generated from installed Safari/macOS inventory only. Safari does not need to be open and Private Browsing state is not inspected.",
+            what_to_do="Review Software Update and Apple Safari/WebKit security guidance.",
+            update_path="System Settings > General > Software Update",
+            references=[APPLE_SECURITY_RELEASES_URL],
+            status="new",
+            summary="Demo Safari/WebKit forecast card",
+            affected_products=["Safari", "WebKit"],
+            highest_severity="high",
+            source="apple",
+        )
+        return AppleSecurityForecast(
+            forecast_id="demo-safari-webkit-forecast",
+            generated_at=utc_now_iso(),
+            level="elevated",
+            summary="Demo Safari/WebKit Apple Security Forecast for UI verification.",
+            state_text="Elevated",
+            why_no_cards="Demo forecast contains a visible Safari/WebKit card.",
+            last_error="",
+            affected_products=["Safari", "WebKit"],
+            cve_count=1,
+            kev_count=0,
+            highest_severity="high",
+            recommended_action="Review Software Update for Safari/WebKit security updates.",
+            cards=[demo_card],
+            previous_level="watch",
+            next_check_at=(datetime.now(timezone.utc) + timedelta(seconds=self.update_interval_seconds)).isoformat(),
+            source_age_hours=0,
+            cache_age_text="demo",
+            should_announce=False,
+            sources_used=["demo"],
+            inventory=inventory,
+            catalog_update_status="demo",
+            errors=[],
+            simulated=True,
+            source_mode="demo-safari-webkit",
+            apple_source_status="demo",
+            kev_source_status="demo",
+            epss_source_status="demo",
+            filtered_non_apple_cves_count=0,
+            hidden_review_needed_count=0,
+            last_successful_update_at=utc_now_iso(),
+            card_count=1,
+        )
+
     def clear_demo_forecast(self) -> None:
         rows = self.db.list_apple_security_forecast_cards(limit=500)
         demo_forecast_ids = {str(item.get("forecast_id", "")) for item in rows if bool(item.get("simulated", False))}
@@ -1349,16 +1449,22 @@ class AppleSecurityForecastEngine:
                 "macos_version": inventory.get("macos_version", ""),
                 "macos_build": inventory.get("macos_build", ""),
                 "safari_version": inventory.get("safari_version", ""),
+                "safari_build": inventory.get("safari_build", ""),
+                "safari_detection_method": inventory.get("safari_detection_method", ""),
                 "webkit_version": inventory.get("webkit_version", ""),
                 "xcode_version": inventory.get("xcode_version", ""),
                 "command_line_tools_version": inventory.get("command_line_tools_version", ""),
                 "architecture": inventory.get("architecture", ""),
                 "device_model": inventory.get("device_model", ""),
+                "software_update_check_status": inventory.get("software_update_check_status", ""),
+                "software_update_error": inventory.get("software_update_error", ""),
+                "privacy_guarantee": inventory.get("privacy_guarantee", ""),
             },
             "cards_generated_count": len(latest_cards),
             "filtered_non_apple_cves_count": int(latest_payload.get("filtered_non_apple_cves_count", 0)),
             "hidden_review_needed_count": int(latest_payload.get("hidden_review_needed_count", 0)),
             "last_error": latest_payload.get("last_error", ""),
+            "why_no_cards": latest_payload.get("why_no_cards", ""),
             "table_counts": {
                 "apple_security_forecasts": len(self.db.conn.execute("SELECT forecast_id FROM apple_security_forecasts").fetchall()),
                 "apple_security_forecast_cards": len(self.db.conn.execute("SELECT card_id FROM apple_security_forecast_cards").fetchall()),

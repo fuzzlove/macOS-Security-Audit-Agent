@@ -2,27 +2,30 @@
 
 ## Preconditions
 
-- Run the desktop app as the logged-in macOS user.
-- Do not use `sudo` for the user LaunchAgent workflow.
-- Expected plist path:
+- Install the detector with administrator approval.
+- Expected detector plist path:
+  `/Library/LaunchDaemons/com.mac-audit-agent.monitor.plist`
+- Expected logged-in user notification companion plist path:
   `~/Library/LaunchAgents/com.mac-audit-agent.monitor.plist`
 - Expected launchctl domain:
   `gui/<uid>`
 
-For system-daemon validation, run the install flow with `MAC_AUDIT_AGENT_LAUNCH_SCOPE=system` from an elevated shell. The expected plist path becomes `/Library/LaunchDaemons/com.mac-audit-agent.monitor.plist` and the launchctl domain becomes `system`.
+The detector must run as a system daemon. The user LaunchAgent is a notification companion only and must not run the detector loop.
 
 ## Test Cases
 
-### 1. Install LaunchAgent
+### 1. Install system daemon and user notifier
 
 Action:
 - Open `Background Monitor`.
-- Click `Install Background Monitor`.
+- Click `Install System Monitor + User Notifier` with administrator approval.
 
 Expected:
+- `/Library/LaunchDaemons/com.mac-audit-agent.monitor.plist` exists.
 - `~/Library/LaunchAgents/com.mac-audit-agent.monitor.plist` exists.
+- `launchctl print system/com.mac-audit-agent.monitor` works after start.
 - `launchctl print gui/<uid>/com.mac-audit-agent.monitor` works.
-- Monitor health shows `LaunchAgent installed: yes`.
+- Monitor health shows the system launchctl domain.
 
 ### 2. Start monitor
 
@@ -30,8 +33,8 @@ Action:
 - Click `Start Monitor`.
 
 Expected:
-- No `sudo` prompt is required.
-- Monitor health shows `LaunchAgent loaded: yes`.
+- Administrator approval is required for the system daemon.
+- Monitor health shows the system daemon as loaded.
 - Monitor PID is visible.
 - Heartbeat updates within 60 seconds.
 
@@ -121,6 +124,13 @@ Expected:
 - `new_usb_device_detected` is recorded at critical severity.
 - The `Pop` sound is used.
 - The persistent bottom-right overlay becomes active until acknowledged.
+
+### 11a. Connected Bluetooth device
+
+- Connect an approved Bluetooth keyboard, mouse, trackpad, or accessory.
+- Confirm `bluetooth_device_connected` is logged with `hardware_detector` and `ioreg_bluetooth` provenance.
+- Confirm the translucent bottom-right overlay appears.
+- Confirm the monitor does not actively scan for ambient nearby devices.
 - The event is saved locally and appears in exports.
 
 ### 12. New network IP assignment
@@ -182,6 +192,8 @@ Action:
 
 Expected:
 - `input_activity_resumed_after_idle` is recorded at medium severity.
+- `input_activity_idle_started` is recorded when aggregate HID input remains idle past the configured threshold.
+- Confirm that neither event stores keystrokes, pointer coordinates, nor screen content.
 - The authorized-use CFAA reminder dialog appears again after the idle period.
 - The event is stored locally and appears in the recent events table.
 

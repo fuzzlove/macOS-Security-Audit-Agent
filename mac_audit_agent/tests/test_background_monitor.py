@@ -2,12 +2,14 @@ import os
 import json
 import plistlib
 import sys
+import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+import pytest
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from mac_audit_agent.launch_agent import (
     LAUNCH_AGENT_LABEL,
@@ -16,25 +18,38 @@ from mac_audit_agent.launch_agent import (
     PLUTIL_BIN,
     LaunchAgentManager,
     build_launch_agent_plist,
+    default_launch_agent_paths,
     launchctl_target,
     project_root,
     default_monitor_db_path,
     monitor_log_root,
+    protected_monitor_manifest_path,
     runtime_monitor_script_path,
     runtime_package_root,
     runtime_root,
+    user_home_dir,
+    user_launchctl_uid,
+    verify_protected_monitor_integrity,
 )
 from mac_audit_agent.hardware_monitor import HardwareMonitor, HardwareMonitorSnapshot, USBReconnectObserver
-from mac_audit_agent.models import BackgroundMonitorEvent, Finding, ScanResult, ScanSummary
+from mac_audit_agent.models import BackgroundMonitorEvent, EventAlertTrace, Finding, ScanResult, ScanSummary, utc_now_iso
 from mac_audit_agent.monitor import FALLBACK_MONITOR_LOG, BackgroundMonitorService, STDERR_MONITOR_LOG, clear_monitor_log_files, is_heartbeat_fresh, is_pid_alive, main as monitor_main
+from mac_audit_agent.monitor import _resolve_monitor_db_path
 from mac_audit_agent.persistence_monitor import PersistenceMonitor, PersistenceSnapshot
 from mac_audit_agent.network_monitor import NetworkMonitor, NetworkMonitorSnapshot
+from mac_audit_agent.native_event_bridge import NativeEventBridge, NativeEventFrame, native_event_frame_to_event, normalize_native_event_type
 from mac_audit_agent.notification_manager import NotificationManager, applescript_escape, send_alert_dialog, send_notification
 from mac_audit_agent.privacy_monitor import PrivacyMonitor, PrivacyMonitorSnapshot
 from mac_audit_agent.reporting import export_scan_result_html, export_scan_result_json
 from mac_audit_agent.session_monitor import SessionMonitor, SessionSnapshot, SessionStateObserver
+from mac_audit_agent.self_impact_watchdog import MonitorSelfImpactWatchdog, SelfImpactMetrics
 from mac_audit_agent.storage import AuditDatabase
-from mac_audit_agent.rules import sanitize_signal_text
+from mac_audit_agent.system_monitor_readiness import (
+    DEPLOYMENT_EVENT_FLOW_EVENT_TYPE,
+    SystemMonitorReadiness,
+    process_deployment_event_flow_request,
+)
+from mac_audit_agent.rules import canonical_event_type, sanitize_signal_text
 from mac_audit_agent.ui.background_monitor_panel import BackgroundMonitorPanel
 from mac_audit_agent.workflow_layer import InvestigatorWorkflowLayer
 
@@ -100,6 +115,27 @@ class FakeLaunchAgent:
         return self.log_path
 
 
+def _monitor_status(**overrides):
+    defaults = {
+        "installed": True,
+        "loaded": True,
+        "running": True,
+        "enabled": True,
+        "plist_path": "/tmp/com.mac-audit-agent.monitor.plist",
+        "label": LAUNCH_AGENT_LABEL,
+        "log_path": "/tmp/background_monitor.stdout.log",
+        "db_path": "/tmp/test.sqlite",
+        "process_pid": os.getpid(),
+        "last_heartbeat": utc_now_iso(),
+        "last_event_timestamp": "",
+        "last_error": "",
+        "notification_status": "available",
+        "current_launchctl_domain": "system",
+    }
+    defaults.update(overrides)
+    return type("Status", (), defaults)()
+
+
 def test_launch_agent_plist_generated_correctly(tmp_path: Path) -> None:
     payload = build_launch_agent_plist(db_path=tmp_path / "audit.sqlite", poll_interval_seconds=30, python_executable="/usr/bin/python3")
     assert payload["Label"] == LAUNCH_AGENT_LABEL
@@ -132,6 +168,595 @@ def test_launch_daemon_plist_generated_correctly(tmp_path: Path, monkeypatch) ->
     assert launchctl_target("system") == "system"
     assert default_monitor_db_path("system") == tmp_path / "system.sqlite3"
     assert monitor_log_root("system") == tmp_path / "system-logs"
+    assert default_launch_agent_paths("system").plist_path.parent == Path("/Library/LaunchDaemons")
+
+
+def test_system_monitor_plist_generated_with_system_mode(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("mac_audit_agent.launch_agent.SYSTEM_RUNTIME_ROOT", tmp_path / "system-runtime")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.SYSTEM_LOG_ROOT", tmp_path / "system-logs")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.SYSTEM_DB_PATH", tmp_path / "system.sqlite3")
+    payload = build_launch_agent_plist(
+        db_path=tmp_path / "system.sqlite3",
+        poll_interval_seconds=30,
+        python_executable="/usr/bin/python3",
+        scope="system",
+        mode="system-daemon",
+    )
+    assert payload["ProgramArguments"] == [
+        "/usr/bin/python3",
+        str(tmp_path / "system-runtime" / "mac_audit_agent" / "monitor.py"),
+        "--run",
+        "--mode",
+        "system-daemon",
+    ]
+    assert payload["EnvironmentVariables"]["MAC_AUDIT_AGENT_MONITOR_ROLE"] == "system-daemon"
+    assert payload["EnvironmentVariables"]["MAC_AUDIT_AGENT_LAUNCH_SCOPE"] == "system"
+
+
+def test_system_monitor_install_uses_shared_system_db_even_if_manager_was_created_with_user_db(tmp_path: Path, monkeypatch) -> None:
+    system_db = tmp_path / "Application Support" / "MacAuditAgent" / "mac_audit_agent.sqlite3"
+    system_plist = tmp_path / "LaunchDaemons" / f"{LAUNCH_AGENT_LABEL}.plist"
+    monkeypatch.setattr("mac_audit_agent.launch_agent.SYSTEM_RUNTIME_ROOT", tmp_path / "system-runtime")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.SYSTEM_LOG_ROOT", tmp_path / "system-logs")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.SYSTEM_DB_PATH", system_db)
+    monkeypatch.setattr("mac_audit_agent.launch_agent.SYSTEM_LAUNCH_DAEMON_PATH", system_plist)
+    monkeypatch.setattr("mac_audit_agent.launch_agent.os.geteuid", lambda: 0)
+    monkeypatch.setattr("mac_audit_agent.launch_agent.os.chown", lambda *_args, **_kwargs: None)
+    manager = LaunchAgentManager(tmp_path / "user.sqlite3", scope="system", runner=lambda *args, **kwargs: FakeCompletedProcess(returncode=0, stdout="OK"))
+    manager.paths = type(manager.paths)(
+        plist_path=system_plist,
+        stdout_path=tmp_path / "system-logs" / "background_monitor.stdout.log",
+        stderr_path=tmp_path / "system-logs" / "background_monitor.stderr.log",
+    )
+
+    plist_path = manager.install_system_monitor()
+
+    payload = plistlib.loads(plist_path.read_bytes())
+    assert payload["EnvironmentVariables"]["MAC_AUDIT_AGENT_DB_PATH"] == str(system_db)
+    manifest = json.loads(protected_monitor_manifest_path("system").read_text(encoding="utf-8"))
+    assert manifest["db_path"] == str(system_db)
+    assert manifest["hash_algorithm"] == "sha256+sha512"
+    assert manifest["manifest_digest_algorithm"] == "sha512"
+    assert "manifest_digest_sha512" in manifest
+    assert "sha512" in manifest["tracked_files"]["monitor.py"]
+
+
+def test_canonical_event_type_maps_alert_aliases() -> None:
+    assert canonical_event_type("session_locked") == "screen_locked"
+    assert canonical_event_type("session_unlocked") == "screen_unlocked"
+    assert canonical_event_type("possible_lid_opened") == "lid_opened"
+    assert canonical_event_type("mouse_activity_detected") == "mouse_or_keyboard_activity_after_idle"
+    assert canonical_event_type("input_activity_after_idle") == "mouse_or_keyboard_activity_after_idle"
+    assert canonical_event_type("hid_activity_after_idle") == "mouse_or_keyboard_activity_after_idle"
+    assert canonical_event_type("current_usb_device_inventory_changed") == "usb_device_connected"
+
+
+def test_system_daemon_mode_without_explicit_db_path_resolves_shared_system_db(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("mac_audit_agent.launch_agent.SYSTEM_DB_PATH", tmp_path / "system.sqlite3")
+    monkeypatch.setattr("mac_audit_agent.monitor.SYSTEM_DB_PATH", tmp_path / "system.sqlite3", raising=False)
+    assert _resolve_monitor_db_path(None, "system-daemon") == tmp_path / "system.sqlite3"
+
+
+def _patch_readiness_system_paths(tmp_path: Path, monkeypatch):
+    system_db = tmp_path / "Application Support" / "MacAuditAgent" / "mac_audit_agent.sqlite3"
+    runtime = tmp_path / "Application Support" / "MacAuditAgent" / "runtime"
+    logs = tmp_path / "Logs" / "MacAuditAgent"
+    plist = tmp_path / "LaunchDaemons" / f"{LAUNCH_AGENT_LABEL}.plist"
+    paths = type(
+        "Paths",
+        (),
+        {
+            "plist_path": plist,
+            "stdout_path": logs / "background_monitor.stdout.log",
+            "stderr_path": logs / "background_monitor.stderr.log",
+        },
+    )()
+    monkeypatch.setattr("mac_audit_agent.launch_agent.SYSTEM_DB_PATH", system_db)
+    monkeypatch.setattr("mac_audit_agent.launch_agent.SYSTEM_RUNTIME_ROOT", runtime)
+    monkeypatch.setattr("mac_audit_agent.launch_agent.SYSTEM_LOG_ROOT", logs)
+    monkeypatch.setattr("mac_audit_agent.launch_agent.SYSTEM_LAUNCH_DAEMON_PATH", plist)
+    monkeypatch.setattr("mac_audit_agent.launch_agent.default_launch_agent_paths", lambda scope=None: paths if scope == "system" else paths)
+    monkeypatch.setattr("mac_audit_agent.system_monitor_readiness.system_monitor_location_status", lambda _paths=None: {"valid": True, "expected_plist_path": str(plist), "observed_plist_path": str(plist), "message": "ok"})
+    return system_db, runtime, logs, plist, paths
+
+
+def test_runtime_version_mismatch_detected(tmp_path: Path, monkeypatch) -> None:
+    system_db, runtime, logs, plist, _paths = _patch_readiness_system_paths(tmp_path, monkeypatch)
+    runtime.mkdir(parents=True)
+    logs.mkdir(parents=True)
+    plist.parent.mkdir(parents=True)
+    plist.write_bytes(plistlib.dumps(build_launch_agent_plist(db_path=system_db, scope="system", mode="system-daemon")))
+    AuditDatabase(system_db).record_monitor_heartbeat(utc_now_iso())
+    manifest_path = protected_monitor_manifest_path("system")
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps({"runtime_version": "old-version", "db_path": str(system_db)}), encoding="utf-8")
+    readiness = SystemMonitorReadiness(system_db, runner=lambda *args, **kwargs: FakeCompletedProcess(returncode=0))
+    monkeypatch.setattr(readiness.system_manager, "status", lambda: _monitor_status(plist_path=str(plist), db_path=str(system_db)))
+
+    report = readiness.audit_deployment()
+
+    version_check = next(check for check in report.checks if check.check_id == "runtime_version")
+    assert version_check.status == "WARNING"
+    assert "Repair System Monitor runtime" in report.repair_actions
+
+
+def test_deployment_audit_finds_old_db_path(tmp_path: Path, monkeypatch) -> None:
+    system_db, runtime, logs, plist, _paths = _patch_readiness_system_paths(tmp_path, monkeypatch)
+    runtime.mkdir(parents=True)
+    logs.mkdir(parents=True)
+    plist.parent.mkdir(parents=True)
+    old_db = tmp_path / "old-user.sqlite3"
+    plist.write_bytes(plistlib.dumps(build_launch_agent_plist(db_path=old_db, scope="system", mode="system-daemon")))
+    AuditDatabase(system_db).record_monitor_heartbeat(utc_now_iso())
+    readiness = SystemMonitorReadiness(system_db, runner=lambda *args, **kwargs: FakeCompletedProcess(returncode=0))
+    monkeypatch.setattr(readiness.system_manager, "status", lambda: _monitor_status(plist_path=str(plist), db_path=str(system_db)))
+
+    report = readiness.audit_deployment()
+
+    db_check = next(check for check in report.checks if check.check_id == "database_path")
+    assert db_check.status == "FAIL"
+    assert str(old_db) in db_check.observed
+
+
+def test_deployment_audit_finds_missing_runtime(tmp_path: Path, monkeypatch) -> None:
+    system_db, _runtime, logs, plist, _paths = _patch_readiness_system_paths(tmp_path, monkeypatch)
+    logs.mkdir(parents=True)
+    plist.parent.mkdir(parents=True)
+    plist.write_bytes(plistlib.dumps(build_launch_agent_plist(db_path=system_db, scope="system", mode="system-daemon")))
+    readiness = SystemMonitorReadiness(system_db, runner=lambda *args, **kwargs: FakeCompletedProcess(returncode=0))
+    monkeypatch.setattr(readiness.system_manager, "status", lambda: _monitor_status(plist_path=str(plist), db_path=str(system_db)))
+
+    report = readiness.audit_deployment()
+
+    runtime_check = next(check for check in report.checks if check.check_id == "runtime_exists")
+    assert runtime_check.status == "FAIL"
+    assert report.deployment_state == "Broken"
+
+
+def test_deployment_audit_finds_invalid_permissions(tmp_path: Path, monkeypatch) -> None:
+    system_db, runtime, logs, plist, _paths = _patch_readiness_system_paths(tmp_path, monkeypatch)
+    runtime.mkdir(parents=True)
+    logs.mkdir(parents=True)
+    plist.parent.mkdir(parents=True)
+    plist.write_bytes(plistlib.dumps(build_launch_agent_plist(db_path=system_db, scope="system", mode="system-daemon")))
+    readiness = SystemMonitorReadiness(system_db, runner=lambda *args, **kwargs: FakeCompletedProcess(returncode=0))
+    monkeypatch.setattr(readiness.system_manager, "status", lambda: _monitor_status(plist_path=str(plist), db_path=str(system_db)))
+
+    report = readiness.audit_deployment()
+
+    permission_check = next(check for check in report.checks if check.check_id == "launchdaemon_permissions")
+    assert permission_check.status == "FAIL"
+
+
+def test_deployment_repair_updates_runtime_manifest_and_db_path(tmp_path: Path, monkeypatch) -> None:
+    system_db, runtime, logs, plist, _paths = _patch_readiness_system_paths(tmp_path, monkeypatch)
+    runtime.mkdir(parents=True)
+    logs.mkdir(parents=True)
+    plist.parent.mkdir(parents=True)
+    plist.write_bytes(plistlib.dumps(build_launch_agent_plist(db_path=tmp_path / "old.sqlite3", scope="system", mode="system-daemon")))
+    readiness = SystemMonitorReadiness(system_db, runner=lambda *args, **kwargs: FakeCompletedProcess(returncode=0))
+    monkeypatch.setattr("mac_audit_agent.system_monitor_readiness.os.geteuid", lambda: 0)
+    calls = []
+
+    def fake_install():
+        calls.append("install")
+        plist.write_bytes(plistlib.dumps(build_launch_agent_plist(db_path=system_db, scope="system", mode="system-daemon")))
+        manifest_path = protected_monitor_manifest_path("system")
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps({"runtime_version": readiness.application_manifest()["runtime_version"], "db_path": str(system_db)}), encoding="utf-8")
+        return plist
+
+    monkeypatch.setattr(readiness.system_manager, "install_system_monitor", fake_install)
+    monkeypatch.setattr(readiness.system_manager, "status", lambda: _monitor_status(plist_path=str(plist), db_path=str(system_db)))
+    monkeypatch.setattr(readiness.system_manager, "start", lambda: calls.append("start"))
+    monkeypatch.setattr(readiness.user_notifier_manager, "status", lambda: _monitor_status(installed=True))
+    report = readiness.audit_deployment()
+
+    notes = readiness.repair_mismatches(report)
+
+    assert "install" in calls
+    assert "start" in calls
+    assert any("repaired system monitor" in note for note in notes)
+    payload = plistlib.loads(plist.read_bytes())
+    assert payload["EnvironmentVariables"]["MAC_AUDIT_AGENT_DB_PATH"] == str(system_db)
+    assert json.loads(protected_monitor_manifest_path("system").read_text(encoding="utf-8"))["db_path"] == str(system_db)
+
+
+def test_event_flow_verification_works(tmp_path: Path, monkeypatch) -> None:
+    system_db, _runtime, _logs, _plist, _paths = _patch_readiness_system_paths(tmp_path, monkeypatch)
+    AuditDatabase(system_db)
+    readiness = SystemMonitorReadiness(system_db, runner=lambda *args, **kwargs: FakeCompletedProcess(returncode=0))
+    monkeypatch.setattr(readiness.system_manager, "status", lambda: _monitor_status(db_path=str(system_db)))
+    monkeypatch.setattr(readiness.user_notifier_manager, "status", lambda: _monitor_status(installed=True, loaded=True))
+    original_request = readiness.request_event_flow_test
+
+    def request_and_process():
+        request_id = original_request()
+        process_deployment_event_flow_request(AuditDatabase(system_db))
+        return request_id
+
+    monkeypatch.setattr(readiness, "request_event_flow_test", request_and_process)
+    result = readiness.verify_event_flow(timeout_seconds=1)
+
+    assert all(stage.status == "PASS" for stage in result.stages if stage.check_id != "notifier_receives_event")
+    assert AuditDatabase(system_db).recent_background_monitor_events(limit=1, event_type=DEPLOYMENT_EVENT_FLOW_EVENT_TYPE)
+
+
+def test_heartbeat_verification_and_health_score_generated(tmp_path: Path, monkeypatch) -> None:
+    system_db, runtime, logs, plist, _paths = _patch_readiness_system_paths(tmp_path, monkeypatch)
+    runtime.mkdir(parents=True)
+    logs.mkdir(parents=True)
+    plist.parent.mkdir(parents=True)
+    plist.write_bytes(plistlib.dumps(build_launch_agent_plist(db_path=system_db, scope="system", mode="system-daemon")))
+    AuditDatabase(system_db).record_monitor_heartbeat(utc_now_iso())
+    readiness = SystemMonitorReadiness(system_db, runner=lambda *args, **kwargs: FakeCompletedProcess(returncode=0))
+    monkeypatch.setattr(readiness.system_manager, "status", lambda: _monitor_status(plist_path=str(plist), db_path=str(system_db)))
+
+    report = readiness.audit_deployment()
+
+    heartbeat = next(check for check in report.checks if check.check_id == "heartbeat_fresh")
+    assert heartbeat.status == "PASS"
+    assert 0 <= report.health_score <= 100
+
+
+def test_audit_does_not_automatically_repair(tmp_path: Path, monkeypatch) -> None:
+    system_db, _runtime, _logs, _plist, _paths = _patch_readiness_system_paths(tmp_path, monkeypatch)
+    readiness = SystemMonitorReadiness(system_db, runner=lambda *args, **kwargs: FakeCompletedProcess(returncode=0))
+    calls = []
+    monkeypatch.setattr(readiness.system_manager, "install_system_monitor", lambda: calls.append("install"))
+    monkeypatch.setattr(readiness.system_manager, "start", lambda: calls.append("start"))
+
+    report = readiness.audit_deployment()
+
+    assert report.deployment_state in {"Broken", "Repair Recommended"}
+    assert calls == []
+
+
+def test_user_notifier_plist_generated_with_user_mode(tmp_path: Path) -> None:
+    payload = build_launch_agent_plist(
+        db_path=tmp_path / "audit.sqlite",
+        poll_interval_seconds=30,
+        python_executable="/usr/bin/python3",
+        scope="user",
+        mode="user-notifier",
+    )
+    assert payload["ProgramArguments"][-2:] == ["--mode", "user-notifier"]
+    assert payload["EnvironmentVariables"]["MAC_AUDIT_AGENT_MONITOR_ROLE"] == "user-notifier"
+
+
+def test_system_monitor_install_requires_admin_approval(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("mac_audit_agent.launch_agent.os.geteuid", lambda: 501)
+    manager = LaunchAgentManager(tmp_path / "audit.sqlite", scope="system", runner=lambda *args, **kwargs: FakeCompletedProcess(returncode=0, stdout="OK"))
+    with pytest.raises(RuntimeError, match="requires root privileges"):
+        manager.install_system_monitor()
+
+
+def test_system_daemon_does_not_call_applescript_directly(tmp_path: Path) -> None:
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite", mode="system-daemon")
+    assert service.notifications.status().startswith("system daemon")
+    event = service.run_self_test()
+    assert event.event_type == "monitor_self_test"
+    assert service.db.latest_monitor_events(limit=1)[0].event_type == "monitor_self_test"
+    assert service.db.latest_monitor_heartbeat()
+
+
+def test_user_notifier_processes_pending_events(tmp_path: Path, monkeypatch) -> None:
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite", mode="user-notifier")
+    event = BackgroundMonitorEvent(
+        event_id="pending-1",
+        timestamp="2026-04-25T00:00:00+00:00",
+        event_type="launchdaemon_added",
+        severity="critical",
+        source="baseline_diff",
+        evidence="New LaunchDaemon detected: com.example.daemon",
+        confidence="high",
+        recommendation="review",
+        metadata_json="{}",
+    )
+    service.db.record_monitor_event(event, dedupe_window_seconds=0)
+    calls = []
+    monkeypatch.setattr(service.notifications, "notify", lambda item, force=False: calls.append(item.event_type) or (True, ""))
+    notified = service.process_pending_notifications()
+    assert calls == ["launchdaemon_added"]
+    assert [item.event_type for item in notified] == ["launchdaemon_added"]
+
+
+def test_user_mode_remains_default() -> None:
+    manager = LaunchAgentManager(Path("/tmp/audit.sqlite"))
+    assert manager.scope == "user"
+    assert manager.paths.plist_path.parent == Path.home() / "Library" / "LaunchAgents"
+
+
+def test_user_launchctl_target_uses_sudo_uid_instead_of_gui_zero(monkeypatch) -> None:
+    monkeypatch.setattr("mac_audit_agent.launch_agent.os.getuid", lambda: 0)
+    monkeypatch.setenv("SUDO_UID", "501")
+    assert user_launchctl_uid() == 501
+    assert launchctl_target("user") == "gui/501"
+
+
+def test_explicit_user_scope_is_not_overridden_by_system_environment(monkeypatch) -> None:
+    monkeypatch.setenv("MAC_AUDIT_AGENT_LAUNCH_SCOPE", "system")
+    assert launchctl_target() == "system"
+    assert launchctl_target("user") == f"gui/{user_launchctl_uid()}"
+    assert default_launch_agent_paths("user").plist_path.parent == user_home_dir() / "Library" / "LaunchAgents"
+    payload = build_launch_agent_plist(db_path=Path("/tmp/audit.sqlite"), scope="user", mode="user-notifier")
+    assert payload["WorkingDirectory"] == str(user_home_dir() / ".mac_audit_agent" / "runtime")
+    assert payload["ProgramArguments"][1] == str(user_home_dir() / ".mac_audit_agent" / "runtime" / "mac_audit_agent" / "monitor.py")
+    assert payload["EnvironmentVariables"]["MAC_AUDIT_AGENT_LAUNCH_SCOPE"] == "user"
+
+
+def test_user_paths_use_sudo_invoking_user_home_instead_of_root_home(tmp_path: Path, monkeypatch) -> None:
+    invoking_home = tmp_path / "Users" / "admin"
+    monkeypatch.setattr("mac_audit_agent.launch_agent.os.getuid", lambda: 0)
+    monkeypatch.setenv("SUDO_UID", "501")
+    monkeypatch.setattr(
+        "mac_audit_agent.launch_agent.pwd.getpwuid",
+        lambda uid: type("User", (), {"pw_uid": uid, "pw_name": "admin", "pw_dir": str(invoking_home)})(),
+    )
+    assert user_home_dir() == invoking_home
+    assert default_launch_agent_paths("user").plist_path == invoking_home / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
+    assert runtime_root("user") == invoking_home / ".mac_audit_agent" / "runtime"
+
+
+def test_launch_agent_stop_tolerates_domain_does_not_support_action(tmp_path: Path) -> None:
+    calls = []
+
+    def fake_runner(command, capture_output=True, text=True):
+        calls.append(command)
+        return FakeCompletedProcess(returncode=125, stderr="Boot-out failed: 125: Domain does not support specified action")
+
+    manager = LaunchAgentManager(tmp_path / "audit.sqlite", runner=fake_runner)
+    manager.paths = type(manager.paths)(
+        plist_path=tmp_path / "com.mac-audit-agent.monitor.plist",
+        stdout_path=tmp_path / "background_monitor.stdout.log",
+        stderr_path=tmp_path / "background_monitor.stderr.log",
+    )
+    manager.stop()
+    assert calls == [[LAUNCHCTL_BIN, "bootout", launchctl_target(), str(manager.paths.plist_path)]]
+
+
+def test_protected_monitor_tamper_rule_is_registered() -> None:
+    from mac_audit_agent.rules import rule_for_event
+
+    rule = rule_for_event("protected_monitor_tamper_detected")
+    assert rule.rule_id == "protected_monitor_tamper_detected"
+    assert rule.severity == "critical"
+    assert rule.source_detector == "integrity_check"
+
+
+def test_protected_mode_requires_admin_approval(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("mac_audit_agent.launch_agent.os.geteuid", lambda: 501)
+    manager = LaunchAgentManager(tmp_path / "audit.sqlite", scope="system", runner=lambda *args, **kwargs: FakeCompletedProcess(returncode=0, stdout="OK"))
+    with pytest.raises(RuntimeError, match="requires root privileges"):
+        manager.install_protected_mode()
+
+
+def test_protected_monitor_integrity_detects_owner_mode_and_hash_changes(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("mac_audit_agent.launch_agent.os.geteuid", lambda: 0)
+    monkeypatch.setattr("mac_audit_agent.launch_agent.os.chown", lambda *args, **kwargs: None)
+    monkeypatch.setattr("mac_audit_agent.launch_agent.runtime_root", lambda scope=None: tmp_path / "system-runtime")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.runtime_package_root", lambda scope=None: tmp_path / "system-runtime" / "mac_audit_agent")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.runtime_monitor_script_path", lambda scope=None: tmp_path / "system-runtime" / "mac_audit_agent" / "monitor.py")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.monitor_log_root", lambda scope=None: tmp_path / "system-logs")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.default_monitor_db_path", lambda scope=None: tmp_path / "system.sqlite3")
+
+    source_pkg = tmp_path / "source" / "mac_audit_agent"
+    source_pkg.mkdir(parents=True, exist_ok=True)
+    (source_pkg / "__init__.py").write_text("", encoding="utf-8")
+    (source_pkg / "monitor.py").write_text("print('ok')\n", encoding="utf-8")
+    manager = LaunchAgentManager(tmp_path / "audit.sqlite", runner=lambda *args, **kwargs: FakeCompletedProcess(returncode=0, stdout="OK"), scope="system")
+    manager._runtime_root = lambda: tmp_path / "system-runtime"
+    manager._runtime_package_root = lambda: tmp_path / "system-runtime" / "mac_audit_agent"
+    manager._runtime_monitor_script_path = lambda: tmp_path / "system-runtime" / "mac_audit_agent" / "monitor.py"
+    manager.paths = type(manager.paths)(
+        plist_path=tmp_path / "Library" / "LaunchDaemons" / f"{LAUNCH_AGENT_LABEL}.plist",
+        stdout_path=tmp_path / "system-logs" / "background_monitor.stdout.log",
+        stderr_path=tmp_path / "system-logs" / "background_monitor.stderr.log",
+    )
+    manager.paths.plist_path.parent.mkdir(parents=True, exist_ok=True)
+    manager.paths.stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "system-runtime" / "mac_audit_agent").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "system-runtime" / "mac_audit_agent" / "monitor.py").write_text("print('ok')\n", encoding="utf-8")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.default_launch_agent_paths", lambda scope=None: manager.paths)
+    monkeypatch.setattr("mac_audit_agent.launch_agent.SYSTEM_LAUNCH_DAEMON_PATH", manager.paths.plist_path)
+    manager.install_protected_mode()
+    manifest_path = protected_monitor_manifest_path("system")
+    assert manifest_path.exists()
+
+    original_stat = Path.stat
+
+    class FakeBadStat:
+        st_uid = 501
+        st_gid = 20
+        st_mode = 0o100666
+
+    monkeypatch.setattr("pathlib.Path.stat", lambda self: FakeBadStat() if self == manager.paths.plist_path else original_stat(self))
+    integrity = verify_protected_monitor_integrity(scope="system")
+    assert integrity["tamper_detected"] is True
+    assert any("owner mismatch" in item or "world writable" in item for item in integrity["evidence"])
+
+    (tmp_path / "system-runtime" / "mac_audit_agent" / "monitor.py").write_text("print('changed')\n", encoding="utf-8")
+    monkeypatch.setattr("pathlib.Path.stat", original_stat)
+    integrity = verify_protected_monitor_integrity(scope="system")
+    assert integrity["tamper_detected"] is True
+    assert any("hash changed" in item for item in integrity["evidence"])
+
+
+def test_protected_monitor_integrity_detects_manifest_digest_tampering(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("mac_audit_agent.launch_agent.os.geteuid", lambda: 0)
+    monkeypatch.setattr("mac_audit_agent.launch_agent.os.chown", lambda *args, **kwargs: None)
+    monkeypatch.setattr("mac_audit_agent.launch_agent.runtime_root", lambda scope=None: tmp_path / "system-runtime")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.runtime_package_root", lambda scope=None: tmp_path / "system-runtime" / "mac_audit_agent")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.runtime_monitor_script_path", lambda scope=None: tmp_path / "system-runtime" / "mac_audit_agent" / "monitor.py")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.monitor_log_root", lambda scope=None: tmp_path / "system-logs")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.default_monitor_db_path", lambda scope=None: tmp_path / "system.sqlite3")
+
+    source_pkg = tmp_path / "source" / "mac_audit_agent"
+    source_pkg.mkdir(parents=True, exist_ok=True)
+    (source_pkg / "__init__.py").write_text("", encoding="utf-8")
+    (source_pkg / "monitor.py").write_text("print('ok')\n", encoding="utf-8")
+
+    manager = LaunchAgentManager(tmp_path / "audit.sqlite", runner=lambda *args, **kwargs: FakeCompletedProcess(returncode=0, stdout="OK"), scope="system")
+    manager._runtime_root = lambda: tmp_path / "system-runtime"
+    manager._runtime_package_root = lambda: tmp_path / "system-runtime" / "mac_audit_agent"
+    manager._runtime_monitor_script_path = lambda: tmp_path / "system-runtime" / "mac_audit_agent" / "monitor.py"
+    manager.paths = type(manager.paths)(
+        plist_path=tmp_path / "Library" / "LaunchDaemons" / f"{LAUNCH_AGENT_LABEL}.plist",
+        stdout_path=tmp_path / "system-logs" / "background_monitor.stdout.log",
+        stderr_path=tmp_path / "system-logs" / "background_monitor.stderr.log",
+    )
+    manager.paths.plist_path.parent.mkdir(parents=True, exist_ok=True)
+    manager.paths.stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "system-runtime" / "mac_audit_agent").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "system-runtime" / "mac_audit_agent" / "monitor.py").write_text("print('ok')\n", encoding="utf-8")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.default_launch_agent_paths", lambda scope=None: manager.paths)
+    monkeypatch.setattr("mac_audit_agent.launch_agent.SYSTEM_LAUNCH_DAEMON_PATH", manager.paths.plist_path)
+    manager.install_protected_mode()
+
+    manifest_path = protected_monitor_manifest_path("system")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["manifest_digest_sha512"] = "0" * 128
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+
+    integrity = verify_protected_monitor_integrity(scope="system")
+    assert integrity["tamper_detected"] is True
+    assert integrity["manifest_digest_status"] == "mismatch"
+    assert any("manifest digest changed" in item for item in integrity["evidence"])
+
+
+def test_lock_down_protected_files_uses_root_owned_system_permissions(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("mac_audit_agent.launch_agent.os.geteuid", lambda: 0)
+    recorded_chown: list[tuple[Path, int, int]] = []
+    recorded_chmod: list[tuple[Path, int]] = []
+    monkeypatch.setattr("mac_audit_agent.launch_agent.os.chown", lambda path, uid, gid: recorded_chown.append((Path(path), uid, gid)))
+    monkeypatch.setattr("pathlib.Path.chmod", lambda self, mode: recorded_chmod.append((Path(self), mode)))
+    monkeypatch.setattr("mac_audit_agent.launch_agent.runtime_root", lambda scope=None: tmp_path / "system-runtime")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.runtime_package_root", lambda scope=None: tmp_path / "system-runtime" / "mac_audit_agent")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.runtime_monitor_script_path", lambda scope=None: tmp_path / "system-runtime" / "mac_audit_agent" / "monitor.py")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.monitor_log_root", lambda scope=None: tmp_path / "system-logs")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.default_monitor_db_path", lambda scope=None: tmp_path / "system.sqlite3")
+
+    source_pkg = tmp_path / "source" / "mac_audit_agent"
+    source_pkg.mkdir(parents=True, exist_ok=True)
+    (source_pkg / "__init__.py").write_text("", encoding="utf-8")
+    (source_pkg / "monitor.py").write_text("print('ok')\n", encoding="utf-8")
+
+    manager = LaunchAgentManager(tmp_path / "audit.sqlite", runner=lambda *args, **kwargs: FakeCompletedProcess(returncode=0, stdout="OK"), scope="system")
+    manager._runtime_root = lambda: tmp_path / "system-runtime"
+    manager._runtime_package_root = lambda: tmp_path / "system-runtime" / "mac_audit_agent"
+    manager._runtime_monitor_script_path = lambda: tmp_path / "system-runtime" / "mac_audit_agent" / "monitor.py"
+    manager.paths = type(manager.paths)(
+        plist_path=tmp_path / "Library" / "LaunchDaemons" / f"{LAUNCH_AGENT_LABEL}.plist",
+        stdout_path=tmp_path / "system-logs" / "background_monitor.stdout.log",
+        stderr_path=tmp_path / "system-logs" / "background_monitor.stderr.log",
+    )
+    manager.paths.plist_path.parent.mkdir(parents=True, exist_ok=True)
+    manager.paths.stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "system-runtime" / "mac_audit_agent").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "system-runtime" / "mac_audit_agent" / "monitor.py").write_text("print('ok')\n", encoding="utf-8")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.default_launch_agent_paths", lambda scope=None: manager.paths)
+    monkeypatch.setattr("mac_audit_agent.launch_agent.SYSTEM_LAUNCH_DAEMON_PATH", manager.paths.plist_path)
+    manager.install_protected_mode()
+    notes = manager.lock_down_protected_files()
+
+    assert any(path == manager.paths.plist_path and uid == 0 for path, uid, _gid in recorded_chown)
+    assert any(path == tmp_path / "system-runtime" and uid == 0 for path, uid, _gid in recorded_chown)
+    assert any(path == tmp_path / "system-runtime" / "mac_audit_agent" / "monitor.py" and mode == 0o755 for path, mode in recorded_chmod)
+    assert any("locked down" in note for note in notes)
+
+
+def test_protected_monitor_integrity_detects_world_writable_plist(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("mac_audit_agent.launch_agent.os.geteuid", lambda: 0)
+    monkeypatch.setattr("mac_audit_agent.launch_agent.os.chown", lambda *args, **kwargs: None)
+    monkeypatch.setattr("mac_audit_agent.launch_agent.runtime_root", lambda scope=None: tmp_path / "system-runtime")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.runtime_package_root", lambda scope=None: tmp_path / "system-runtime" / "mac_audit_agent")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.runtime_monitor_script_path", lambda scope=None: tmp_path / "system-runtime" / "mac_audit_agent" / "monitor.py")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.monitor_log_root", lambda scope=None: tmp_path / "system-logs")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.default_monitor_db_path", lambda scope=None: tmp_path / "system.sqlite3")
+
+    source_pkg = tmp_path / "source" / "mac_audit_agent"
+    source_pkg.mkdir(parents=True, exist_ok=True)
+    (source_pkg / "__init__.py").write_text("", encoding="utf-8")
+    (source_pkg / "monitor.py").write_text("print('ok')\n", encoding="utf-8")
+
+    manager = LaunchAgentManager(tmp_path / "audit.sqlite", runner=lambda *args, **kwargs: FakeCompletedProcess(returncode=0, stdout="OK"), scope="system")
+    manager._runtime_root = lambda: tmp_path / "system-runtime"
+    manager._runtime_package_root = lambda: tmp_path / "system-runtime" / "mac_audit_agent"
+    manager._runtime_monitor_script_path = lambda: tmp_path / "system-runtime" / "mac_audit_agent" / "monitor.py"
+    manager.paths = type(manager.paths)(
+        plist_path=tmp_path / "Library" / "LaunchDaemons" / f"{LAUNCH_AGENT_LABEL}.plist",
+        stdout_path=tmp_path / "system-logs" / "background_monitor.stdout.log",
+        stderr_path=tmp_path / "system-logs" / "background_monitor.stderr.log",
+    )
+    manager.paths.plist_path.parent.mkdir(parents=True, exist_ok=True)
+    manager.paths.stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "system-runtime" / "mac_audit_agent").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "system-runtime" / "mac_audit_agent" / "monitor.py").write_text("print('ok')\n", encoding="utf-8")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.default_launch_agent_paths", lambda scope=None: manager.paths)
+    monkeypatch.setattr("mac_audit_agent.launch_agent.SYSTEM_LAUNCH_DAEMON_PATH", manager.paths.plist_path)
+    manager.install_protected_mode()
+
+    original_stat = Path.stat
+
+    class FakeBadStat:
+        st_uid = 0
+        st_gid = 80
+        st_mode = 0o100666
+
+    monkeypatch.setattr("pathlib.Path.stat", lambda self: FakeBadStat() if self == manager.paths.plist_path else original_stat(self))
+    integrity = verify_protected_monitor_integrity(scope="system")
+    assert integrity["tamper_detected"] is True
+    assert any("world writable" in item or "mode mismatch" in item for item in integrity["evidence"])
+
+
+def test_uninstall_path_exists_and_removes_protected_plist(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("mac_audit_agent.launch_agent.os.geteuid", lambda: 0)
+    monkeypatch.setattr("mac_audit_agent.launch_agent.os.chown", lambda *args, **kwargs: None)
+    monkeypatch.setattr("mac_audit_agent.launch_agent.runtime_root", lambda scope=None: tmp_path / "system-runtime")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.runtime_package_root", lambda scope=None: tmp_path / "system-runtime" / "mac_audit_agent")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.runtime_monitor_script_path", lambda scope=None: tmp_path / "system-runtime" / "mac_audit_agent" / "monitor.py")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.monitor_log_root", lambda scope=None: tmp_path / "system-logs")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.default_monitor_db_path", lambda scope=None: tmp_path / "system.sqlite3")
+    source_pkg = tmp_path / "source" / "mac_audit_agent"
+    source_pkg.mkdir(parents=True, exist_ok=True)
+    (source_pkg / "__init__.py").write_text("", encoding="utf-8")
+    (source_pkg / "monitor.py").write_text("print('ok')\n", encoding="utf-8")
+    manager = LaunchAgentManager(tmp_path / "audit.sqlite", runner=lambda *args, **kwargs: FakeCompletedProcess(returncode=0, stdout="OK"), scope="system")
+    manager._runtime_root = lambda: tmp_path / "system-runtime"
+    manager._runtime_package_root = lambda: tmp_path / "system-runtime" / "mac_audit_agent"
+    manager._runtime_monitor_script_path = lambda: tmp_path / "system-runtime" / "mac_audit_agent" / "monitor.py"
+    manager.paths = type(manager.paths)(
+        plist_path=tmp_path / "Library" / "LaunchDaemons" / f"{LAUNCH_AGENT_LABEL}.plist",
+        stdout_path=tmp_path / "system-logs" / "background_monitor.stdout.log",
+        stderr_path=tmp_path / "system-logs" / "background_monitor.stderr.log",
+    )
+    manager.paths.plist_path.parent.mkdir(parents=True, exist_ok=True)
+    manager.paths.stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "system-runtime" / "mac_audit_agent").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "system-runtime" / "mac_audit_agent" / "monitor.py").write_text("print('ok')\n", encoding="utf-8")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.default_launch_agent_paths", lambda scope=None: manager.paths)
+    monkeypatch.setattr("mac_audit_agent.launch_agent.SYSTEM_LAUNCH_DAEMON_PATH", manager.paths.plist_path)
+    report_path = tmp_path / "reports" / "monitor-report.html"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("<html>report</html>", encoding="utf-8")
+    manager.install_protected_mode()
+    assert manager.paths.plist_path.exists()
+    manager.uninstall_protected_mode(remove_runtime=False)
+    assert not manager.paths.plist_path.exists()
+    assert report_path.exists()
+    assert hasattr(manager, "uninstall_protected_mode")
+
+
+def test_system_monitor_install_rejects_user_launchagents_path(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("mac_audit_agent.launch_agent.os.geteuid", lambda: 0)
+    manager = LaunchAgentManager(tmp_path / "audit.sqlite", scope="system")
+    manager.paths = type(manager.paths)(
+        plist_path=Path.home() / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist",
+        stdout_path=tmp_path / "system-logs" / "background_monitor.stdout.log",
+        stderr_path=tmp_path / "system-logs" / "background_monitor.stderr.log",
+    )
+    with pytest.raises(RuntimeError, match="/Library/LaunchDaemons"):
+        manager.install_system_monitor()
 
 
 def test_launch_agent_install_validates_with_plutil_and_sets_permissions(tmp_path: Path, monkeypatch) -> None:
@@ -146,8 +771,8 @@ def test_launch_agent_install_validates_with_plutil_and_sets_permissions(tmp_pat
     monkeypatch.setattr("mac_audit_agent.launch_agent.os.chmod", lambda path, mode, **kwargs: chmod_calls.append((Path(path), mode)))
     monkeypatch.setattr("mac_audit_agent.launch_agent.os.chown", lambda path, uid, gid: chown_calls.append((Path(path), uid, gid)))
     runtime_base = tmp_path / "runtime"
-    monkeypatch.setattr("mac_audit_agent.launch_agent.runtime_root", lambda: runtime_base)
-    monkeypatch.setattr("mac_audit_agent.launch_agent.runtime_package_root", lambda: runtime_base / "mac_audit_agent")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.runtime_root", lambda scope=None: runtime_base)
+    monkeypatch.setattr("mac_audit_agent.launch_agent.runtime_package_root", lambda scope=None: runtime_base / "mac_audit_agent")
     monkeypatch.setattr("mac_audit_agent.launch_agent.monitor_script_path", lambda: tmp_path / "source" / "mac_audit_agent" / "monitor.py")
     source_pkg = tmp_path / "source" / "mac_audit_agent"
     source_pkg.mkdir(parents=True, exist_ok=True)
@@ -164,6 +789,9 @@ def test_launch_agent_install_validates_with_plutil_and_sets_permissions(tmp_pat
 
     assert plist_path == manager.paths.plist_path
     assert manager.paths.plist_path.exists()
+    payload = plistlib.loads(manager.paths.plist_path.read_bytes())
+    assert payload["ProgramArguments"][-2:] == ["--mode", "user-notifier"]
+    assert payload["EnvironmentVariables"]["MAC_AUDIT_AGENT_MONITOR_ROLE"] == "user-notifier"
     assert any(command[:2] == [PLUTIL_BIN, "-lint"] for command in calls)
     assert any(call == (manager.paths.plist_path, 0o644) for call in chmod_calls)
     assert any(call[0] == manager.paths.plist_path for call in chown_calls)
@@ -192,8 +820,8 @@ def test_launch_agent_start_stop_without_root(tmp_path: Path) -> None:
         stderr_path=tmp_path / "background_monitor.stderr.log",
     )
     from unittest.mock import patch
-    with patch("mac_audit_agent.launch_agent.runtime_root", lambda: runtime_base), patch(
-        "mac_audit_agent.launch_agent.runtime_package_root", lambda: runtime_base / "mac_audit_agent"
+    with patch("mac_audit_agent.launch_agent.runtime_root", lambda scope=None: runtime_base), patch(
+        "mac_audit_agent.launch_agent.runtime_package_root", lambda scope=None: runtime_base / "mac_audit_agent"
     ), patch("mac_audit_agent.launch_agent.monitor_script_path", lambda: source_pkg / "monitor.py"):
         manager.paths.plist_path.write_bytes(plistlib.dumps(build_launch_agent_plist(db_path=tmp_path / "audit.sqlite", python_executable="/usr/bin/python3")))
         manager.paths.stdout_path.parent.mkdir(parents=True, exist_ok=True)
@@ -233,8 +861,8 @@ def test_launch_agent_errors_include_exact_command_and_stderr(tmp_path: Path) ->
         stderr_path=tmp_path / "background_monitor.stderr.log",
     )
     from unittest.mock import patch
-    with patch("mac_audit_agent.launch_agent.runtime_root", lambda: runtime_base), patch(
-        "mac_audit_agent.launch_agent.runtime_package_root", lambda: runtime_base / "mac_audit_agent"
+    with patch("mac_audit_agent.launch_agent.runtime_root", lambda scope=None: runtime_base), patch(
+        "mac_audit_agent.launch_agent.runtime_package_root", lambda scope=None: runtime_base / "mac_audit_agent"
     ), patch("mac_audit_agent.launch_agent.monitor_script_path", lambda: source_pkg / "monitor.py"):
         manager.paths.plist_path.write_bytes(plistlib.dumps(build_launch_agent_plist(db_path=tmp_path / "audit.sqlite", python_executable="/usr/bin/python3")))
         manager.paths.stdout_path.parent.mkdir(parents=True, exist_ok=True)
@@ -256,8 +884,8 @@ def test_launch_agent_errors_include_exact_command_and_stderr(tmp_path: Path) ->
 
 def test_launch_agent_start_preflight_checks_working_directory_owner_mode_and_log_dirs(tmp_path: Path, monkeypatch) -> None:
     runtime_base = tmp_path / "runtime"
-    monkeypatch.setattr("mac_audit_agent.launch_agent.runtime_root", lambda: runtime_base)
-    monkeypatch.setattr("mac_audit_agent.launch_agent.runtime_package_root", lambda: runtime_base / "mac_audit_agent")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.runtime_root", lambda scope=None: runtime_base)
+    monkeypatch.setattr("mac_audit_agent.launch_agent.runtime_package_root", lambda scope=None: runtime_base / "mac_audit_agent")
     monkeypatch.setattr("mac_audit_agent.launch_agent.monitor_script_path", lambda: tmp_path / "source" / "mac_audit_agent" / "monitor.py")
     source_pkg = tmp_path / "source" / "mac_audit_agent"
     source_pkg.mkdir(parents=True, exist_ok=True)
@@ -349,8 +977,8 @@ def test_launch_agent_force_reinstall_attempts_bootout_remove_recreate_bootstrap
     manager.paths.plist_path.parent.mkdir(parents=True, exist_ok=True)
     manager.paths.stdout_path.parent.mkdir(parents=True, exist_ok=True)
     from unittest.mock import patch
-    with patch("mac_audit_agent.launch_agent.runtime_root", lambda: runtime_base), patch(
-        "mac_audit_agent.launch_agent.runtime_package_root", lambda: runtime_base / "mac_audit_agent"
+    with patch("mac_audit_agent.launch_agent.runtime_root", lambda scope=None: runtime_base), patch(
+        "mac_audit_agent.launch_agent.runtime_package_root", lambda scope=None: runtime_base / "mac_audit_agent"
     ), patch("mac_audit_agent.launch_agent.monitor_script_path", lambda: source_pkg / "monitor.py"):
         manager.paths.plist_path.write_bytes(plistlib.dumps(build_launch_agent_plist(db_path=tmp_path / "audit.sqlite", python_executable="/usr/bin/python3")))
         plist_path, notes = manager.force_reinstall()
@@ -612,6 +1240,184 @@ def test_input_activity_resumed_after_idle_uses_cfaa_dialog(tmp_path: Path) -> N
     assert any("Authorized use reminder" in command[2] for command in calls)
 
 
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        "idle_resume_detected",
+        "mouse_or_keyboard_activity_after_idle",
+    ],
+)
+def test_idle_resume_variants_use_cfaa_dialog(tmp_path: Path, event_type: str) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    calls = []
+    manager = NotificationManager(db, runner=lambda *args, **kwargs: calls.append(args[0]) or FakeCompletedProcess(returncode=0))
+    event = BackgroundMonitorEvent(
+        event_id=f"{event_type}-dialog",
+        timestamp="2026-04-24T12:00:00+00:00",
+        event_type=event_type,
+        severity="medium",
+        source="hid_idle_time",
+        evidence="Activity was detected after a period of inactivity.",
+        confidence="high",
+        recommendation="review",
+        metadata_json="{}",
+    )
+    sent, error = manager.notify(event)
+    assert sent is True
+    assert error == ""
+    assert any("display dialog" in command[2] for command in calls)
+    assert any("Authorized use reminder" in command[2] for command in calls)
+
+
+def test_visibility_sensitive_physical_and_device_events_notify_by_default(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    manager = NotificationManager(db)
+    for event_type, severity in [
+        ("camera_activity_suspected", "medium"),
+        ("camera_activity_confirmed", "high"),
+        ("bluetooth_device_connected", "medium"),
+        ("bluetooth_device_disconnected", "medium"),
+        ("usb_device_removed", "medium"),
+        ("unknown_hid_device_detected", "high"),
+        ("display_wake", "medium"),
+        ("display_sleep", "medium"),
+        ("screen_locked", "medium"),
+        ("lid_opened", "high"),
+        ("lid_closed", "high"),
+        ("idle_resume_detected", "medium"),
+        ("mouse_or_keyboard_activity_after_idle", "medium"),
+        ("system_moisture_detected", "critical"),
+    ]:
+        event = BackgroundMonitorEvent(
+            event_id=f"{event_type}-1",
+            timestamp="2026-04-24T12:00:00+00:00",
+            event_type=event_type,
+            severity=severity,
+            source="test",
+            evidence=f"{event_type} evidence",
+            confidence="high",
+            recommendation="review",
+            metadata_json="{}",
+            rule_id=event_type,
+            trigger_rule_id=event_type,
+            rule_name=event_type,
+            trigger_rule_name=event_type,
+        )
+        assert manager.preference_for(event.event_type)["notify"] is True
+        assert manager.should_notify(event) is True
+
+
+def test_security_overlay_buttons_use_full_legible_labels(tmp_path: Path, monkeypatch) -> None:
+    state_path = tmp_path / "state" / "security_overlay.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "active": True,
+        "event_type": "input_activity_resumed_after_idle",
+        "severity": "critical",
+        "style": "critical_red",
+        "title": "Authorized Use Notice",
+        "details": "Activity was detected after a period of inactivity.",
+        "summary": "Review required.",
+        "timestamp": "2026-06-02T12:00:00+00:00",
+        "count": 1,
+        "persistent": True,
+        "dismiss_after_seconds": 0,
+        "buttons": ["Open Timeline", "Preserve Evidence Snapshot", "Acknowledge"],
+    }
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    from mac_audit_agent.security_overlay import SecurityOverlay
+    app = QApplication.instance() or QApplication([])
+    overlay = SecurityOverlay(state_path)
+    overlay.refresh()
+
+    assert overlay.open_timeline.text() == "Open Timeline"
+    assert overlay.preserve_snapshot.text() == "Preserve Evidence Snapshot"
+    assert overlay.acknowledge.text() == "Acknowledge"
+    assert overlay.open_timeline.minimumHeight() >= 34
+    assert overlay.preserve_snapshot.minimumHeight() >= 34
+    assert overlay.acknowledge.minimumHeight() >= 34
+    overlay.close()
+    assert app is not None
+
+
+def test_visible_alert_decision_and_overlay_payload_restore_bottom_right_styles(tmp_path: Path, monkeypatch) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    manager = NotificationManager(db)
+    state_path = tmp_path / "state" / "security_overlay.json"
+    pid_path = tmp_path / "state" / "security_overlay.pid"
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", state_path)
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_PID_PATH", pid_path)
+    monkeypatch.setattr(manager, "_ensure_security_overlay_process", lambda: None)
+
+    cases = [
+        ("launchdaemon_added", "critical_red"),
+        ("usb_device_connected", "high_orange"),
+        ("new_usb_device_detected", "critical_red"),
+        ("apple_security_forecast_elevated", "neutral_grey"),
+        ("apple_security_forecast_urgent", "high_orange"),
+        ("input_activity_resumed_after_idle", "critical_red"),
+    ]
+    for event_type, expected_style in cases:
+        event = BackgroundMonitorEvent(
+            event_id=f"{event_type}-overlay",
+            timestamp="2026-04-24T12:00:00+00:00",
+            event_type=event_type,
+            severity="critical" if "urgent" in event_type or event_type in {"launchdaemon_added", "new_usb_device_detected"} else "high" if event_type == "usb_device_connected" else "medium",
+            source="test",
+            evidence=f"{event_type} evidence",
+            confidence="high",
+            recommendation="review",
+            metadata_json="{}",
+            rule_id=event_type,
+            trigger_rule_id=event_type,
+            rule_name=event_type,
+            trigger_rule_name=event_type,
+        )
+        decision = manager.should_show_visible_alert(event)
+        assert decision.show is True
+        assert decision.style == expected_style
+        assert manager.update_security_overlay(event) is True
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        assert payload["active"] is True
+        assert payload["style"] == expected_style
+        assert payload["visible_alert_shown"] is True
+        assert payload["buttons"]
+
+
+def test_visible_alert_cooldown_suppresses_repeat_overlay(tmp_path: Path, monkeypatch) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    manager = NotificationManager(db)
+    state_path = tmp_path / "state" / "security_overlay.json"
+    pid_path = tmp_path / "state" / "security_overlay.pid"
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", state_path)
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_PID_PATH", pid_path)
+    monkeypatch.setattr(manager, "_ensure_security_overlay_process", lambda: None)
+    event = BackgroundMonitorEvent(
+        event_id="usb-1",
+        timestamp="2026-04-24T12:00:00+00:00",
+        event_type="usb_device_connected",
+        severity="info",
+        source="test",
+        evidence="USB connected",
+        confidence="high",
+        recommendation="review",
+        metadata_json="{}",
+        rule_id="usb_device_connected",
+        trigger_rule_id="usb_device_connected",
+        rule_name="usb_device_connected",
+        trigger_rule_name="usb_device_connected",
+    )
+    assert manager.update_security_overlay(event) is True
+    db.set_background_monitor_state(manager._visible_alert_last_key(event), "2026-04-24T12:00:00+00:00")
+    repeat = BackgroundMonitorEvent(
+        **{**event.to_dict(), "event_id": "usb-2", "timestamp": "2026-04-24T12:05:00+00:00"}
+    )
+    decision = manager.should_show_visible_alert(repeat)
+    assert decision.show is False
+    assert decision.reason == "within_cooldown"
+
+
 def test_medium_event_logs_but_does_not_popup_by_default(tmp_path: Path) -> None:
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
     manager = NotificationManager(db)
@@ -707,7 +1513,7 @@ def test_lid_transition_events_popup_once(tmp_path: Path) -> None:
         metadata_json="{}",
     )
     assert manager.should_notify(opened) is True
-    db.set_background_monitor_state("notify:possible_lid_opened::Possible lid opened transition detected.", opened.timestamp)
+    db.set_background_monitor_state(manager._last_key(opened), opened.timestamp)
     repeat = BackgroundMonitorEvent(**{**opened.to_dict(), "event_id": "lid-open-2", "timestamp": "2026-04-24T12:01:00+00:00"})
     assert manager.should_notify(repeat) is False
     assert repeat.notification_decision == "suppressed_cooldown"
@@ -724,6 +1530,91 @@ def test_lid_transition_events_popup_once(tmp_path: Path) -> None:
         metadata_json="{}",
     )
     assert manager.should_notify(closed) is True
+
+
+def test_visible_alert_signature_distinguishes_device_transition_context(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    manager = NotificationManager(db)
+    first = BackgroundMonitorEvent(
+        event_id="usb-1",
+        timestamp="2026-04-24T12:00:00+00:00",
+        event_type="usb_device_connected",
+        severity="info",
+        source="ioreg_usb_observer",
+        process_name="IOUSBHost",
+        evidence="USB device recognized: keyboard.",
+        confidence="high",
+        recommendation="review",
+        related_path="/dev/disk1",
+        previous_state="device not present",
+        current_state="keyboard",
+        metadata_json="{}",
+    )
+    second = BackgroundMonitorEvent(
+        event_id="usb-2",
+        timestamp="2026-04-24T12:00:10+00:00",
+        event_type="usb_device_connected",
+        severity="info",
+        source="ioreg_usb_observer",
+        process_name="IOUSBHost",
+        evidence="USB device recognized: mouse.",
+        confidence="high",
+        recommendation="review",
+        related_path="/dev/disk2",
+        previous_state="device not present",
+        current_state="mouse",
+        metadata_json="{}",
+    )
+    assert manager._visible_alert_last_key(first) != manager._visible_alert_last_key(second)
+
+
+def test_idle_cfaa_reminder_prefers_overlay_and_does_not_call_dialog_when_overlay_visible(tmp_path: Path, monkeypatch) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    manager = NotificationManager(db)
+    event = BackgroundMonitorEvent(
+        event_id="idle-1",
+        timestamp="2026-04-24T12:00:00+00:00",
+        event_type="idle_resume_detected",
+        severity="medium",
+        source="hid_idle_time",
+        evidence="Input resumed after idle.",
+        confidence="high",
+        recommendation="review",
+        rule_id="idle_resume_detected",
+        trigger_rule_id="idle_resume_detected",
+        rule_name="Idle Resume Detected",
+        trigger_rule_name="Idle Resume Detected",
+        visible_alert_shown=True,
+        alert_style="critical_red",
+        metadata_json="{}",
+    )
+    called = []
+
+    def fail_dialog(*_args, **_kwargs):
+        called.append("dialog")
+        raise AssertionError("dialog should not be called when the overlay is already visible")
+
+    monkeypatch.setattr(manager, "_run_dialog_attempt", fail_dialog)
+
+    sent, error = manager.notify_cfaa_idle_reminder(event)
+
+    assert sent is True
+    assert error == ""
+    assert called == []
+
+
+def test_run_dialog_attempt_timeout_returns_completed_process(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+
+    def runner(command, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=command, timeout=5, output="", stderr="timed out")
+
+    manager = NotificationManager(db, runner=runner)
+    command, result = manager._run_dialog_attempt("High priority test message")
+
+    assert command[0] == "/usr/bin/osascript"
+    assert result.returncode == 124
+    assert "timed out" in result.stderr
 
 
 def test_new_admin_user_pops_by_default(tmp_path: Path) -> None:
@@ -794,7 +1685,7 @@ def test_hardware_monitor_baselines_usb_then_emits_new_recognition() -> None:
     )
     assert monitor.evaluate(None, baseline) == []
     events = monitor.evaluate(baseline, current)
-    assert [event.event_type for event in events] == ["usb_device_connected"]
+    assert [event.event_type for event in events] == ["usb_device_connected", "usb_inventory_changed"]
     assert "Acme New Device" in events[0].evidence
 
 
@@ -809,6 +1700,87 @@ def test_hardware_monitor_assigns_distinct_ids_to_usb_devices_in_same_snapshot()
         timestamp="2026-05-31T12:00:00+00:00",
     )
     assert len({event.event_id for event in events}) == 2
+
+
+def test_hardware_monitor_parses_only_connected_bluetooth_devices() -> None:
+    monitor = HardwareMonitor()
+    devices = monitor._parse_bluetooth_devices(
+        """
++-o Keyboard  <class IOBluetoothDevice, id 1>
+    "Name" = "Research Keyboard"
+    "DeviceAddress" = "AA-BB-CC-DD-EE-FF"
+    "Connected" = Yes
++-o Headset  <class IOBluetoothDevice, id 2>
+    "Name" = "Offline Headset"
+    "DeviceAddress" = "11-22-33-44-55-66"
+    "Connected" = No
+"""
+    )
+    assert devices == [{"name": "Research Keyboard", "address": "AA-BB-CC-DD-EE-FF", "vendor_id": "", "product_id": ""}]
+
+
+def test_hardware_monitor_emits_connected_bluetooth_event_with_provenance() -> None:
+    monitor = HardwareMonitor()
+    current = HardwareMonitorSnapshot(bluetooth_devices=[{"name": "Research Mouse", "address": "AA-BB"}])
+    events = monitor.evaluate(HardwareMonitorSnapshot(), current)
+    assert [event.event_type for event in events] == ["bluetooth_device_connected", "bluetooth_inventory_changed"]
+    assert events[0].trigger_subsource == "ioreg_bluetooth"
+    assert "Research Mouse" in events[0].evidence
+
+
+def test_hardware_monitor_emits_removed_usb_and_bluetooth_events() -> None:
+    monitor = HardwareMonitor()
+    previous = HardwareMonitorSnapshot(
+        usb_devices=[{"vendor_id": "1", "product_id": "2", "serial": "old", "location_id": "3", "name": "USB Token"}],
+        bluetooth_devices=[{"name": "BT Mouse", "address": "AA-BB"}],
+    )
+    current = HardwareMonitorSnapshot()
+    events = monitor.evaluate(previous, current)
+    types = [event.event_type for event in events]
+    assert "usb_device_removed" in types
+    assert "usb_inventory_changed" in types
+    assert "bluetooth_device_disconnected" in types
+    assert "bluetooth_inventory_changed" in types
+
+
+def test_native_event_bridge_normalizes_native_events(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    bridge = NativeEventBridge(db, event_log_path=tmp_path / "native_events.jsonl")
+    bridge.event_log_path.parent.mkdir(parents=True, exist_ok=True)
+    bridge.event_log_path.write_text(
+        json.dumps(
+            {
+                "event_type": "usb_inventory_changed",
+                "source": "native_usb_monitor",
+                "timestamp": "2026-06-01T12:00:00+00:00",
+                "confidence": "high",
+                "severity": "medium",
+                "evidence": {"added": ["phone"], "removed": []},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    drained = bridge.drain()
+    assert len(drained) == 1
+    assert drained[0].event_type == "usb_device_connected"
+    frame = NativeEventFrame(
+        event_type="lid_state_open",
+        source="native_power_monitor",
+        timestamp="2026-06-01T12:00:00+00:00",
+        confidence="high",
+        severity="high",
+        evidence={"previous_state": "closed", "current_state": "open"},
+        previous_state="closed",
+        current_state="open",
+    )
+    event = native_event_frame_to_event(frame)
+    assert normalize_native_event_type("lid_state_open") == "lid_opened"
+    assert event.event_type == "lid_opened"
+    assert event.rule_id
+    assert event.trigger_source == "native_event_helper"
+    assert event.previous_state == "closed"
+    assert event.current_state == "open"
 
 
 def test_hardware_monitor_emits_only_explicit_new_moisture_markers() -> None:
@@ -942,11 +1914,43 @@ def test_network_monitor_detects_ip_assignment_and_vpn_connection() -> None:
         vpn_interfaces=[{"interface": "utun3", "ip_address": "10.8.0.12", "netmask": "255.255.255.255", "broadcast": ""}],
     )
     events = monitor.evaluate(previous, current)
-    assert [event.event_type for event in events] == ["network_ip_assigned", "vpn_connected"]
+    assert [event.event_type for event in events] == [
+        "network_ip_assigned",
+        "new_network_connection_detected",
+        "new_outbound_connection_detected",
+        "vpn_connected",
+    ]
     assert events[0].severity == "info"
     assert "192.168.1.20" in events[0].evidence
-    assert events[1].severity == "info"
-    assert "utun3" in events[1].evidence
+    assert events[1].severity == "high"
+    assert "192.168.1.20" in events[1].evidence
+    assert events[2].severity == "high"
+    assert "192.168.1.20" in events[2].evidence
+    assert events[3].severity == "info"
+    assert "utun3" in events[3].evidence
+
+
+def test_new_network_connection_event_is_visible_by_default(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    manager = NotificationManager(db)
+    event = BackgroundMonitorEvent(
+        event_id="network-new-1",
+        timestamp="2026-04-24T12:00:00+00:00",
+        event_type="new_network_connection_detected",
+        severity="high",
+        source="network_state_observer",
+        evidence="New active network connection observed on en0: 192.168.1.20.",
+        confidence="high",
+        recommendation="Confirm the new connection matches expected network activity.",
+        rule_id="new_network_connection_detected",
+        trigger_rule_id="new_network_connection_detected",
+        rule_name="New Network Connection Detected",
+        trigger_rule_name="New Network Connection Detected",
+        process_name="network_state_observer",
+    )
+    decision = manager.should_show_visible_alert(event)
+    assert decision.show is True
+    assert decision.style == "high_orange"
 
 
 def test_network_info_alert_uses_overlay_and_bypasses_min_severity(tmp_path: Path, monkeypatch) -> None:
@@ -982,6 +1986,10 @@ def test_network_info_alert_uses_overlay_and_bypasses_min_severity(tmp_path: Pat
         confidence="high",
         recommendation="review",
         metadata_json="{}",
+        rule_id="network_ip_assigned",
+        trigger_rule_id="network_ip_assigned",
+        rule_name="network_ip_assigned",
+        trigger_rule_name="network_ip_assigned",
     )
     assert manager.should_notify(event) is True
     sent, error = manager.notify(event)
@@ -1254,8 +2262,8 @@ def test_security_overlay_groups_critical_events_and_launches_one_process(tmp_pa
     assert len(popen_calls) == 1
 
     repeat = BackgroundMonitorEvent(**{**event.to_dict(), "event_id": "overlay-2", "timestamp": "2026-05-31T12:01:00+00:00"})
-    assert manager.update_security_overlay(repeat) is True
-    assert json.loads(state_path.read_text(encoding="utf-8"))["count"] == 2
+    assert manager.update_security_overlay(repeat) is False
+    assert json.loads(state_path.read_text(encoding="utf-8"))["count"] == 1
     assert len(popen_calls) == 1
 
 
@@ -1273,8 +2281,62 @@ def test_security_overlay_ignores_low_severity_events(tmp_path: Path, monkeypatc
         source="hardware",
         evidence="USB recognized.",
     )
-    assert manager.update_security_overlay(event) is False
-    assert not state_path.exists()
+    assert manager.update_security_overlay(event) is True
+    assert json.loads(state_path.read_text(encoding="utf-8"))["severity"] == "low"
+
+
+def test_new_activity_overlay_is_visible_without_optional_overlay_setting(tmp_path: Path, monkeypatch) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    state_path = tmp_path / "state" / "security_overlay.json"
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", state_path)
+    manager = NotificationManager(db)
+    monkeypatch.setattr(manager, "_ensure_security_overlay_process", lambda: None)
+    event = BackgroundMonitorEvent(
+        event_id="bluetooth-connected-overlay",
+        timestamp="2026-06-02T12:00:00+00:00",
+        event_type="bluetooth_device_connected",
+        severity="medium",
+        source="hardware",
+        evidence="Bluetooth device connected: Research Mouse.",
+    )
+    assert manager.update_security_overlay(event) is True
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    assert payload["severity"] == "medium"
+    assert payload["event_type"] == "bluetooth_device_connected"
+
+
+def test_log_only_activity_routes_overlay_without_invoking_notification(tmp_path: Path, monkeypatch) -> None:
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite", record_startup=False)
+    monkeypatch.setattr(service.notifications, "update_security_overlay", lambda event: True)
+    monkeypatch.setattr(service.notifications, "notify", lambda *_args, **_kwargs: pytest.fail("notification should not run"))
+    event = BackgroundMonitorEvent(
+        event_id="camera-stop-overlay",
+        timestamp="2026-06-02T12:00:00+00:00",
+        event_type="camera_activity_stopped",
+        severity="info",
+        source="AVFoundation",
+        evidence="Camera stopped.",
+    )
+    assert service._route_log_only_activity_overlay(event) is True
+
+
+def test_user_notifier_renders_daemon_log_only_activity_overlay_once(tmp_path: Path, monkeypatch) -> None:
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite", mode="user-notifier", record_startup=False)
+    overlays = []
+    monkeypatch.setattr(service.notifications, "update_security_overlay", lambda event: overlays.append(event.event_type) or True)
+    event = BackgroundMonitorEvent(
+        event_id="daemon-bluetooth-overlay",
+        timestamp="2026-06-02T12:00:00+00:00",
+        event_type="camera_activity_stopped",
+        severity="info",
+        source="hardware_detector",
+        evidence="Camera stopped.",
+    )
+    service.db.record_monitor_event(event, dedupe_window_seconds=0)
+    notified = service.process_pending_notifications()
+    assert len(notified) == 0
+    assert overlays == ["camera_activity_stopped"]
+    assert service.db.latest_monitor_events(limit=1)[0].notification_decision == "overlay_only"
 
 
 def test_security_overlay_reconciliation_relaunches_active_overlay(tmp_path: Path, monkeypatch) -> None:
@@ -1360,6 +2422,15 @@ def test_send_alert_dialog_uses_osascript() -> None:
     assert "display dialog" in command[2]
 
 
+def test_send_alert_dialog_timeout_is_converted_to_failure() -> None:
+    def runner(command, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd=command, timeout=5, output="", stderr="timed out")
+
+    result = send_alert_dialog("Mac Audit Agent - High Priority Event", "FaceTime observed", runner=runner)
+    assert result.returncode == 124
+    assert "timed out" in (result.stderr or "")
+
+
 def test_high_event_uses_dialog_fallback_after_notification_failure(tmp_path: Path, monkeypatch) -> None:
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
     fallback_path = tmp_path / "monitor.log"
@@ -1394,6 +2465,79 @@ def test_high_event_uses_dialog_fallback_after_notification_failure(tmp_path: Pa
     assert any("display notification" in command[2] for command in calls)
     assert any("display dialog" in command[2] for command in calls)
     assert "notification attempt" in fallback_path.read_text(encoding="utf-8")
+
+
+def test_visible_alert_candidate_forces_overlay_even_when_notification_gate_is_false(tmp_path: Path, monkeypatch) -> None:
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite", poll_interval_seconds=5)
+    service.notifications.update_settings(
+        notify_all_events=False,
+        notify_important_events=True,
+        notify_min_severity="critical",
+        notification_sound="Glass",
+        duplicate_rate_limit_seconds=10,
+        high_priority_alert_style="notification",
+        notification_mode="notification",
+        popup_only_severe_events=True,
+        browser_capture_process_popup=False,
+        show_visible_alerts=False,
+        show_physical_session_alerts=True,
+        show_usb_bluetooth_alerts=True,
+        show_network_change_alerts=True,
+        show_admin_persistence_alerts=True,
+        show_apple_forecast_alerts=True,
+        idle_activity_warning_minutes=2,
+        cfaa_idle_warning_enabled=True,
+        cooldown_seconds_per_category=600,
+    )
+    event = service._build_event(
+        "lid_opened",
+        "Lid opened transition detected.",
+        severity="high",
+        confidence="high",
+        source="session_poll",
+        process_name="WindowServer",
+    )
+    assert event.rule_id == "lid_opened"
+    calls = []
+
+    def fake_notify(alert_event, notify_force=False):
+        calls.append(notify_force)
+        alert_event.visible_alert_shown = True
+        alert_event.notification_sent = True
+        alert_event.notification_error = ""
+        alert_event.notification_returncode = 0
+        alert_event.notification_decision = "sent"
+        return True, ""
+
+    monkeypatch.setattr(service, "_notify_event", fake_notify)
+    assert service.record_monitor_event(event) == event.event_id
+    assert calls == [True]
+    trace = service.db.get_event_alert_trace(event.event_id)
+    assert trace is not None
+    assert trace.alert_required is True
+    assert trace.notification_policy_result == "sent"
+
+
+def test_process_pending_notifications_survives_notification_timeout(tmp_path: Path, monkeypatch) -> None:
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite", poll_interval_seconds=5)
+    monkeypatch.setattr(service, "_route_log_only_activity_overlay", lambda _event, mark_processed=True: False)
+    monkeypatch.setattr(service, "_should_notify_event", lambda _event, notify_force=False: True)
+    monkeypatch.setattr(service, "_notify_event", lambda _event, notify_force=False: (_ for _ in ()).throw(subprocess.TimeoutExpired(cmd=["/usr/bin/osascript"], timeout=5, output="", stderr="timed out")))
+    event = service._build_event(
+        "camera_activity_confirmed",
+        "Camera activity confirmed for FaceTime.",
+        severity="high",
+        confidence="high",
+        source="process_poll",
+        process_name="FaceTime",
+    )
+    monkeypatch.setattr(service.db, "pending_background_monitor_events", lambda limit=10: [event])
+
+    pending = service.process_pending_notifications(limit=10)
+
+    assert pending == []
+    assert service.db.get_background_monitor_state("notification_pipeline_broken", "") == "1"
+    assert "Notifier delivery failed" in service.db.get_background_monitor_state("last_error", "")
 
 
 def test_repeated_high_event_within_cooldown_is_suppressed(tmp_path: Path) -> None:
@@ -1538,6 +2682,101 @@ def test_notification_failure_does_not_crash_and_logs_error(tmp_path: Path, monk
     assert event.notification_returncode == 1
 
 
+def test_notification_readiness_keeps_security_alerting_ready_when_notification_center_fails(tmp_path: Path, monkeypatch) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    readiness_path = tmp_path / "app-support" / "MacAuditAgent" / "notification_readiness.json"
+    monkeypatch.setattr("mac_audit_agent.notification_manager.NOTIFICATION_READINESS_PATH", readiness_path)
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", tmp_path / "overlay" / "security_overlay.json")
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_PID_PATH", tmp_path / "overlay" / "security_overlay.pid")
+
+    def fake_runner(command, **_kwargs):
+        if any("display notification" in part for part in command):
+            return FakeCompletedProcess(returncode=1, stderr="notification failed")
+        if any("display dialog" in part for part in command):
+            return FakeCompletedProcess(returncode=0, stdout="button returned: Acknowledge")
+        return FakeCompletedProcess(returncode=0, stdout="OK")
+
+    manager = NotificationManager(db, runner=fake_runner)
+    monkeypatch.setattr(manager, "_ensure_security_overlay_process", lambda: True)
+
+    result = manager.readiness_check()
+
+    assert result["overlay"]["success"] is True
+    assert result["dialog"]["success"] is True
+    assert result["notification_center"]["success"] is False
+    assert result["overall_status"] == "PASS"
+    assert result["security_alerting_ready"] is True
+    assert db.get_background_monitor_state("notification_status", "").startswith("security alerts ready")
+    assert readiness_path.exists()
+    assert db.latest_notification_capabilities() is not None
+    assert db.latest_alert_delivery_records(limit=1)[0].delivery_method_used in {"overlay", "dialog"}
+
+
+def test_notification_readiness_overlay_passes_even_when_visible_alerts_disabled(tmp_path: Path, monkeypatch) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", tmp_path / "overlay" / "security_overlay.json")
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_PID_PATH", tmp_path / "overlay" / "security_overlay.pid")
+    db.set_background_monitor_state("show_visible_alerts", "0")
+
+    manager = NotificationManager(db, runner=lambda *args, **kwargs: FakeCompletedProcess(returncode=0, stdout="ok"))
+    monkeypatch.setattr(manager, "_ensure_security_overlay_process", lambda: True)
+
+    result = manager.readiness_check()
+
+    assert result["overlay"]["success"] is True
+    assert result["overall_status"] == "PASS"
+
+
+def test_process_pending_notifications_advances_cursor_for_sequential_events(tmp_path: Path, monkeypatch) -> None:
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite", poll_interval_seconds=5)
+    monkeypatch.setattr(service.notifications, "should_notify", lambda _event, force=False: False)
+    first = service._build_event(
+        "usb_device_connected",
+        "USB device connected.",
+        severity="info",
+        confidence="high",
+        source="hardware_detector",
+        process_name="IOUSBHost",
+    )
+    second = service._build_event(
+        "usb_device_removed",
+        "USB device removed.",
+        severity="medium",
+        confidence="high",
+        source="hardware_detector",
+        process_name="IOUSBHost",
+    )
+    assert service.record_monitor_event(first) == first.event_id
+    assert service.record_monitor_event(second) == second.event_id
+    monkeypatch.setattr(service, "_route_log_only_activity_overlay", lambda _event, mark_processed=True: False)
+    monkeypatch.setattr(service, "_should_notify_event", lambda _event, notify_force=False: True)
+
+    def fake_notify(event, notify_force=False):
+        event.visible_alert_shown = True
+        event.notification_sent = True
+        event.notification_error = ""
+        event.notification_returncode = 0
+        return True, ""
+
+    monkeypatch.setattr(service, "_notify_event", fake_notify)
+
+    notified = service.process_pending_notifications(limit=10)
+
+    assert [event.event_id for event in notified] == [first.event_id, second.event_id]
+    assert service.db.get_background_monitor_state("last_event_consumed", "") == second.event_id
+    assert service.db.get_background_monitor_state("notifier_cursor_after", "") == second.event_id
+    assert service.db.get_background_monitor_state("notification_pipeline_broken", "") == "0"
+
+
+def test_usb_reconnect_observer_emits_immediately_for_first_topology_change(tmp_path: Path) -> None:
+    monitor = HardwareMonitor(executor=lambda *_args, **_kwargs: (0, "", ""))
+    observer = USBReconnectObserver(monitor, poll_seconds=0.1, quiet_window_seconds=0.0)
+    previous = [{"vendor_id": "1", "product_id": "2", "serial": "A", "name": "USB Keyboard"}]
+    current = []
+    events = monitor.usb_connection_events(previous, current, timestamp="2026-06-01T12:00:00+00:00")
+    assert [event.event_type for event in events] == ["usb_device_removed", "usb_inventory_changed"]
+
+
 def test_camera_detection_never_records_images_or_audio() -> None:
     monitor = PrivacyMonitor()
     event = monitor._event(
@@ -1611,6 +2850,18 @@ def test_camera_helper_process_creates_camera_activity_suspected() -> None:
     current.capture_capable_processes = [{"pid": 123, "name": "Photo Booth", "command": "/Applications/Photo Booth.app/Contents/MacOS/Photo Booth", "args": "/Applications/Photo Booth.app/Contents/MacOS/Photo Booth", "redacted_args": "/Applications/Photo Booth.app/Contents/MacOS/Photo Booth"}]
     events = monitor.evaluate(previous, current)
     assert any(event.event_type == "camera_activity_suspected" for event in events)
+
+
+def test_camera_active_api_emits_start_once_and_stop_transition() -> None:
+    monitor = PrivacyMonitor(executor=lambda _command: (1, "", "unsupported"))
+    inactive = PrivacyMonitorSnapshot(camera_active_api=False)
+    active = PrivacyMonitorSnapshot(camera_active_api=True)
+    started = monitor.evaluate(inactive, active)
+    repeated = monitor.evaluate(active, active)
+    stopped = monitor.evaluate(active, inactive)
+    assert [event.event_type for event in started] == ["camera_activity_confirmed"]
+    assert all(event.event_type != "camera_activity_confirmed" for event in repeated)
+    assert [event.event_type for event in stopped] == ["camera_activity_stopped"]
 
 
 def test_ps_parser_handles_paths_with_spaces() -> None:
@@ -1763,6 +3014,14 @@ def test_input_activity_resumed_after_idle_creates_medium_event() -> None:
     assert "idle for at least 120 seconds" in event.evidence
 
 
+def test_input_activity_idle_started_creates_aggregate_info_event() -> None:
+    monitor = SessionMonitor(executor=lambda _command: (1, "", "unsupported"))
+    events = monitor.evaluate(SessionSnapshot(hid_idle_seconds=10.0), SessionSnapshot(hid_idle_seconds=121.0))
+    event = next(event for event in events if event.event_type == "input_activity_idle_started")
+    assert event.severity == "info"
+    assert "Aggregate keyboard, mouse, and trackpad input" in event.evidence
+
+
 def test_session_state_observer_enqueues_lid_events_quickly() -> None:
     snapshots = [
         SessionSnapshot(display_state="awake", system_power_state="awake", session_locked=False, console_user="m", clamshell_state="open"),
@@ -1895,6 +3154,100 @@ def test_background_monitor_panel_show_context_button_enables_for_selected_event
     assert app is not None
 
 
+def test_background_monitor_panel_reads_events_from_shared_system_db_in_system_mode(tmp_path: Path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    user_db = AuditDatabase(tmp_path / "user.sqlite", tmp_path / "user-logs")
+    shared_db_path = tmp_path / "system" / "mac_audit_agent.sqlite3"
+    shared_db = AuditDatabase(shared_db_path, tmp_path / "system-logs")
+    user_db.set_background_monitor_state("monitor_mode", "system")
+    user_db.set_background_monitor_state("monitor_install_mode", "system")
+    shared_db.record_monitor_event(
+        BackgroundMonitorEvent(
+            event_id="shared-system-event",
+            timestamp="2026-06-02T12:00:00+00:00",
+            event_type="possible_lid_opened",
+            severity="high",
+            source="session_detector",
+            evidence="Shared system DB lid open event.",
+        )
+    )
+    monkeypatch.setattr("mac_audit_agent.ui.background_monitor_panel.default_monitor_db_path", lambda scope=None: shared_db_path)
+
+    panel = BackgroundMonitorPanel(user_db, FakeLaunchAgent(installed=True, running=False))
+    panel.refresh_events()
+
+    assert "possible_lid_opened" in panel.events_table.item(0, 1).text()
+    assert app is not None
+
+
+def test_background_monitor_panel_processes_pending_notifications_from_shared_system_db_in_system_mode(tmp_path: Path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    user_db = AuditDatabase(tmp_path / "user.sqlite", tmp_path / "user-logs")
+    shared_db_path = tmp_path / "system" / "mac_audit_agent.sqlite3"
+    shared_db = AuditDatabase(shared_db_path, tmp_path / "system-logs")
+    user_db.set_background_monitor_state("monitor_mode", "system")
+    user_db.set_background_monitor_state("monitor_install_mode", "system")
+    shared_db.record_monitor_event(
+        BackgroundMonitorEvent(
+            event_id="shared-system-visible-alert",
+            timestamp="2026-06-02T12:05:00+00:00",
+            event_type="possible_lid_closed",
+            severity="high",
+            source="session_detector",
+            evidence="Shared system DB lid close event.",
+            confidence="high",
+            recommendation="review",
+            metadata_json="{}",
+            rule_id="possible_lid_closed",
+            trigger_rule_id="possible_lid_closed",
+            rule_name="possible_lid_closed",
+            trigger_rule_name="possible_lid_closed",
+        )
+    )
+    panel = BackgroundMonitorPanel(user_db, FakeLaunchAgent(installed=True, running=False))
+    calls = []
+
+    class FakeNotificationService:
+        def __init__(self) -> None:
+            self.notifications = type(
+                "Notifier",
+                (),
+                {
+                    "status": lambda self: "available via AppleScript",
+                    "settings": lambda self: {
+                        "notify_all_events": False,
+                        "notify_important_events": True,
+                        "notify_min_severity": "info",
+                        "notification_sound": "Glass",
+                        "duplicate_rate_limit_seconds": 10,
+                        "popup_only_severe_events": True,
+                        "browser_capture_process_popup": False,
+                        "show_visible_alerts": True,
+                        "show_physical_session_alerts": True,
+                        "show_usb_bluetooth_alerts": True,
+                        "show_network_change_alerts": True,
+                        "show_admin_persistence_alerts": True,
+                        "show_apple_forecast_alerts": True,
+                        "idle_activity_warning_minutes": 2,
+                        "cfaa_idle_warning_enabled": True,
+                        "cooldown_seconds_per_category": 600,
+                    },
+                },
+            )()
+
+        def process_pending_notifications(self, limit: int = 200):
+            calls.append(limit)
+            return []
+
+    monkeypatch.setattr(panel, "_active_monitor_db", lambda: shared_db)
+    monkeypatch.setattr(panel, "_notification_service", lambda: FakeNotificationService())
+
+    panel.refresh()
+
+    assert calls
+    assert app is not None
+
+
 def test_background_monitor_panel_prefers_pid_or_fresh_heartbeat_for_running(tmp_path: Path, monkeypatch) -> None:
     class ContradictoryLaunchAgent(FakeLaunchAgent):
         def status(self):
@@ -1930,6 +3283,111 @@ def test_background_monitor_panel_detects_orphan_process(tmp_path: Path, monkeyp
     panel = BackgroundMonitorPanel(db, OrphanLaunchAgent(installed=True, running=False))
     text = panel.health_panel.toPlainText()
     assert "Monitor status: orphan monitor process" in text
+    assert app is not None
+
+
+def test_real_event_alert_trace_records_policy_and_overlay(tmp_path: Path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite", mode="user-notifier", record_startup=False)
+    monkeypatch.setattr(service.notifications, "runner", lambda *args, **kwargs: FakeCompletedProcess(returncode=0, stdout="ok", stderr=""))
+    monkeypatch.setattr(service.notifications, "_ensure_security_overlay_process", lambda: True)
+    monkeypatch.setattr(service.notifications, "_security_overlay_pid_alive", lambda: True)
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", tmp_path / "security_overlay.json")
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_PID_PATH", tmp_path / "security_overlay.pid")
+
+    event = service.simulate_event(
+        "usb_device_connected",
+        "USB device connected during real-event trace test.",
+        severity="info",
+        confidence="high",
+        process_name="real_usb_detector",
+        pid=321,
+        notify_force=True,
+    )
+
+    trace = service.db.get_event_alert_trace(event.event_id)
+    assert trace is not None
+    assert trace.stored_success is True
+    assert trace.notification_policy_checked is True
+    assert trace.notification_policy_result == "sent"
+    assert trace.notification_policy_reason in {"forced", "cooldown_elapsed", "first_severe_event"}
+    assert trace.overlay_dispatch_attempted is True
+    assert trace.overlay_dispatch_result == "SUCCESS"
+    assert trace.visible_alert_id == event.event_id
+    assert app is not None
+
+
+def test_process_pending_notifications_tracks_notifier_consumption(tmp_path: Path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite", mode="user-notifier", record_startup=False)
+    monkeypatch.setattr(service.notifications, "should_notify", lambda event, force=False: True)
+    monkeypatch.setattr(service.notifications, "runner", lambda *args, **kwargs: FakeCompletedProcess(returncode=0, stdout="ok", stderr=""))
+    monkeypatch.setattr(service.notifications, "_ensure_security_overlay_process", lambda: True)
+    monkeypatch.setattr(service.notifications, "_security_overlay_pid_alive", lambda: True)
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", tmp_path / "security_overlay.json")
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_PID_PATH", tmp_path / "security_overlay.pid")
+
+    event = BackgroundMonitorEvent(
+        event_id="trace-consume-1",
+        timestamp=utc_now_iso(),
+        event_type="lid_opened",
+        severity="high",
+        source="lid_detector",
+        process_name="lid_detector",
+        pid=1,
+        evidence="Lid opened during notifier consumption test.",
+        confidence="high",
+        recommendation="review timeline",
+        rule_id="lid_opened",
+        rule_name="lid_opened",
+        trigger_rule_id="lid_opened",
+        trigger_rule_name="lid_opened",
+        trigger_source="session_detector",
+    )
+    service.db.record_monitor_event(event)
+    service.db.record_event_alert_trace(
+        EventAlertTrace(
+            trace_id=f"trace-{event.event_id}",
+            event_id=event.event_id,
+            event_type=event.event_type,
+            original_event_type=event.event_type,
+            normalized_event_type=event.event_type,
+            detector_source=event.source,
+            created_at=event.timestamp,
+            stored_db_path=str(service.db.path),
+            stored_success=True,
+            severity_before_policy=event.severity,
+            severity_after_policy=event.severity,
+        )
+    )
+
+    notified = service.process_pending_notifications()
+
+    trace = service.db.get_event_alert_trace(event.event_id)
+    assert trace is not None
+    assert trace.notifier_seen is True
+    assert trace.notifier_db_path == str(service.db.path)
+    assert trace.overlay_dispatch_attempted is True
+    assert service.db.get_background_monitor_state("notifier_running", "0") == "1"
+    assert service.db.get_background_monitor_state("notifier_db_path", "") == str(service.db.path)
+    assert service.db.get_background_monitor_state("events_found_last_poll", "0") == "1"
+    assert service.db.get_background_monitor_state("events_alerted_last_poll", "0") == "1"
+    assert service.db.get_background_monitor_state("overlay_alive", "0") == "1"
+    assert notified
+    assert app is not None
+
+
+def test_background_monitor_panel_prefers_system_database_when_system_daemon_is_loaded(tmp_path: Path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    user_db = AuditDatabase(tmp_path / "user.sqlite", tmp_path / "logs")
+    system_db_path = tmp_path / "system.sqlite"
+    panel = BackgroundMonitorPanel(user_db, FakeLaunchAgent(installed=True, running=False))
+    monkeypatch.setattr("mac_audit_agent.ui.background_monitor_panel.default_monitor_db_path", lambda scope=None: system_db_path if scope == "system" else tmp_path / "user.sqlite")
+    monkeypatch.setattr(panel.system_launch_agent, "status", lambda: _monitor_status(installed=True, loaded=True, running=True, process_pid=4242))
+
+    active_db = panel._active_monitor_db()
+
+    assert active_db.path == system_db_path
     assert app is not None
 
 
@@ -2497,22 +3955,30 @@ def test_monitor_test_notification_command_logs_result(tmp_path: Path, monkeypat
             self.db = AuditDatabase(db_path, tmp_path / "logs")
 
         def test_notification(self):
-            self.db.set_background_monitor_state("notification_status", "available via AppleScript")
+            self.db.set_background_monitor_state("notification_status", "security alerts ready (overlay/dialog; notification center optional)")
             return {
                 "success": True,
-                "stderr": "",
-                "osascript_exists": True,
-                "notification_status": "available via AppleScript",
-                "permission_note": "unknown",
-                "event_id": "notification-test-1",
+                "overall_status": "PASS",
+                "overlay": {"success": True, "error": ""},
+                "dialog": {"success": True, "error": ""},
+                "notification_center": {"success": False, "error": "notification failed"},
+                "security_alerting_ready": True,
+                "notification_center_optional": True,
+                "last_test_time": "2026-04-25T00:00:00+00:00",
+                "last_test_result": "PASS",
+                "notification_status": "security alerts ready (overlay/dialog; notification center optional)",
+                "readiness_json": {},
+                "permission_note": "Notification Center is optional; overlay/dialog are sufficient for security alerting.",
+                "event_id": "notification-readiness-1",
             }
 
     monkeypatch.setattr("mac_audit_agent.monitor.BackgroundMonitorService", FakeService)
     exit_code = monitor_main(["--db-path", str(tmp_path / "audit.sqlite"), "--test-notification"])
     captured = capsys.readouterr()
     assert exit_code == 0
-    assert '"success": true' in captured.out
-    assert '"notification_status": "available via AppleScript"' in captured.out
+    assert '"overall_status": "PASS"' in captured.out
+    assert '"notification_center": {' in captured.out
+    assert '"notification_status": "security alerts ready (overlay/dialog; notification center optional)"' in captured.out
 
 
 def test_monitor_test_dialog_command_logs_result(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -2560,6 +4026,255 @@ def test_repair_action_attempts_bootout_bootstrap_kickstart(tmp_path: Path, monk
     assert app is not None
 
 
+def test_repair_alerts_notifier_recreates_plist_and_verifies_overlay(tmp_path: Path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    panel = BackgroundMonitorPanel(db, FakeLaunchAgent(installed=True, running=False))
+    calls = []
+
+    class FakeNotifierManager:
+        def __init__(self) -> None:
+            self.paths = type("Paths", (), {"plist_path": tmp_path / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"})()
+            self._target = "gui/501"
+            self._status = type(
+                "Status",
+                (),
+                {
+                    "process_pid": os.getpid(),
+                    "loaded": True,
+                    "running": True,
+                    "last_error": "",
+                },
+            )()
+
+        def stop(self):
+            calls.append("stop")
+
+        def uninstall(self):
+            calls.append("uninstall")
+
+        def install_user_notifier(self):
+            calls.append("install")
+            self.paths.plist_path.parent.mkdir(parents=True, exist_ok=True)
+            self.paths.plist_path.write_text("plist", encoding="utf-8")
+            return self.paths.plist_path
+
+        def _bootstrap_preflight(self):
+            calls.append("preflight")
+
+        def _bootout_commands(self):
+            return [[LAUNCHCTL_BIN, "bootout", self._target, str(self.paths.plist_path)]]
+
+        def _bootout_tolerate(self):
+            return set()
+
+        def _run(self, command, tolerate=None, check=True):
+            calls.append(" ".join(command))
+            return FakeCompletedProcess(returncode=0, stdout="OK", stderr="")
+
+        def _launchctl_target(self):
+            return self._target
+
+        def start(self):
+            calls.append("start")
+
+        def status(self):
+            return self._status
+
+    notifier_service = BackgroundMonitorService(tmp_path / "audit.sqlite", mode="user-notifier", record_startup=False)
+    monkeypatch.setattr(notifier_service.notifications, "should_notify", lambda event, force=False: True)
+    def fake_overlay(event):
+        event.visible_alert_shown = True
+        event.notification_decision = "sent"
+        event.notification_reason = "test"
+        event.notification_sent = True
+        event.notification_returncode = 0
+        notifier_service.db.set_background_monitor_state("overlay_manager_alive", "1")
+        notifier_service.db.set_background_monitor_state("overlay_dispatch_result", "SUCCESS")
+        notifier_service.db.set_background_monitor_state("overlay_dispatch_attempted", "1")
+        notifier_service.db.set_background_monitor_state("last_alert_displayed_at", event.timestamp)
+        notifier_service.db.update_monitor_event_notification(
+            event.event_id,
+            notification_sent=True,
+            notification_error="",
+            notification_returncode=0,
+            notification_decision="sent",
+            notification_reason="test",
+            cooldown_remaining_seconds=event.cooldown_remaining_seconds,
+            popup_allowed=True,
+            visible_alert_shown=True,
+            alert_style="critical_red",
+            cooldown_suppressed=False,
+            last_suppression_reason="",
+        )
+        return True
+
+    monkeypatch.setattr(notifier_service.notifications, "update_security_overlay", fake_overlay)
+
+    def fake_notify(event, force=False):
+        fake_overlay(event)
+        event.notification_sent = True
+        event.notification_returncode = 0
+        event.notification_error = ""
+        event.notification_decision = "sent"
+        event.notification_reason = "test"
+        event.visible_alert_shown = True
+        event.alert_style = "critical_red"
+        return True, ""
+
+    monkeypatch.setattr(notifier_service.notifications, "notify", fake_notify)
+    monkeypatch.setattr(panel, "_active_monitor_db", lambda: db)
+    monkeypatch.setattr(panel, "_notifier_manager", lambda: FakeNotifierManager())
+    monkeypatch.setattr(panel, "_notification_service", lambda: notifier_service)
+    monkeypatch.setattr(panel.service, "stop_orphan_processes", lambda: [9001])
+    monkeypatch.setattr(panel, "_repair_alerts_log_tail", lambda: "repair log tail")
+    monkeypatch.setattr("mac_audit_agent.ui.background_monitor_panel.QMessageBox.warning", lambda *args, **kwargs: None)
+    monkeypatch.setattr("mac_audit_agent.ui.background_monitor_panel.QMessageBox.information", lambda *args, **kwargs: None)
+
+    panel.repair_alerts_notifier()
+
+    assert "stop" in calls
+    assert "uninstall" in calls
+    assert "install" in calls
+    assert "start" in calls
+    assert db.get_background_monitor_state("notifier_installed", "") == "1"
+    assert db.get_background_monitor_state("notifier_loaded", "") == "1"
+    assert db.get_background_monitor_state("notifier_pid_alive", "") == "1"
+    assert db.get_background_monitor_state("overlay_manager_alive", "") == "1"
+    assert db.get_background_monitor_state("last_error", "") == ""
+    assert app is not None
+
+
+def test_test_bottom_right_alert_uses_direct_overlay_path(tmp_path: Path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    panel = BackgroundMonitorPanel(db, FakeLaunchAgent(installed=True, running=False))
+    service = BackgroundMonitorService(tmp_path / "service.sqlite", mode="user-notifier", record_startup=False)
+    overlay_calls: list[str] = []
+
+    def fake_overlay(event, **_kwargs):
+        overlay_calls.append(event.event_type)
+        event.visible_alert_shown = True
+        return True
+
+    monkeypatch.setattr(panel, "_event_service", lambda: service)
+    monkeypatch.setattr(panel, "_notification_service", lambda: service)
+    monkeypatch.setattr(service.notifications, "show_visible_security_alert", fake_overlay)
+    monkeypatch.setattr("mac_audit_agent.ui.background_monitor_panel.QMessageBox.information", lambda *args, **kwargs: None)
+    monkeypatch.setattr("mac_audit_agent.ui.background_monitor_panel.QMessageBox.warning", lambda *args, **kwargs: None)
+
+    panel.test_bottom_right_alert()
+
+    assert overlay_calls == [
+        "protected_monitor_tamper_detected",
+        "usb_device_connected",
+        "apple_security_forecast_elevated",
+    ]
+    latest = service.db.latest_monitor_events(limit=3)
+    assert len(latest) == 3
+    assert all(event.visible_alert_shown for event in latest)
+    assert app is not None
+
+
+def test_real_mandatory_events_use_same_visible_overlay_path(tmp_path: Path, monkeypatch) -> None:
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite", mode="user-notifier", record_startup=False)
+    overlay_calls: list[str] = []
+
+    def fake_overlay(event, **_kwargs):
+        overlay_calls.append(event.event_type)
+        event.visible_alert_shown = True
+        return True
+
+    monkeypatch.setattr(service.notifications, "show_visible_security_alert", fake_overlay)
+
+    event = BackgroundMonitorEvent(
+        event_id="real-usb-visible",
+        timestamp=utc_now_iso(),
+        event_type="usb_reconnect_detected",
+        severity="info",
+        source="hardware_detector",
+        evidence="USB reconnect observed by detector.",
+        confidence="high",
+    )
+
+    assert service.record_monitor_event(event) == "real-usb-visible"
+    stored = service.db.latest_monitor_events(limit=1)[0]
+    assert stored.event_type == "usb_device_connected"
+    assert stored.notification_sent is True
+    assert overlay_calls == ["usb_device_connected"]
+    trace = service.db.get_event_alert_trace("real-usb-visible")
+    assert trace is not None
+    assert trace.original_event_type == "usb_reconnect_detected"
+    assert trace.normalized_event_type == "usb_device_connected"
+
+
+def test_two_pending_real_events_alert_sequentially(tmp_path: Path, monkeypatch) -> None:
+    writer_db = AuditDatabase(tmp_path / "audit.sqlite")
+    notifier = BackgroundMonitorService(tmp_path / "audit.sqlite", mode="user-notifier", record_startup=False)
+    overlay_calls: list[str] = []
+
+    def fake_overlay(event, **_kwargs):
+        overlay_calls.append(event.event_type)
+        event.visible_alert_shown = True
+        return True
+
+    monkeypatch.setattr(notifier.notifications, "show_visible_security_alert", fake_overlay)
+    for event_type in ["lid_opened", "bluetooth_device_connected"]:
+        writer_db.record_monitor_event(
+            BackgroundMonitorEvent(
+                event_id=f"pending-{event_type}",
+                timestamp=utc_now_iso(),
+                event_type=event_type,
+                severity="medium",
+                source="real_detector",
+                evidence=f"{event_type} observed.",
+                confidence="high",
+            ),
+            dedupe_window_seconds=0,
+        )
+        writer_db.record_event_alert_trace(
+            EventAlertTrace(
+                trace_id=f"trace-pending-{event_type}",
+                event_id=f"pending-{event_type}",
+                event_type=event_type,
+                original_event_type=event_type,
+                normalized_event_type=event_type,
+                stored_db_path=str(writer_db.path),
+                stored_success=True,
+                alert_queue_enqueued=True,
+            )
+        )
+
+    notified = notifier.process_pending_notifications()
+
+    assert [event.event_type for event in notified] == ["lid_opened", "bluetooth_device_connected"]
+    assert overlay_calls == ["lid_opened", "bluetooth_device_connected"]
+    assert notifier.db.get_background_monitor_state("notifier_cursor_after", "") == "pending-bluetooth_device_connected"
+
+
+def test_idle_resume_uses_authorized_use_overlay_notice(tmp_path: Path, monkeypatch) -> None:
+    state_path = tmp_path / "security_overlay.json"
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", state_path)
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_PID_PATH", tmp_path / "security_overlay.pid")
+    manager = NotificationManager(AuditDatabase(tmp_path / "audit.sqlite"))
+    monkeypatch.setattr(manager, "_ensure_security_overlay_process", lambda: True)
+    event = BackgroundMonitorEvent(
+        event_id="idle-visible",
+        timestamp=utc_now_iso(),
+        event_type="keyboard_activity_detected",
+        severity="medium",
+        source="session_detector",
+        evidence="Keyboard input resumed after idle.",
+        confidence="high",
+    )
+
+    assert manager.show_visible_security_alert(event, reason="authorized_use_notice") is True
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    assert payload["title"] == "Authorized Use Notice"
+    assert payload["buttons"] == ["Open Timeline", "Preserve Evidence Snapshot", "Acknowledge"]
+    assert "Activity was detected after a period of inactivity" in payload["details"]
+
+
 def test_force_reinstall_action_stops_orphans_and_runs_force_reinstall(tmp_path: Path, monkeypatch) -> None:
     app = QApplication.instance() or QApplication([])
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
@@ -2581,10 +4296,122 @@ def test_force_reinstall_action_stops_orphans_and_runs_force_reinstall(tmp_path:
     assert app is not None
 
 
-def test_enable_continuous_monitoring_installs_starts_and_verifies_updates(tmp_path: Path, monkeypatch) -> None:
+def test_test_critical_alert_creates_visible_alert_event(tmp_path: Path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    panel = BackgroundMonitorPanel(db, FakeLaunchAgent(installed=True, running=False))
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite", mode="user-notifier", record_startup=False)
+    monkeypatch.setattr(service.notifications, "should_notify", lambda event, force=False: True)
+    def fake_overlay(event):
+        event.visible_alert_shown = True
+        event.notification_decision = "sent"
+        event.notification_reason = "test"
+        event.notification_sent = True
+        event.notification_returncode = 0
+        service.db.set_background_monitor_state("overlay_manager_alive", "1")
+        service.db.set_background_monitor_state("overlay_dispatch_result", "SUCCESS")
+        service.db.set_background_monitor_state("overlay_dispatch_attempted", "1")
+        service.db.set_background_monitor_state("last_alert_displayed_at", event.timestamp)
+        service.db.update_monitor_event_notification(
+            event.event_id,
+            notification_sent=True,
+            notification_error="",
+            notification_returncode=0,
+            notification_decision="sent",
+            notification_reason="test",
+            cooldown_remaining_seconds=event.cooldown_remaining_seconds,
+            popup_allowed=True,
+            visible_alert_shown=True,
+            alert_style="critical_red",
+            cooldown_suppressed=False,
+            last_suppression_reason="",
+        )
+        return True
+
+    monkeypatch.setattr(service.notifications, "update_security_overlay", fake_overlay)
+
+    def fake_notify(event, force=False):
+        fake_overlay(event)
+        event.notification_sent = True
+        event.notification_returncode = 0
+        event.notification_error = ""
+        event.notification_decision = "sent"
+        event.notification_reason = "test"
+        event.visible_alert_shown = True
+        event.alert_style = "critical_red"
+        return True, ""
+
+    monkeypatch.setattr(service.notifications, "notify", fake_notify)
+    monkeypatch.setattr(panel, "_event_service", lambda: service)
+    monkeypatch.setattr(panel, "_notification_service", lambda: service)
+    monkeypatch.setattr("mac_audit_agent.ui.background_monitor_panel.QMessageBox.information", lambda *args, **kwargs: None)
+    monkeypatch.setattr("mac_audit_agent.ui.background_monitor_panel.QMessageBox.warning", lambda *args, **kwargs: None)
+
+    panel.test_critical_alert()
+
+    latest = db.latest_monitor_events(limit=1)[0]
+    assert latest.event_type == "protected_monitor_tamper_detected"
+    assert latest.notification_sent is True
+    assert latest.visible_alert_shown is True
+    assert db.get_background_monitor_state("overlay_dispatch_result", "") in {"SUCCESS", "skipped"}
+    assert app is not None
+
+
+def test_primary_install_action_installs_system_daemon_and_user_notifier(tmp_path: Path, monkeypatch) -> None:
     app = QApplication.instance() or QApplication([])
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
     panel = BackgroundMonitorPanel(db, FakeLaunchAgent(installed=False, running=False))
+    calls = []
+    system_plist = Path("/Library/LaunchDaemons") / f"{LAUNCH_AGENT_LABEL}.plist"
+    user_plist = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
+
+    monkeypatch.setattr("mac_audit_agent.ui.background_monitor_panel.os.geteuid", lambda: 0)
+    monkeypatch.setattr(
+        panel.system_launch_agent,
+        "install_system_monitor",
+        lambda: calls.append("system-daemon") or system_plist,
+    )
+    monkeypatch.setattr(
+        panel,
+        "_system_user_notifier_manager",
+        lambda: type("SystemUserNotifier", (), {"install_user_notifier": lambda self: calls.append("user-notifier") or user_plist})(),
+    )
+    monkeypatch.setattr(panel.system_launch_agent, "show_logs", lambda: "/Library/Logs/MacAuditAgent/background_monitor.stdout.log")
+    monkeypatch.setattr(panel, "refresh", lambda: None)
+    monkeypatch.setattr("mac_audit_agent.ui.background_monitor_panel.QMessageBox.question", lambda *args, **kwargs: QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr("mac_audit_agent.ui.background_monitor_panel.QMessageBox.information", lambda *args, **kwargs: None)
+
+    panel.install_monitor()
+
+    assert calls == ["system-daemon", "user-notifier"]
+    assert db.get_background_monitor_state("monitor_mode", "") == "system"
+    assert db.get_background_monitor_state("plist_path", "") == str(system_plist)
+    assert app is not None
+
+
+def test_enable_continuous_monitoring_requires_system_install(tmp_path: Path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    panel = BackgroundMonitorPanel(db, FakeLaunchAgent(installed=False, running=False))
+    calls = []
+    monkeypatch.setattr(panel.launch_agent, "install", lambda: calls.append("install") or Path(panel.launch_agent.plist_path))
+    monkeypatch.setattr(panel.launch_agent, "start", lambda: calls.append("start"))
+    monkeypatch.setattr("mac_audit_agent.ui.background_monitor_panel.QMessageBox.warning", lambda *args, **kwargs: None)
+    monkeypatch.setattr(panel, "refresh", lambda: None)
+
+    panel.toggle_continuous_monitoring(True)
+
+    assert calls == []
+    assert "Install System Monitor + User Notifier" in db.get_background_monitor_state("last_error", "")
+    assert app is not None
+
+
+def test_enable_continuous_monitoring_starts_system_daemon_and_user_notifier(tmp_path: Path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    db.set_background_monitor_state("monitor_mode", "system")
+    panel = BackgroundMonitorPanel(db, FakeLaunchAgent(installed=True, running=False))
+    panel.system_launch_agent = FakeLaunchAgent(installed=True, running=False)
     calls = []
     states = iter(
         [
@@ -2592,8 +4419,8 @@ def test_enable_continuous_monitoring_installs_starts_and_verifies_updates(tmp_p
             type("Status", (), {"last_heartbeat": "2026-04-25T00:00:05+00:00", "detector_last_run_timestamp": "2026-04-25T00:00:06+00:00"})(),
         ]
     )
-    monkeypatch.setattr(panel.launch_agent, "install", lambda: calls.append("install") or Path(panel.launch_agent.plist_path))
-    monkeypatch.setattr(panel.launch_agent, "start", lambda: calls.append("start"))
+    monkeypatch.setattr(panel.system_launch_agent, "start", lambda: calls.append("system-start"))
+    monkeypatch.setattr(panel.launch_agent, "start", lambda: calls.append("user-notifier-start"))
     monkeypatch.setattr(panel.db, "get_background_monitor_status", lambda: next(states))
     monkeypatch.setattr("mac_audit_agent.ui.background_monitor_panel.time.sleep", lambda _seconds: None)
     monkeypatch.setattr("mac_audit_agent.ui.background_monitor_panel.QMessageBox.warning", lambda *args, **kwargs: None)
@@ -2601,7 +4428,7 @@ def test_enable_continuous_monitoring_installs_starts_and_verifies_updates(tmp_p
 
     panel.toggle_continuous_monitoring(True)
 
-    assert calls == ["install", "start"]
+    assert calls == ["system-start", "user-notifier-start"]
     assert app is not None
 
 
@@ -2869,3 +4696,79 @@ def test_provenance_text_redacts_secrets() -> None:
     assert "abc123" not in text
     assert "super-secret" not in text
     assert "[redacted]" in text
+
+
+def test_self_impact_watchdog_requires_sustained_pressure_and_bounds_backoff() -> None:
+    watchdog = MonitorSelfImpactWatchdog(alpha=1.0)
+    metrics = SelfImpactMetrics(
+        cycle_seconds=12.0,
+        poll_interval_seconds=3.0,
+        cpu_percent=95.0,
+        rss_mb=2048.0,
+        emitted_events=40,
+        detector_errors=2,
+    )
+    first = watchdog.evaluate(metrics)
+    second = watchdog.evaluate(metrics)
+    assert first.sustained_warning is False
+    assert second.sustained_warning is True
+    assert second.level == "critical"
+    assert watchdog.effective_poll_interval(3) == 12
+
+
+def test_monitor_self_impact_warning_records_once_and_persists_metrics(tmp_path: Path, monkeypatch) -> None:
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite", record_startup=False)
+    service.self_impact_watchdog = MonitorSelfImpactWatchdog(alpha=1.0)
+    monkeypatch.setattr(service.notifications, "notify", lambda event, force=False: (True, ""))
+    monkeypatch.setattr(service.notifications, "update_security_overlay", lambda event: True)
+    metrics = SelfImpactMetrics(12.0, 3.0, 95.0, 2048.0, 40, 2)
+    assert service._evaluate_self_impact(cycle_seconds=12, emitted_events=40, detector_errors=2, metrics=metrics) is None
+    event = service._evaluate_self_impact(cycle_seconds=12, emitted_events=40, detector_errors=2, metrics=metrics)
+    assert event is not None
+    assert event.event_type == "monitor_self_impact_warning"
+    assert event.severity == "critical"
+    assert "does not claim a denial-of-service condition" in event.recommendation
+    assert service.db.get_background_monitor_state("self_impact_backoff_multiplier") == "4"
+    assert service._evaluate_self_impact(cycle_seconds=12, emitted_events=40, detector_errors=2, metrics=metrics) is None
+    saved = [item for item in service.db.latest_monitor_events(limit=10) if item.event_type == "monitor_self_impact_warning"]
+    assert len(saved) == 1
+
+
+def test_monitor_self_impact_warning_forces_bottom_right_overlay(tmp_path: Path, monkeypatch) -> None:
+    state_path = tmp_path / "security_overlay.json"
+    db = AuditDatabase(tmp_path / "audit.sqlite")
+    manager = NotificationManager(db)
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", state_path)
+    monkeypatch.setattr(manager, "_ensure_security_overlay_process", lambda: None)
+    event = BackgroundMonitorEvent(
+        event_id="self-impact-overlay",
+        timestamp="2026-06-02T12:00:00+00:00",
+        event_type="monitor_self_impact_warning",
+        severity="critical",
+        source="self_impact_watchdog",
+        evidence="Sustained monitor resource pressure.",
+    )
+    assert manager.update_security_overlay(event) is True
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    assert payload["active"] is True
+    assert payload["severity"] == "critical"
+
+
+def test_system_daemon_periodic_integrity_drift_records_one_tamper_event(tmp_path: Path, monkeypatch) -> None:
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite", mode="system-daemon", record_startup=False)
+    integrity = {
+        "scope": "system",
+        "tamper_detected": True,
+        "severity": "critical",
+        "confidence": "high",
+        "plist_path": "/Library/LaunchDaemons/com.mac-audit-agent.monitor.plist",
+        "evidence": ["runtime hash changed"],
+        "recommendation": "Reinstall from a trusted source.",
+    }
+    monkeypatch.setattr("mac_audit_agent.monitor.verify_protected_monitor_integrity", lambda scope: integrity)
+    first = service._run_integrity_detector()
+    service._last_integrity_poll = 0.0
+    second = service._run_integrity_detector()
+    assert [event.event_type for event in first] == ["protected_monitor_tamper_detected"]
+    assert second == []
+    assert service.db.latest_monitor_events(limit=1)[0].severity == "critical"

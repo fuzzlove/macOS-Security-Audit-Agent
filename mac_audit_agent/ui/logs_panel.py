@@ -1,0 +1,127 @@
+from __future__ import annotations
+
+from typing import Any
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QSizePolicy,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+
+def _make_table(headers: list[str]) -> QTableWidget:
+    table = QTableWidget(0, len(headers))
+    table.setHorizontalHeaderLabels(headers)
+    table.setSelectionBehavior(QAbstractItemView.SelectRows)
+    table.setSelectionMode(QAbstractItemView.SingleSelection)
+    table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+    table.setAlternatingRowColors(True)
+    table.setWordWrap(True)
+    table.verticalHeader().setVisible(False)
+    table.horizontalHeader().setStretchLastSection(True)
+    return table
+
+
+class LogsPanel(QFrame):
+    refresh_requested = Signal()
+    open_reports_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("logsPanel")
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._build_ui()
+        self.set_logs({"events": [], "scan_logs": [], "summary": "No logs loaded yet."})
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        title = QLabel("Logs")
+        title.setStyleSheet("font-size: 18px; font-weight: 700; color: #F0F6FC;")
+        subtitle = QLabel("Local event history, notification decisions, and scan output.")
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet("color: #9DB0C9;")
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        toolbar = QHBoxLayout()
+        self.refresh_button = QPushButton("Refresh")
+        self.open_reports_button = QPushButton("Open Reports Folder")
+        for button in [self.refresh_button, self.open_reports_button]:
+            button.setMinimumHeight(36)
+            button.setToolTip(button.text())
+            button.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
+            toolbar.addWidget(button)
+        layout.addLayout(toolbar)
+
+        self.summary_label = QLabel("No logs loaded yet.")
+        self.summary_label.setWordWrap(True)
+        layout.addWidget(self.summary_label)
+
+        self.table = _make_table(["Timestamp", "Type", "Severity", "Decision", "Reason", "Evidence"])
+        layout.addWidget(self.table, 1)
+
+        self.details = QTextEdit()
+        self.details.setReadOnly(True)
+        self.details.setPlaceholderText("Select a log row to inspect it in detail.")
+        layout.addWidget(self.details)
+
+        self.refresh_button.clicked.connect(self.refresh_requested.emit)
+        self.open_reports_button.clicked.connect(self.open_reports_requested.emit)
+        self.table.itemSelectionChanged.connect(self._refresh_details)
+
+    def set_logs(self, payload: dict[str, Any]) -> None:
+        events = list(payload.get("events", []))
+        scan_logs = list(payload.get("scan_logs", []))
+        rows = events[:]
+        if scan_logs:
+            rows.extend(scan_logs)
+        self.summary_label.setText(str(payload.get("summary", "No logs loaded yet.")))
+        self.table.setRowCount(0)
+        for row_data in rows:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            values = [
+                str(row_data.get("timestamp", "")),
+                str(row_data.get("event_type", row_data.get("collector_name", ""))),
+                str(row_data.get("severity", "")),
+                str(row_data.get("notification_decision", row_data.get("exit_code", ""))),
+                str(row_data.get("notification_reason", row_data.get("error", row_data.get("stderr", "")))),
+                str(row_data.get("evidence", row_data.get("command_or_source", row_data.get("stdout", "")))),
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.UserRole, row_data)
+                self.table.setItem(row, column, item)
+        self.table.resizeRowsToContents()
+        self._refresh_details()
+
+    def _refresh_details(self) -> None:
+        selected = self.table.currentItem()
+        if selected is None:
+            self.details.setPlainText("No log row selected.")
+            return
+        row = selected.row()
+        item = self.table.item(row, 0)
+        if item is None:
+            return
+        data = item.data(Qt.UserRole)
+        if not isinstance(data, dict):
+            self.details.setPlainText("No log details available.")
+            return
+        lines = [f"{key}: {value}" for key, value in data.items()]
+        self.details.setPlainText("\n".join(lines))
+

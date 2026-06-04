@@ -4,315 +4,188 @@
 
 # macOS Security Audit Agent
 
-Liquidsky Network Security 🔒
+Mac Audit Agent is a local-first macOS audit, monitoring, and investigation platform. It is designed for analysts who need transparent evidence collection, reviewable alerts, and local-only reports without sending telemetry off the machine.
 
-Mac Audit Agent is a local-first macOS security auditing app built with Python and PySide6. It focuses on transparent, read-only collection, baseline comparison, review tracking, and a desktop UI that helps an investigator understand what changed and what needs follow-up.
+This repository is intended to be understandable, auditable, and safe enough for public review, institutional evaluation, and responsible internal deployment.
 
 ## What It Does
 
-- Runs defensive macOS audits with explicit command previews and collection warnings
-- Surfaces findings for ports, users, launch items, files, history indicators, processes, packet captures, and local network devices
-- Tracks investigation progress with persistent notes, review states, and audit history
-- Compares scans against baseline data to highlight drift and review-needed changes
-- Runs an optional user-session Background Monitor through a LaunchAgent, not a daemon
-- Exports JSON and HTML reports with embedded branding and optional monitor logs or investigation notes
+- Runs read-only macOS security audits
+- Surfaces findings with evidence, confidence, and rule provenance
+- Tracks review state, notes, suppression decisions, and case history
+- Correlates events into investigation patterns and flight-recorder timelines
+- Provides Apple Security Forecast summaries with low-noise grouping
+- Supports optional user LaunchAgent mode and optional root-owned system LaunchDaemon mode
+- Exports HTML and JSON reports locally
+- Preserves evidence snapshots before cleanup or remediation
+
+## What It Does Not Do
+
+- No telemetry
+- No cloud dependency
+- No browser history extraction
+- No cookie, token, password, or keychain extraction
+- No hidden persistence
+- No stealth behavior
+- No offensive exploitation
+- No hack-back or retaliation
+- No automatic destructive cleanup
+- No remediation without user approval
 
 ## Safety Model
 
-- Designed for systems you own or are explicitly authorized to assess
-- Read-only and dry-run-first by default
-- No exploitation, stealth, evasion, credential harvesting, browser-token dumping, keychain dumping, or packet-content capture in the app logic
-- Packet capture snapshots store local metadata only
-- Local network discovery does not perform vulnerability probing, credential checks, or exploits
-- Background monitoring is optional and user-scoped
+The default mode is conservative.
+
+Safe by default:
+
+- no packet capture unless explicitly chosen
+- no aggressive scans unless explicitly chosen
+- no full localhost scan unless explicitly chosen
+- no destructive cleanup by default
+- no system daemon install by default
+- no remediation execution by default
+- no automatic uploads
+- no automatic cloud enrichment using private data
+
+Important features that can increase risk always require explicit user action and a warning.
+
+## Privacy Model
+
+All data stays local on the Mac unless you explicitly export a report.
+
+The app does not collect:
+
+- browser history
+- private browsing state
+- cookies
+- passwords
+- keychain data
+- tokens
+- secrets
+- ambient camera/microphone content
+
+Redaction support is available for:
+
+- usernames
+- IP addresses
+- MAC addresses
+- hostnames
+- filesystem paths
+- URL secrets
+
+## Supported macOS Releases
+
+The project is developed for current Apple silicon and Intel Macs running modern macOS releases. The codebase is intended to be reviewed and tested on current supported macOS versions from Apple, not on hidden or unsupported system behavior.
+
+## Deployment Modes
+
+### User Monitor Mode
+
+- LaunchAgent under the logged-in user
+- Best for UI notifications and per-session alerts
+- Default install mode
+
+### System Monitor Mode
+
+- Root-owned LaunchDaemon under `/Library/LaunchDaemons`
+- Starts at boot
+- Writes to the shared system database
+- Does not show GUI alerts directly
+- Uses the user notifier companion for visible alerts after login
+
+## Scan Modes
+
+### Safe Scan
+
+The default scan mode is read-only and low impact.
+
+### Verbose Scan
+
+Adds more evidence detail without changing system state.
+
+### Aggressive Local Scan
+
+Targets localhost-only port enumeration and related local checks. This is intentionally opt-in because it can be noisy.
+
+## Evidence Preservation
+
+The platform prefers evidence preservation over cleanup.
+
+Before cleanup or remediation, the app can:
+
+- warn about potential evidence loss
+- create an evidence snapshot
+- preserve logs, notes, reports, and case data
+
+Do not delete logs automatically during an active investigation.
 
 ## Main UI Areas
 
 - Dashboard
-- Scan Categories
+- Intrusion Detection
+- Investigation Priorities
+- Flight Recorder
+- Evidence Snapshots
+- Apple Security Forecast
+- Logs
+- Settings
+- Operational Health
+- Skins
 - Results
 - Investigation Notes
-- Background Monitor
 - Command Preview
 
-The dashboard includes branded header artwork, a clickable logo that opens the usage guide, security score summary, and quick access buttons for the main scan workflows.
+## Screenshots
 
-## Current Scan Workflows
+Placeholders for public release:
 
-- Safe Scan
-- Verbose Scan
-- Aggressive Local Scan
-- Full Localhost Port Scan
-- Packet Capture Snapshot
-- Local Network Device Discovery
-- Aggressive Local Vulnerability Review
-
-### Findings Pipeline
-
-The app keeps findings in a single pipeline:
-
-- Collectors gather evidence and safe command output
-- Findings are normalized into the shared `Finding` model
-- Baseline comparison is attached to the scan result
-- The UI renders findings, review-needed groups, and details
-- JSON and HTML reports export the same scan result structure
-
-### Binary Trust Scoring
-
-The process and file pipelines now include binary trust scoring:
-
-- process trust score and summary
-- file trust score, trust label, and summary
-- UI tables show trust and score
-- reports include trust metadata
-
-### Baseline Drift Detection
-
-Baseline comparison now includes drift scoring:
-
-- drift score
-- drift label
-- drift summary
-- high-risk change count
-
-This is used to highlight meaningful change without duplicating the existing baseline comparison pipeline.
-
-## Local Network Discovery
-
-Local Network Discovery uses a Fing-style hybrid discovery model:
-
-- ARP first
-- mDNS / Bonjour enrichment
-- threaded ping fallback
-- reverse DNS and vendor enrichment
-- baseline comparison
-
-It identifies devices visible on the local network and shows the best available identity as `Likely Hostname` rather than relying on raw IPs alone.
-
-Device records include:
-
-- IP address
-- Likely hostname
-- MAC address
-- Vendor
-- Device type
-- Confidence
-- Discovery methods
-- Review flags
-- First seen
-- Last seen
-
-The UI shows:
-
-- selected interface
-- subnet
-- gateway
-- scan mode
-- discovered host count
-- device table
-- device details panel
-- raw debug output
-- baseline changes
-- review-needed devices
-
-Unknown devices are not proof of compromise, but should be reviewed.
-
-## Investigation Notes
-
-Investigation Notes are stored locally in SQLite and persist across sessions.
-
-Features:
-
-- Freeform notes editor
-- Reviewed checklist
-- Finding-linked notes
-- Timeline notes
-- Auto-save every 30 seconds
-- Last saved timestamp
-- Progress dashboard
-- Export to JSON and HTML
-
-Notes are intentionally local and are only included in reports when you explicitly choose to include them.
-
-## Background Monitor
-
-The Background Monitor is optional and user-scoped. It runs as a LaunchAgent in the user GUI domain and keeps continuous monitoring outside the main app process.
-
-### Recent Updates
-
-- Added an authorized-use acknowledgment dialog that appears once per GUI login session
-- Added a persistent bottom-right overlay for high and critical events
-- Added explicit hardware handling for USB recognition and moisture detection
-- Added a fast USB reconnect observer so brief disconnect/reconnect cycles are captured reliably
-- Added trusted USB inventory tracking so first-seen physical USB identities can escalate to a critical alert
-- Added system-daemon support so the monitor can also run from `/Library/LaunchDaemons` with shared runtime and log paths
-- Added a medium-severity alert when keyboard, mouse, and trackpad input resumes after 2 minutes of inactivity
-- That idle-resume event reuses the CFAA reminder dialog so the user sees the same authorized-use warning again after inactivity
-- Added separate sounds for USB recognition and moisture detection
-- Added informational bottom-right overlay alerts for new IP assignments and VPN connections
-- Added critical persistence alerts for new LaunchDaemons and other startup persistence methods
-- Added logging of previous and current startup persistence inventories
-- Added a Security Flight Recorder context window with `Show Context` for findings and monitor events
-- Added a CVE findings digest that includes the authorized-use reminder and deduplicates repeated digests
-- Added documentation for the hardware notice design and UAT coverage
-
-### LaunchAgent Behavior
-
-- Installed under `~/Library/LaunchAgents/com.mac-audit-agent.monitor.plist`
-- Uses the user GUI domain only
-- Runs continuously with `RunAtLoad = true` and `KeepAlive = true`
-- Writes stdout and stderr logs under `~/.mac_audit_agent/logs`
-- Uses a runtime copy under `~/.mac_audit_agent/runtime` to avoid protected-folder access issues
-
-The monitor code now also supports a system LaunchDaemon mode. In that mode the plist lives under `/Library/LaunchDaemons`, the launch target is `system`, and the runtime, logs, and SQLite path move to shared locations under `/Library/Application Support/MacAuditAgent` and `/Library/Logs/MacAuditAgent`.
-
-### Monitor Actions
-
-- Install Monitor
-- Start Monitor
-- Stop Monitor
-- Restart Monitor
-- Repair Monitor
-- Force Reinstall Monitor
-- Uninstall Monitor
-- Show Logs
-- Test Notification
-- Test High Priority Dialog
-- Generate Test Event
-- Event Priorities
-
-### Monitor Coverage
-
-The monitor records privacy and session indicators such as:
-
-- camera or capture-capable process observations
-- lid open/close and display/session transitions
-- remote login and screen sharing posture
-- suspicious processes
-- persistence and high-risk security events
-- input activity resuming after extended inactivity
-- USB reconnects and first-seen USB devices
-- explicit moisture or liquid detection markers
-
-The monitor writes events to SQLite and to local logs, then applies notification policy rules. By default, severe events may alert while normal activity stays silent and still gets logged.
-
-The visible alert policy is intentionally narrower than storage. Informational events stay non-modal by default, while first-seen USB hardware is treated as critical and new network/VPN assignment events show as subtle informational overlays.
-
-### Investigator Workflow Layer
-
-The workflow layer sits above raw detectors and scan output:
-
-- Security Replay: compares saved scan moments and recent monitor events over time
-- Review Queue: ranks findings by severity, confidence, review state, and suppression history
-- Explainability Engine: summarizes what happened, why it matters, supporting evidence, and the next action
-- Security Flight Recorder: builds a 15-minute before/after context window for findings and monitor events and shows the surrounding timeline
-
-The workflow layer stays local-only and uses evidence already captured by the app. It does not make unsupported compromise claims.
-
-### Monitor Health
-
-The UI health panel shows:
-
-- LaunchAgent installed
-- LaunchAgent loaded
-- PID alive
-- heartbeat freshness
-- detector timestamp
-- current snapshot keys
-- last event
-- last error
-- log paths
-
-## Reports
-
-The app exports JSON and HTML reports for both scan results and investigation notes.
-
-Report output includes:
-
-- scan metadata
-- findings
-- baseline comparison
-- network discovery results
-- process trust scoring
-- optional background monitor logs
-- optional investigation notes
-
-Reports include the logo branding when the asset is available.
-
-## Branding and Assets
-
-The app uses bundled assets for its logo and report branding.
-
-- Main logo asset: `mac_audit_agent/assets/logo.png`
-- Secondary dashboard logo: `mac_audit_agent/assets/logo2.png`
-- Asset resolution works from source and PyInstaller builds
+- Dashboard
+- Intrusion Detection
+- Investigation Priorities
+- Flight Recorder
+- Apple Security Forecast
+- Operational Health
+- Settings
 
 ## Installation
 
-Create a virtual environment and install dependencies:
+### Source
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install PySide6 pytest
+python3 -m pip install -r requirements.txt
+python3 launcher.py
 ```
 
-## Run
+### PyInstaller app
 
-Start the desktop app:
+Build the bundled macOS app with the provided spec file:
 
 ```bash
-python3 -m mac_audit_agent.app
+pyinstaller "Mac Audit Agent.spec"
 ```
 
-The default local database is:
+## Uninstall
 
-```text
-~/.mac_audit_agent.sqlite3
-```
+- Remove the LaunchAgent or LaunchDaemon from Launch Services
+- Remove the runtime copy if you installed system mode
+- Preserve reports, snapshots, notes, and evidence unless you intentionally choose to remove them
 
-## Packaging
+## Legal / Authorized Use Notice
 
-Include bundled assets when building with PyInstaller:
+Use this software only on systems and networks you own or are explicitly authorized to assess.
 
-```bash
-pyinstaller --add-data "mac_audit_agent/assets:mac_audit_agent/assets" mac_audit_agent/app.py
-```
+If you are unsure whether you are authorized, stop and obtain written approval before running scans, monitors, or exports.
 
-## Testing
+## Documentation
 
-Run the full test suite:
+- [Architecture](docs/ARCHITECTURE.md)
+- [Threat Model](docs/THREAT_MODEL.md)
+- [Privacy](docs/PRIVACY.md)
+- [Deployment](docs/DEPLOYMENT.md)
+- [Operational Safety](docs/OPERATIONAL_SAFETY.md)
+- [Government / Enterprise Evaluation](docs/GOVERNMENT_EVALUATION.md)
+- [Public Release Checklist](docs/PUBLIC_RELEASE_CHECKLIST.md)
 
-```bash
-pytest mac_audit_agent/tests
-```
+## Tests
 
-Useful focused runs:
-
-```bash
-pytest mac_audit_agent/tests/test_storage.py
-pytest mac_audit_agent/tests/test_reporting.py
-pytest mac_audit_agent/tests/test_network_discovery.py
-pytest mac_audit_agent/tests/test_background_monitor.py
-```
-
-## Troubleshooting
-
-- If the Background Monitor shows `ModuleNotFoundError`, reinstall it so the LaunchAgent runs from the runtime copy under `~/.mac_audit_agent/runtime`
-- If LaunchAgent bootstrap fails, check the monitor stdout and stderr logs under `~/.mac_audit_agent/logs`
-- Design notes for the new USB/CFAA behavior are in `docs/CFAA_HARDWARE_NOTICE_DESIGN.md`
-- UAT steps for the background monitor are in `docs/UAT_BACKGROUND_MONITOR.md`
-- If network discovery returns no devices, verify the selected interface and confirm the subnet is the one you intended to assess
-- If reports look empty, confirm a scan has completed and the current scan result is loaded
-
-## Current Status
-
-The app currently includes:
-
-- scan workflows for ports, users, launch items, files, history, processes, packet capture, local network discovery, and localhost scanning
-- investigation notes with progress tracking
-- background privacy/session monitoring through a user LaunchAgent
-- trust scoring for binaries
-- baseline drift detection
-- report branding with logo assets
-- JSON and HTML export paths for scans, monitor events, and notes
+The repository includes unit tests, storage tests, UI smoke tests, and report export tests. The public release checklist requires that the test suite, compile checks, and diff checks pass before distribution.

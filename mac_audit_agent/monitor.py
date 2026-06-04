@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -25,29 +26,40 @@ from datetime import datetime, timedelta, timezone
 
 from mac_audit_agent.launch_agent import (
     LAUNCH_AGENT_LABEL,
+    MAC_AUDIT_AGENT_ENV_ROLE,
+    MONITOR_ROLE_LEGACY,
+    MONITOR_ROLE_SYSTEM,
+    MONITOR_ROLE_USER,
     PLUTIL_BIN,
     default_launch_agent_paths,
     default_monitor_db_path,
     launchctl_target,
+    launch_scope,
     monitor_log_root,
     monitor_script_path,
     project_root,
+    verify_protected_monitor_integrity,
     runtime_monitor_script_path,
     runtime_root,
 )
 from mac_audit_agent.hardware_monitor import HardwareMonitor, USBReconnectObserver
-from mac_audit_agent.models import BackgroundMonitorEvent, utc_now_iso
-from mac_audit_agent.rules import correlation_id_for, evidence_hash, normalized_signal, rule_for_event
+from mac_audit_agent.models import BackgroundMonitorEvent, EventAlertTrace, utc_now_iso
+from mac_audit_agent.rules import canonical_event_type, correlation_id_for, evidence_hash, normalized_signal, rule_for_event
 from mac_audit_agent.persistence_monitor import PersistenceMonitor, PersistenceSnapshot
 from mac_audit_agent.network_monitor import NetworkMonitor, NetworkStateObserver, NetworkMonitorSnapshot
-from mac_audit_agent.notification_manager import NotificationManager
+from mac_audit_agent.notification_manager import ACTIVITY_OVERLAY_EVENT_TYPES, NotificationManager
+from mac_audit_agent.models import NotificationCapabilities
 from mac_audit_agent.privacy_monitor import PrivacyMonitor, PrivacyMonitorSnapshot
+from mac_audit_agent.native_event_bridge import NativeEventBridge
 from mac_audit_agent.session_monitor import SessionMonitor, SessionSnapshot, SessionStateObserver
+from mac_audit_agent.self_impact_watchdog import MonitorSelfImpactWatchdog, SelfImpactMetrics
 from mac_audit_agent.storage import AuditDatabase
+from mac_audit_agent.system_monitor_readiness import process_deployment_event_flow_request
+from mac_audit_agent.version import APP_VERSION
 
 
 LOGGER = logging.getLogger(__name__)
-MONITOR_VERSION = "background-monitor-2026.05.31"
+MONITOR_VERSION = APP_VERSION
 TRUSTED_USB_DEVICES_STATE_KEY = "trusted_usb_devices_json"
 DISCLAIMER = (
     "This monitor records local security events and privacy indicators. "
@@ -72,8 +84,10 @@ IMPORTANT_EVENT_TYPES = {
     "launchagent_added",
     "persistence_item_created_high_risk",
     "persistence_item_created",
+    "protected_monitor_tamper_detected",
     "major_security_event",
     "alert_storm_detected",
+    "monitor_self_impact_warning",
     "monitor_self_test",
 }
 ALERT_STORM_THRESHOLD = 20
@@ -84,6 +98,7 @@ HEARTBEAT_SECONDS = 30
 DEDUPE_SECONDS = 60
 NETWORK_POLL_SECONDS = 2.0
 PERSISTENCE_POLL_SECONDS = 10.0
+INTEGRITY_POLL_SECONDS = 60.0
 PS_LINE_RE = re.compile(r"^\s*(\d+)\s+(.*?)\s{2,}(.*)$")
 
 
@@ -183,12 +198,102 @@ def tail_text_file(path: Path, lines: int = 30) -> str:
     return "\n".join(content[-lines:])
 
 
+class _DaemonNotificationManager:
+    def __init__(self, db) -> None:
+        self.db = db
+
+    def settings(self) -> dict[str, object]:
+        return {
+            "event_preferences": {},
+            "notify_min_severity": "info",
+            "popup_only_severe_events": False,
+            "browser_capture_process_popup": False,
+        }
+
+    def event_preferences(self) -> dict[str, dict[str, object]]:
+        return {}
+
+    def update_event_preferences(self, preferences: dict[str, dict[str, object]]) -> None:
+        self.db.set_background_monitor_state("daemon_event_preferences_json", json.dumps(preferences, sort_keys=True))
+
+    def preference_for(self, event_type: str) -> dict[str, object]:
+        if event_type == "monitor_self_impact_warning":
+            return {"enabled": True, "severity": "critical", "notify": False, "cooldown_seconds": 900, "notification_mode": "none"}
+        return {"enabled": True, "notify": False, "cooldown_seconds": 0, "notification_mode": "none"}
+
+    def status(self) -> str:
+        return "system daemon: GUI notifications deferred to user notifier"
+
+    def capabilities(self) -> NotificationCapabilities:
+        return NotificationCapabilities(
+            overlay_available=False,
+            applescript_dialog_available=False,
+            notification_center_available=False,
+            osascript_exists=Path("/usr/bin/osascript").exists(),
+            last_test_time=self.db.get_background_monitor_state("last_test_time", ""),
+            last_test_result="system daemon defers GUI notifications to the user notifier",
+        )
+
+    def refresh_notification_capabilities(self) -> NotificationCapabilities:
+        capabilities = self.capabilities()
+        try:
+            self.db.set_background_monitor_state("notification_capabilities_json", json.dumps(capabilities.to_dict(), sort_keys=True))
+        except Exception:
+            pass
+        return capabilities
+
+    def readiness_check(self) -> dict[str, object]:
+        capabilities = self.refresh_notification_capabilities()
+        result = {
+            "updated_at": utc_now_iso(),
+            "overlay": {"available": False, "attempted": False, "success": False, "error": "system daemon defers GUI notifications"},
+            "dialog": {"available": False, "attempted": False, "success": False, "error": "system daemon defers GUI notifications"},
+            "notification_center": {"available": False, "attempted": False, "success": False, "error": "system daemon defers GUI notifications"},
+            "overall_status": "PASS",
+            "reason": "System daemon does not render GUI alerts directly; user notifier handles delivery.",
+            "security_alerting_ready": True,
+            "notification_center_optional": True,
+            "last_test_time": utc_now_iso(),
+            "last_test_result": "PASS",
+            "capabilities": capabilities.to_dict(),
+        }
+        self.db.set_background_monitor_state("notification_readiness_json", json.dumps(result, sort_keys=True))
+        self.db.set_background_monitor_state("notification_status", self.status())
+        return result
+
+    def start_cfaa_login_acknowledgment(self) -> bool:
+        return False
+
+    def poll_cfaa_login_acknowledgment(self) -> bool:
+        return False
+
+    def reconcile_security_overlay(self) -> bool:
+        return False
+
+    def update_security_overlay(self, event: BackgroundMonitorEvent) -> None:
+        return None
+
+    def show_visible_security_alert(self, event: BackgroundMonitorEvent, reason: str = "") -> bool:
+        self.db.set_background_monitor_state("last_notification_decision", "overlay_deferred")
+        self.db.set_background_monitor_state("last_suppression_reason", reason or "system daemon defers GUI notifications")
+        return False
+
+    def should_notify(self, event: BackgroundMonitorEvent, *, force: bool = False) -> bool:
+        return False
+
+    def notify(self, event: BackgroundMonitorEvent, force: bool = False) -> tuple[bool, str]:
+        return False, "system daemon does not show GUI notifications"
+
+
 class BackgroundMonitorService:
-    def __init__(self, db_path: Path, poll_interval_seconds: int = 5, executor=None, record_startup: bool = True) -> None:
+    def __init__(self, db_path: Path, poll_interval_seconds: int = 5, executor=None, record_startup: bool = True, mode: str = MONITOR_ROLE_LEGACY) -> None:
         self.db = AuditDatabase(db_path)
         self.poll_interval_seconds = max(3, min(5, poll_interval_seconds))
         self.executor = executor or self._run_command
         self.record_startup = record_startup
+        self.mode = (mode or MONITOR_ROLE_LEGACY).strip().lower()
+        self.system_daemon_mode = self.mode == MONITOR_ROLE_SYSTEM
+        self.user_notifier_mode = self.mode == MONITOR_ROLE_USER
         self.privacy_monitor = PrivacyMonitor(executor=self.executor)
         self.session_monitor = SessionMonitor(executor=self.executor)
         self.session_observer = SessionStateObserver(self.session_monitor)
@@ -197,7 +302,9 @@ class BackgroundMonitorService:
         self.network_monitor = NetworkMonitor(executor=self.executor)
         self.network_observer = NetworkStateObserver(self.network_monitor, poll_seconds=NETWORK_POLL_SECONDS)
         self.persistence_monitor = PersistenceMonitor(executor=self.executor)
-        self.notifications = NotificationManager(self.db)
+        self.native_event_bridge = NativeEventBridge(self.db)
+        self.notifications = NotificationManager(self.db) if not self.system_daemon_mode else _DaemonNotificationManager(self.db)
+        self.self_impact_watchdog = MonitorSelfImpactWatchdog()
         self.previous_privacy = None
         self.previous_session = None
         self.previous_hardware = None
@@ -207,6 +314,7 @@ class BackgroundMonitorService:
         self.latest_snapshot: dict[str, object] = {}
         self._last_heartbeat_written = 0.0
         self._last_sharing_poll = 0.0
+        self._last_integrity_poll = 0.0
         self.enabled_detectors = [
             "camera_process_detector",
             "screen_session_detector",
@@ -215,6 +323,7 @@ class BackgroundMonitorService:
             "sharing_service_detector",
             "suspicious_process_detector",
             "hardware_device_detector",
+            "protected_monitor_integrity_detector",
         ]
         self._detector_enabled_flags = {
             "detector_enabled_camera": "1",
@@ -224,6 +333,7 @@ class BackgroundMonitorService:
             "detector_enabled_sharing": "1",
             "detector_enabled_process": "1",
             "detector_enabled_hardware": "1",
+            "detector_enabled_integrity": "1",
         }
         self._ensure_log_paths()
         if self.record_startup:
@@ -235,20 +345,32 @@ class BackgroundMonitorService:
             self._write_log_line(f"startup: monitor initialized | db_path={self.db.path}")
             self._record_startup_diagnostics()
             self.record_startup = True
-        self.notifications.start_cfaa_login_acknowledgment()
-        self.session_observer.start()
-        self.network_observer.start()
-        self.usb_observer.start()
-        while True:
-            self.notifications.poll_cfaa_login_acknowledgment()
+        if self.user_notifier_mode:
             self.notifications.start_cfaa_login_acknowledgment()
-            self.notifications.reconcile_security_overlay()
-            self.run_once()
-            time.sleep(self.poll_interval_seconds)
+        if not self.user_notifier_mode:
+            self.session_observer.start()
+            self.network_observer.start()
+            self.usb_observer.start()
+        while True:
+            if self.user_notifier_mode:
+                self.record_heartbeat()
+                self.process_pending_notifications()
+            else:
+                self.notifications.poll_cfaa_login_acknowledgment()
+                self.notifications.start_cfaa_login_acknowledgment()
+                self.notifications.reconcile_security_overlay()
+                self.run_once()
+            time.sleep(self.self_impact_watchdog.effective_poll_interval(self.poll_interval_seconds))
 
     def run_once(self) -> list[BackgroundMonitorEvent]:
+        if self.user_notifier_mode:
+            self.record_heartbeat()
+            return self.process_pending_notifications()
+        cycle_started = time.monotonic()
         self._update_runtime_state()
         all_events: list[BackgroundMonitorEvent] = []
+        all_events.extend(self.native_event_bridge.drain())
+        all_events.extend(process_deployment_event_flow_request(self.db))
         detector_errors: dict[str, str] = {}
         detector_counts: dict[str, dict[str, int]] = {}
         zero_reasons: list[str] = []
@@ -260,6 +382,7 @@ class BackgroundMonitorService:
             ("sharing_service_detector", self._run_sharing_detector),
             ("suspicious_process_detector", self._run_suspicious_process_detector),
             ("hardware_device_detector", self._run_hardware_detector),
+            ("protected_monitor_integrity_detector", self._run_integrity_detector),
         ]
         zero_reason_map = {
             "camera_process_detector": "no capture-capable process found",
@@ -269,6 +392,7 @@ class BackgroundMonitorService:
             "sharing_service_detector": "no sharing state change",
             "suspicious_process_detector": "no suspicious process found",
             "hardware_device_detector": "no USB topology change or explicit moisture marker found",
+            "protected_monitor_integrity_detector": "no protected monitor integrity change",
         }
         for name, detector in detector_specs:
             self._write_log_line(f"detector started: {name}")
@@ -295,7 +419,72 @@ class BackgroundMonitorService:
         self.db.set_background_monitor_state("detector_errors", json.dumps(detector_errors, sort_keys=True))
         if not detector_errors:
             self.db.set_background_monitor_state("last_error", "")
+        warning = self._evaluate_self_impact(
+            cycle_seconds=time.monotonic() - cycle_started,
+            emitted_events=len(all_events),
+            detector_errors=len(detector_errors),
+        )
+        if warning is not None:
+            all_events.append(warning)
         return all_events
+
+    def _evaluate_self_impact(
+        self,
+        *,
+        cycle_seconds: float,
+        emitted_events: int,
+        detector_errors: int,
+        metrics: SelfImpactMetrics | None = None,
+    ) -> BackgroundMonitorEvent | None:
+        metrics = metrics or self.self_impact_watchdog.collect_metrics(
+            cycle_seconds=cycle_seconds,
+            poll_interval_seconds=self.poll_interval_seconds,
+            emitted_events=emitted_events,
+            detector_errors=detector_errors,
+        )
+        assessment = self.self_impact_watchdog.evaluate(metrics)
+        payload = assessment.to_dict()
+        self.db.set_background_monitor_state("self_impact_last_check", utc_now_iso())
+        self.db.set_background_monitor_state("self_impact_score", str(assessment.score))
+        self.db.set_background_monitor_state("self_impact_level", assessment.level)
+        self.db.set_background_monitor_state("self_impact_backoff_multiplier", str(assessment.backoff_multiplier))
+        self.db.set_background_monitor_state("self_impact_metrics_json", json.dumps(payload, sort_keys=True))
+        self._write_log_line(
+            f"self-impact watchdog: score={assessment.score} level={assessment.level} "
+            f"backoff={assessment.backoff_multiplier} metrics={json.dumps(payload['metrics'], sort_keys=True)}"
+        )
+        active = self.db.get_background_monitor_state("self_impact_warning_active", "0") == "1"
+        if not assessment.sustained_warning:
+            if assessment.score < 40:
+                self.db.set_background_monitor_state("self_impact_warning_active", "0")
+            return None
+        if active:
+            return None
+        self.db.set_background_monitor_state("self_impact_warning_active", "1")
+        evidence = (
+            "The audit agent may be contributing to sustained system resource pressure. "
+            f"Self-impact score={assessment.score}/100; detector cycle={metrics.cycle_seconds:.2f}s; "
+            f"poll interval={metrics.poll_interval_seconds:.2f}s; CPU={metrics.cpu_percent:.1f}%; "
+            f"RSS={metrics.rss_mb:.1f}MB; emitted events={metrics.emitted_events}; "
+            f"detector errors={metrics.detector_errors}; bounded polling backoff={assessment.backoff_multiplier}x."
+        )
+        event = self._build_event(
+            "monitor_self_impact_warning",
+            evidence,
+            severity="critical",
+            confidence="high",
+            source="self_impact_watchdog",
+            trigger_subsource="monitor_cycle_resource_score",
+            previous_state="resource pressure below sustained warning threshold",
+            current_state=f"sustained self-impact score {assessment.score}/100",
+        )
+        event.metadata_json = json.dumps(payload, sort_keys=True)
+        event.recommendation = (
+            "Review monitor health metrics, pause intensive scans, and allow bounded polling backoff to reduce load. "
+            "This warning does not claim a denial-of-service condition."
+        )
+        self.record_monitor_event(event, notify_force=True)
+        return event
 
     def run_self_test(self) -> BackgroundMonitorEvent:
         self.record_heartbeat()
@@ -348,32 +537,30 @@ class BackgroundMonitorService:
         }
 
     def test_notification(self) -> dict[str, object]:
-        event = self._build_event(
-            "monitor_test_notification",
-            "User triggered a notification test.",
-            severity="high",
-            confidence="high",
-            simulated=True,
-            source="notification_test",
-            process_name="FaceTime",
-        )
-        sent, error = self.notifications.notify(event)
-        try:
-            self.db.record_monitor_event(event, dedupe_window_seconds=0)
-        except Exception as exc:
-            self._write_log_line(f"notification test db write failed: {exc}")
+        readiness = self.notifications.readiness_check()
+        self.db.set_background_monitor_state("notification_status", self.notifications.status())
+        self.db.set_background_monitor_state("notification_readiness_json", json.dumps(readiness, sort_keys=True))
         self._write_log_line(
-            f"notification test: event_id={event.event_id} sent={sent} returncode={event.notification_returncode} error={error}"
+            "notification readiness: "
+            f"overlay={readiness['overlay']['success']} "
+            f"dialog={readiness['dialog']['success']} "
+            f"notification_center={readiness['notification_center']['success']} "
+            f"overall={readiness['overall_status']}"
         )
         return {
-            "success": sent,
-            "stderr": error,
-            "osascript_exists": Path("/usr/bin/osascript").exists(),
+            "success": readiness["overall_status"] == "PASS",
+            "overall_status": readiness["overall_status"],
+            "overlay": readiness["overlay"],
+            "dialog": readiness["dialog"],
+            "notification_center": readiness["notification_center"],
+            "security_alerting_ready": readiness["security_alerting_ready"],
+            "notification_center_optional": readiness["notification_center_optional"],
+            "last_test_time": readiness["last_test_time"],
+            "last_test_result": readiness["last_test_result"],
             "notification_status": self.db.get_background_monitor_state("notification_status", ""),
-            "permission_note": (
-                "Permission status cannot be confirmed directly. Check System Settings > Notifications for Terminal/Python/osascript or the packaged app."
-            ),
-            "event_id": event.event_id,
+            "readiness_json": readiness,
+            "permission_note": "Notification Center is optional; overlay/dialog are sufficient for security alerting.",
+            "event_id": f"notification-readiness-{utc_now_iso()}",
         }
 
     def simulate_event(
@@ -549,6 +736,33 @@ class BackgroundMonitorService:
                 simulated=True,
                 source=source,
             )
+        if event_type == "new_network_connection_detected":
+            return self._build_event(
+                "new_network_connection_detected",
+                "Simulated new network connection event.",
+                severity="high",
+                confidence="high",
+                simulated=True,
+                source=source,
+            )
+        if event_type == "new_outbound_connection_detected":
+            return self._build_event(
+                "new_outbound_connection_detected",
+                "Simulated new outbound network connection event.",
+                severity="high",
+                confidence="high",
+                simulated=True,
+                source=source,
+            )
+        if event_type == "new_inbound_connection_detected":
+            return self._build_event(
+                "new_inbound_connection_detected",
+                "Simulated new inbound network connection event.",
+                severity="critical",
+                confidence="high",
+                simulated=True,
+                source=source,
+            )
         if event_type == "vpn_connected":
             return self._build_event(
                 "vpn_connected",
@@ -652,6 +866,11 @@ class BackgroundMonitorService:
         }
 
     def record_monitor_event(self, event: BackgroundMonitorEvent, *, notify_force: bool = False, _skip_storm_detection: bool = False) -> str | None:
+        original_event_type = getattr(event, "original_event_type", "") or event.event_type
+        canonical_type = canonical_event_type(event.event_type)
+        event.original_event_type = original_event_type
+        event.normalized_event_type = canonical_type
+        event.event_type = canonical_type
         preference = self.notifications.preference_for(event.event_type)
         if not bool(preference.get("enabled", True)):
             self.db.set_background_monitor_state(
@@ -669,9 +888,36 @@ class BackgroundMonitorService:
                 f"process_name={event.process_name} pid={event.pid} error={exc}"
             )
             return None
+        trace_id = f"trace-{event.event_id}"
+        try:
+            self.db.record_event_alert_trace(
+                EventAlertTrace(
+                    trace_id=trace_id,
+                    event_id=event.event_id,
+                    event_type=event.event_type,
+                    original_event_type=original_event_type,
+                    normalized_event_type=canonical_type,
+                    detector_source=getattr(event, "trigger_source", "") or event.source,
+                    created_at=event.timestamp,
+                    stored_db_path=str(self.db.path),
+                    stored_success=bool(stored),
+                    alert_queue_enqueued=bool(stored),
+                    severity_before_policy=event.severity,
+                    severity_after_policy=event.severity,
+                )
+            )
+        except Exception as exc:
+            self._write_log_line(f"alert trace write failed: event_id={event.event_id} error={exc}")
         if not stored:
-            self.notifications.update_security_overlay(event)
+            if hasattr(self.notifications, "update_security_overlay"):
+                self.notifications.update_security_overlay(event)
             return None
+        self._route_log_only_activity_overlay(event)
+        force_visible_alert = False
+        try:
+            force_visible_alert = bool(self.notifications.should_show_visible_alert(event, force=True).show)
+        except Exception:
+            force_visible_alert = False
         if not _skip_storm_detection:
             storm_event = self._maybe_build_alert_storm_event(event)
             if storm_event is not None:
@@ -694,9 +940,13 @@ class BackgroundMonitorService:
                 notification_reason="alert_storm_active",
                 cooldown_remaining_seconds=event.cooldown_remaining_seconds,
                 popup_allowed=False,
+                visible_alert_shown=bool(event.visible_alert_shown),
+                alert_style=str(event.alert_style or "neutral_grey"),
+                cooldown_suppressed=bool(event.cooldown_suppressed),
+                last_suppression_reason=event.last_suppression_reason,
             )
-        elif self._should_notify_event(event, notify_force=notify_force):
-            sent, error = self._notify_event(event, notify_force=notify_force)
+        elif self._should_notify_event(event, notify_force=notify_force or force_visible_alert):
+            sent, error = self._notify_event(event, notify_force=notify_force or force_visible_alert)
             event.notification_sent = sent
             event.notification_error = error
         else:
@@ -712,6 +962,10 @@ class BackgroundMonitorService:
                 notification_reason=event.notification_reason,
                 cooldown_remaining_seconds=event.cooldown_remaining_seconds,
                 popup_allowed=event.popup_allowed,
+                visible_alert_shown=bool(event.visible_alert_shown),
+                alert_style=str(event.alert_style or "neutral_grey"),
+                cooldown_suppressed=bool(event.cooldown_suppressed),
+                last_suppression_reason=event.last_suppression_reason,
             )
         if storm_active and event.event_type == "alert_storm_detected":
             event.popup_allowed = True
@@ -725,6 +979,10 @@ class BackgroundMonitorService:
                 notification_reason=event.notification_reason,
                 cooldown_remaining_seconds=event.cooldown_remaining_seconds,
                 popup_allowed=event.popup_allowed,
+                visible_alert_shown=bool(event.visible_alert_shown),
+                alert_style=str(event.alert_style or "neutral_grey"),
+                cooldown_suppressed=bool(event.cooldown_suppressed),
+                last_suppression_reason=event.last_suppression_reason,
             )
         self._write_log_line(
             f"event: type={event.event_type} severity={event.severity} confidence={event.confidence} "
@@ -826,6 +1084,188 @@ class BackgroundMonitorService:
         except TypeError:
             return self.notifications.notify(event)
 
+    def process_pending_notifications(self, limit: int = 200) -> list[BackgroundMonitorEvent]:
+        pending = self.db.pending_background_monitor_events(limit=limit)
+        now = utc_now_iso()
+        self.db.set_background_monitor_state("user_notifier_db_path", str(self.db.path))
+        self.db.set_background_monitor_state("notifier_db_path", str(self.db.path))
+        self.db.set_background_monitor_state("user_notifier_last_poll", now)
+        self.db.set_background_monitor_state("notifier_last_poll", now)
+        self.db.set_background_monitor_state("alert_queue_length", str(len(pending)))
+        self.db.set_background_monitor_state("queue_length", str(len(pending)))
+        self.db.set_background_monitor_state("notifier_running", "1")
+        self.db.set_background_monitor_state("notifier_pid", str(os.getpid()))
+        self.db.set_background_monitor_state("notifier_loaded", "1")
+        self.db.set_background_monitor_state("notifier_pid_alive", "1")
+        notified: list[BackgroundMonitorEvent] = []
+        seen_count = 0
+        alerted_count = 0
+        suppressed_count = 0
+        pipeline_failure = False
+        cursor_before = self.db.get_background_monitor_state("last_event_consumed", "")
+        cursor_after = cursor_before
+        queue_before = len(pending)
+        for event in pending:
+            seen_count += 1
+            self.db.set_background_monitor_state("user_notifier_last_event_seen", event.timestamp)
+            self.db.set_background_monitor_state("notifier_last_event_seen", event.timestamp)
+            try:
+                self.db.update_event_alert_trace(
+                    f"trace-{event.event_id}",
+                    notifier_db_path=str(self.db.path),
+                    notifier_poll_seen=True,
+                    notifier_poll_time=now,
+                    notifier_cursor_before=cursor_before,
+                    notifier_cursor_after=event.event_id,
+                    notifier_seen=True,
+                    notifier_seen_at=utc_now_iso(),
+                )
+            except Exception:
+                pass
+            if event.notification_sent:
+                cursor_after = event.event_id
+                self.db.set_background_monitor_state("last_event_consumed", cursor_after)
+                self.db.set_background_monitor_state("last_event_consumed_at", event.timestamp)
+                continue
+            if self._route_log_only_activity_overlay(event, mark_processed=True):
+                alerted_count += 1
+                self.db.set_background_monitor_state("last_alert_generated", event.event_id)
+                self.db.set_background_monitor_state("last_alert_displayed", event.event_id)
+                self.db.set_background_monitor_state("notifier_last_alert_displayed", event.event_id)
+                cursor_after = event.event_id
+                self.db.set_background_monitor_state("last_event_consumed", cursor_after)
+                self.db.set_background_monitor_state("last_event_consumed_at", event.timestamp)
+                continue
+            force_visible_alert = False
+            try:
+                force_visible_alert = bool(self.notifications.should_show_visible_alert(event, force=True).show)
+            except Exception:
+                force_visible_alert = False
+            if not self._should_notify_event(event, notify_force=force_visible_alert):
+                suppressed_count += 1
+                self.db.set_background_monitor_state("last_notification_decision", event.notification_decision or "log_only")
+                self.db.set_background_monitor_state("last_suppression_reason", event.last_suppression_reason or event.notification_reason or "log_only")
+                cursor_after = event.event_id
+                self.db.set_background_monitor_state("last_event_consumed", cursor_after)
+                self.db.set_background_monitor_state("last_event_consumed_at", event.timestamp)
+                continue
+            try:
+                sent, error = self._notify_event(event, notify_force=force_visible_alert)
+            except Exception as exc:  # noqa: BLE001
+                sent = False
+                error = str(exc)
+                event.notification_sent = False
+                event.notification_error = error
+                event.notification_returncode = None
+                event.notification_decision = event.notification_decision or "notification_error"
+                event.notification_reason = event.notification_reason or "notification_pipeline_failure"
+                event.last_suppression_reason = event.last_suppression_reason or "notification_pipeline_failure"
+                pipeline_failure = True
+                self.db.set_background_monitor_state("notification_pipeline_broken", "1")
+                self.db.set_background_monitor_state("last_error", f"Notifier delivery failed for {event.event_type}: {error}")
+                self._write_log_line(f"notification pipeline error: event_id={event.event_id} event_type={event.event_type} error={error}")
+                self.db.update_monitor_event_notification(
+                    event.event_id,
+                    notification_sent=False,
+                    notification_error=error,
+                    notification_returncode=None,
+                    notification_decision=event.notification_decision,
+                    notification_reason=event.notification_reason,
+                    cooldown_remaining_seconds=event.cooldown_remaining_seconds,
+                    popup_allowed=event.popup_allowed,
+                    visible_alert_shown=bool(event.visible_alert_shown),
+                    alert_style=str(event.alert_style or "neutral_grey"),
+                    cooldown_suppressed=bool(event.cooldown_suppressed),
+                    last_suppression_reason=event.last_suppression_reason,
+                )
+                suppressed_count += 1
+                cursor_after = event.event_id
+                self.db.set_background_monitor_state("last_event_consumed", cursor_after)
+                self.db.set_background_monitor_state("last_event_consumed_at", event.timestamp)
+                continue
+            event.notification_sent = sent
+            event.notification_error = error
+            if sent:
+                alerted_count += 1
+                self.db.set_background_monitor_state("last_alert_generated", event.event_id)
+                if bool(event.visible_alert_shown):
+                    self.db.set_background_monitor_state("last_alert_displayed", event.event_id)
+                    self.db.set_background_monitor_state("notifier_last_alert_displayed", event.event_id)
+                self.db.update_monitor_event_notification(
+                    event.event_id,
+                    notification_sent=event.notification_sent,
+                    notification_error=event.notification_error,
+                    notification_returncode=event.notification_returncode,
+                    notification_decision=event.notification_decision,
+                    notification_reason=event.notification_reason,
+                    cooldown_remaining_seconds=event.cooldown_remaining_seconds,
+                    popup_allowed=event.popup_allowed,
+                    visible_alert_shown=bool(event.visible_alert_shown),
+                    alert_style=str(event.alert_style or "neutral_grey"),
+                    cooldown_suppressed=bool(event.cooldown_suppressed),
+                    last_suppression_reason=event.last_suppression_reason,
+                )
+                notified.append(event)
+            else:
+                suppressed_count += 1
+                self.db.set_background_monitor_state("last_notification_decision", event.notification_decision or "log_only")
+                self.db.set_background_monitor_state("last_suppression_reason", event.last_suppression_reason or event.notification_reason or "notification failed")
+            cursor_after = event.event_id
+            self.db.set_background_monitor_state("last_event_consumed", cursor_after)
+            self.db.set_background_monitor_state("last_event_consumed_at", event.timestamp)
+        if notified:
+            self.db.set_background_monitor_state("user_notifier_last_processed", utc_now_iso())
+            self.db.set_background_monitor_state("user_notifier_pending_count", str(len(pending)))
+        self.db.set_background_monitor_state("events_found_last_poll", str(seen_count))
+        self.db.set_background_monitor_state("events_alerted_last_poll", str(alerted_count))
+        self.db.set_background_monitor_state("events_suppressed_last_poll", str(suppressed_count))
+        self.db.set_background_monitor_state("notifier_last_event_count", str(seen_count))
+        self.db.set_background_monitor_state("notifier_last_alert_count", str(alerted_count))
+        self.db.set_background_monitor_state("notifier_last_suppressed_count", str(suppressed_count))
+        self.db.set_background_monitor_state("overlay_alive", self.db.get_background_monitor_state("overlay_manager_alive", "0"))
+        self.db.set_background_monitor_state("notifier_cursor_before", cursor_before or "")
+        self.db.set_background_monitor_state("notifier_cursor_after", cursor_after or cursor_before or "")
+        self.db.set_background_monitor_state("alert_queue_length_before", str(queue_before))
+        self.db.set_background_monitor_state("alert_queue_length_after", str(len(self.db.pending_background_monitor_events(limit=limit))))
+        if pipeline_failure:
+            self.db.set_background_monitor_state("notification_pipeline_broken", "1")
+        else:
+            self.db.set_background_monitor_state("notification_pipeline_broken", "1" if seen_count and not alerted_count and self.db.get_background_monitor_state("notifier_running", "0") != "1" else "0")
+        return notified
+
+    def _route_log_only_activity_overlay(self, event: BackgroundMonitorEvent, *, mark_processed: bool = False) -> bool:
+        event.event_type = canonical_event_type(event.event_type)
+        event.normalized_event_type = event.event_type
+        if event.event_type not in ACTIVITY_OVERLAY_EVENT_TYPES:
+            return False
+        preference = self.notifications.preference_for(event.event_type)
+        if bool(preference.get("notify", False)) or str(preference.get("notification_mode", "none")) != "none":
+            return False
+        if not hasattr(self.notifications, "update_security_overlay"):
+            return False
+        rendered = bool(self.notifications.update_security_overlay(event))
+        if rendered and mark_processed:
+            event.notification_sent = True
+            event.notification_decision = "overlay_only"
+            event.notification_reason = "activity_overlay_rendered"
+            event.popup_allowed = False
+            event.visible_alert_shown = True
+            self.db.update_monitor_event_notification(
+                event.event_id,
+                notification_sent=True,
+                notification_error="",
+                notification_returncode=0,
+                notification_decision="overlay_only",
+                notification_reason="activity_overlay_rendered",
+                cooldown_remaining_seconds=0,
+                popup_allowed=False,
+                visible_alert_shown=True,
+                alert_style=str(getattr(event, "alert_style", "neutral_grey") or "neutral_grey"),
+                cooldown_suppressed=bool(event.cooldown_suppressed),
+                last_suppression_reason=event.last_suppression_reason,
+            )
+        return rendered
+
     def record_event(self, event: BackgroundMonitorEvent, *, notify_force: bool = False) -> bool:
         return self.record_monitor_event(event, notify_force=notify_force) is not None
 
@@ -852,6 +1292,7 @@ class BackgroundMonitorService:
         self.db.set_background_monitor_state("enabled", "1")
         self.db.set_background_monitor_state("running", "1" if launchctl_loaded else "0")
         self.db.set_background_monitor_state("loaded", "1" if launchctl_loaded else "0")
+        self.db.set_background_monitor_state("monitor_mode", self.mode)
         self.db.set_background_monitor_state("db_path", str(self.db.path))
         self.db.set_background_monitor_state("notification_status", self.notifications.status())
         self.db.set_background_monitor_state("process_pid", str(os.getpid()))
@@ -890,6 +1331,30 @@ class BackgroundMonitorService:
         }
         self.db.set_background_monitor_state("startup_diagnostics", json.dumps(diagnostics, sort_keys=True))
         self._write_startup_like_log("startup diagnostics", diagnostics)
+        integrity_scope = "system" if self.system_daemon_mode else launch_scope()
+        integrity = verify_protected_monitor_integrity(scope=integrity_scope)
+        self.db.set_background_monitor_state("monitor_protection_integrity_json", json.dumps(integrity, sort_keys=True))
+        self.db.set_background_monitor_state("monitor_protection_integrity_fingerprint", evidence_hash(integrity))
+        if integrity_scope == "system" and integrity.get("tamper_detected"):
+            event = BackgroundMonitorEvent(
+                event_id=f"protected-monitor-tamper-{utc_now_iso()}",
+                timestamp=utc_now_iso(),
+                event_type="protected_monitor_tamper_detected",
+                severity=str(integrity.get("severity", "high")),
+                source="integrity_check",
+                evidence="; ".join(str(item) for item in integrity.get("evidence", [])),
+                confidence=str(integrity.get("confidence", "high")),
+                recommendation=str(integrity.get("recommendation", "")),
+                metadata_json=json.dumps(integrity, sort_keys=True),
+                process_name="com.mac-audit-agent.monitor",
+                related_path=str(integrity.get("plist_path", "")),
+                related_user="root" if integrity.get("scope") == "system" else getpass.getuser(),
+                previous_state="installed and expected" if integrity.get("manifest_exists") else "manifest missing",
+                current_state="tampered" if integrity.get("tamper_detected") else "verified",
+                baseline_status="expected manifest comparison",
+                source_trace=str(integrity.get("manifest_path", "")),
+            )
+            self.record_monitor_event(event, notify_force=True)
         launchctl_loaded = bool(self._launchctl_service_status().get("loaded"))
         self.db.set_background_monitor_state(
             "status_text",
@@ -970,9 +1435,9 @@ class BackgroundMonitorService:
         for event in events:
             if event.event_type not in IMPORTANT_EVENT_TYPES and event.event_type in {"display_sleep", "display_wake", "possible_lid_closed", "possible_lid_opened", "display_state_changed"}:
                 event.confidence = "medium"
-                if self.record_monitor_event(event):
-                    recorded.append(event)
-            return recorded
+            if self.record_monitor_event(event):
+                recorded.append(event)
+        return recorded
 
     def _run_network_detector(self) -> list[BackgroundMonitorEvent]:
         if self.network_observer.running:
@@ -1108,6 +1573,7 @@ class BackgroundMonitorService:
         self.latest_snapshot.update(
             {
                 "usb_devices": current.usb_devices,
+                "bluetooth_devices": current.bluetooth_devices,
                 "moisture_detection_capability": current.moisture_capability,
                 "moisture_markers": sorted(current.moisture_markers),
             }
@@ -1121,6 +1587,45 @@ class BackgroundMonitorService:
             if self.record_monitor_event(event):
                 recorded.append(event)
         return recorded
+
+    def _run_integrity_detector(self) -> list[BackgroundMonitorEvent]:
+        if not self.system_daemon_mode:
+            return []
+        now = time.monotonic()
+        if self._last_integrity_poll and now - self._last_integrity_poll < INTEGRITY_POLL_SECONDS:
+            return []
+        self._last_integrity_poll = now
+        integrity = verify_protected_monitor_integrity(scope="system")
+        fingerprint = evidence_hash(integrity)
+        previous_fingerprint = self.db.get_background_monitor_state("monitor_protection_integrity_fingerprint", "")
+        self.db.set_background_monitor_state("monitor_protection_integrity_json", json.dumps(integrity, sort_keys=True))
+        self.db.set_background_monitor_state("monitor_protection_integrity_fingerprint", fingerprint)
+        self.latest_snapshot["monitor_protection_integrity"] = integrity
+        self._store_current_snapshot()
+        if not integrity.get("tamper_detected") or fingerprint == previous_fingerprint:
+            return []
+        evidence_items = [str(item) for item in integrity.get("evidence", [])]
+        event = self._build_event(
+            "protected_monitor_tamper_detected",
+            "; ".join(evidence_items) or "Protected monitor integrity changed from the installed manifest.",
+            severity=str(integrity.get("severity", "high")),
+            confidence=str(integrity.get("confidence", "high")),
+            source="integrity_check",
+            process_name="com.mac-audit-agent.monitor",
+            trigger_subsource="protected_runtime_manifest",
+            previous_state="installed manifest expectation",
+            current_state="protected monitor integrity drift observed",
+            related_path=str(integrity.get("plist_path", "")),
+            related_user="root",
+        )
+        event.metadata_json = json.dumps(integrity, sort_keys=True)
+        event.recommendation = str(
+            integrity.get(
+                "recommendation",
+                "Review recent administrative activity and reinstall the protected monitor from a trusted source if the change was not approved.",
+            )
+        )
+        return [event] if self.record_monitor_event(event, notify_force=True) else []
 
     def _coalesce_usb_observer_events(self, events: list[BackgroundMonitorEvent]) -> list[BackgroundMonitorEvent]:
         if not events:
@@ -1346,7 +1851,7 @@ class BackgroundMonitorService:
             except Exception:
                 return 0
         if detector_name == "hardware_device_detector" and self.previous_hardware is not None:
-            return len(self.previous_hardware.usb_devices) + len(self.previous_hardware.moisture_markers)
+            return len(self.previous_hardware.usb_devices) + len(self.previous_hardware.bluetooth_devices) + len(self.previous_hardware.moisture_markers)
         return 0
 
     def _list_processes(self) -> list[dict[str, object]]:
@@ -1443,7 +1948,7 @@ class BackgroundMonitorService:
         rule = rule or rule_for_event(event_type)
         raw_signal = evidence
         timestamp = utc_now_iso()
-        return BackgroundMonitorEvent(
+        event = BackgroundMonitorEvent(
             event_id=f"{event_type}-{timestamp}-{process_name or source}",
             timestamp=timestamp,
             event_type=event_type,
@@ -1484,6 +1989,9 @@ class BackgroundMonitorService:
             recommended_verification_steps=list(rule.verification_steps),
             source_trace=f"Detector={rule.source_detector}; Rule={rule.rule_id}; Evidence={raw_signal}",
         )
+        event.original_event_type = event_type
+        event.normalized_event_type = canonical_event_type(event_type)
+        return event
 
     def _ensure_log_paths(self) -> None:
         for path in [FALLBACK_MONITOR_LOG, STDOUT_MONITOR_LOG, STDERR_MONITOR_LOG]:
@@ -1518,8 +2026,9 @@ class BackgroundMonitorService:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Background Privacy & Session Monitor")
-    parser.add_argument("--db-path", type=Path, default=default_monitor_db_path())
+    parser.add_argument("--db-path", type=Path, default=None)
     parser.add_argument("--poll-interval", type=int, default=5)
+    parser.add_argument("--mode", choices=[MONITOR_ROLE_LEGACY, MONITOR_ROLE_USER, MONITOR_ROLE_SYSTEM], default=os.environ.get(MAC_AUDIT_AGENT_ENV_ROLE, MONITOR_ROLE_LEGACY))
     parser.add_argument("--run", action="store_true")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--self-test", action="store_true")
@@ -1533,6 +2042,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-dialog", action="store_true")
     parser.add_argument("--notify-force", action="store_true")
     return parser
+
+
+def _resolve_monitor_db_path(db_path: Path | None, mode: str) -> Path:
+    if db_path is not None:
+        return db_path
+    if mode == MONITOR_ROLE_SYSTEM:
+        return default_monitor_db_path("system")
+    return default_monitor_db_path("user")
 
 
 def _write_crash_details(db_path: Path, exc: BaseException) -> None:
@@ -1653,11 +2170,18 @@ def _doctor_payload(service: BackgroundMonitorService) -> tuple[int, dict[str, o
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    args.db_path = _resolve_monitor_db_path(args.db_path, args.mode)
     try:
         try:
-            service = BackgroundMonitorService(db_path=args.db_path, poll_interval_seconds=args.poll_interval, record_startup=bool(args.run))
+            service = BackgroundMonitorService(db_path=args.db_path, poll_interval_seconds=args.poll_interval, record_startup=bool(args.run), mode=args.mode)
         except TypeError:
-            service = BackgroundMonitorService(db_path=args.db_path, poll_interval_seconds=args.poll_interval)
+            try:
+                service = BackgroundMonitorService(db_path=args.db_path, poll_interval_seconds=args.poll_interval, record_startup=bool(args.run))
+            except TypeError:
+                try:
+                    service = BackgroundMonitorService(db_path=args.db_path, poll_interval_seconds=args.poll_interval, mode=args.mode)
+                except TypeError:
+                    service = BackgroundMonitorService(db_path=args.db_path, poll_interval_seconds=args.poll_interval)
     except Exception as exc:
         if args.run:
             _write_crash_details(args.db_path, exc)

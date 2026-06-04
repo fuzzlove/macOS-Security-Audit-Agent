@@ -484,6 +484,17 @@ def test_reports_include_apple_security_forecast_section(tmp_path: Path) -> None
     assert "Sources Used" in html_content
 
 
+def test_reports_include_investigation_priorities_section(tmp_path: Path) -> None:
+    scan_result = make_scan_result()
+    json_path = export_scan_result_json(scan_result, tmp_path / "scan.json")
+    html_path = export_scan_result_html(scan_result, tmp_path / "scan.html")
+    json_content = json_path.read_text(encoding="utf-8")
+    html_content = html_path.read_text(encoding="utf-8")
+    assert '"investigation_priorities"' in json_content
+    assert "Investigation Priorities" in html_content
+    assert "Top Priorities" in html_content
+
+
 def test_reports_include_empty_apple_security_forecast_section(tmp_path: Path) -> None:
     scan_result = make_scan_result()
     json_path = export_scan_result_json(scan_result, tmp_path / "scan.json")

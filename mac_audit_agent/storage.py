@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import grp
 import ipaddress
 import json
 import logging
+import os
 import shutil
 import sqlite3
+import threading
+import time
 from dataclasses import fields, is_dataclass, asdict
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
@@ -16,10 +20,13 @@ from mac_audit_agent.models import (
     BaselineComparison,
     BackgroundMonitorEvent,
     BackgroundMonitorStatus,
+    AlertDeliveryRecord,
     CommandExecutionResult,
     FileIssueSnapshot,
     Finding,
     FindingSuppressionRule,
+    EventAlertTrace,
+    NotificationCapabilities,
     HistoryIndicator,
     InvestigationAuditEntry,
     InvestigationNote,
@@ -38,8 +45,10 @@ from mac_audit_agent.models import (
     safe_int,
     utc_now_iso,
 )
+from mac_audit_agent.version import DATABASE_SCHEMA_VERSION
 
 LOGGER = logging.getLogger(__name__)
+SYSTEM_MONITOR_DB_PATH = Path("/Library/Application Support/MacAuditAgent/mac_audit_agent.sqlite3")
 FINDING_FIELD_NAMES = {item.name for item in fields(Finding)}
 FINDING_PROVENANCE_FIELDS = {
     "rule_id",
@@ -103,6 +112,56 @@ EVENT_PROVENANCE_FIELDS = {
     "recommended_verification_steps",
     "source_trace",
 }
+
+
+class _LockedConnection:
+    def __init__(self, conn: sqlite3.Connection, lock: threading.RLock) -> None:
+        self._conn = conn
+        self._lock = lock
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+    @property
+    def row_factory(self):  # type: ignore[override]
+        return self._conn.row_factory
+
+    @row_factory.setter
+    def row_factory(self, value) -> None:  # type: ignore[override]
+        self._conn.row_factory = value
+
+    def _with_retry(self, fn, *args, **kwargs):
+        last_exc: sqlite3.OperationalError | None = None
+        for attempt in range(6):
+            try:
+                with self._lock:
+                    return fn(*args, **kwargs)
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                    raise
+                last_exc = exc
+                time.sleep(min(0.25 * (attempt + 1), 1.5))
+        if last_exc is not None:
+            raise last_exc
+        return fn(*args, **kwargs)
+
+    def execute(self, *args, **kwargs):
+        return self._with_retry(self._conn.execute, *args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        return self._with_retry(self._conn.executemany, *args, **kwargs)
+
+    def executescript(self, *args, **kwargs):
+        return self._with_retry(self._conn.executescript, *args, **kwargs)
+
+    def commit(self):
+        return self._with_retry(self._conn.commit)
+
+    def rollback(self):
+        return self._with_retry(self._conn.rollback)
+
+    def close(self):
+        return self._with_retry(self._conn.close)
 
 
 def normalize_finding_payload(payload: dict) -> dict:
@@ -354,12 +413,44 @@ class AuditDatabase:
     def __init__(self, path: Path, logs_dir: Path | None = None, log_retention_days: int = 30) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_shared_system_db_permissions()
         self.logs_dir = logs_dir or (Path.home() / ".mac_audit_agent" / "logs")
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.log_retention_days = log_retention_days
-        self.conn = sqlite3.connect(path)
+        self._db_lock = threading.RLock()
+        raw_conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
+        self.conn = _LockedConnection(raw_conn, self._db_lock)
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")
         self._init_schema()
+        self._ensure_shared_system_db_permissions()
+
+    def _ensure_shared_system_db_permissions(self) -> None:
+        if self.path != SYSTEM_MONITOR_DB_PATH:
+            return
+        try:
+            admin_gid = grp.getgrnam("admin").gr_gid
+        except KeyError:
+            try:
+                admin_gid = grp.getgrnam("wheel").gr_gid
+            except KeyError:
+                return
+        targets = [
+            (self.path.parent, 0o775),
+            (self.path, 0o660),
+            (self.path.with_suffix(self.path.suffix + "-wal"), 0o660),
+            (self.path.with_suffix(self.path.suffix + "-shm"), 0o660),
+        ]
+        for target, mode in targets:
+            try:
+                if not target.exists():
+                    continue
+                os.chown(target, 0, admin_gid)
+                target.chmod(mode)
+            except OSError:
+                LOGGER.debug("Unable to adjust shared system DB permissions for %s", target, exc_info=True)
 
     def _init_schema(self) -> None:
         self.conn.executescript(
@@ -646,6 +737,10 @@ class AuditDatabase:
                 notification_reason TEXT NOT NULL DEFAULT '',
                 cooldown_remaining_seconds INTEGER NOT NULL DEFAULT 0,
                 popup_allowed INTEGER NOT NULL DEFAULT 0,
+                visible_alert_shown INTEGER NOT NULL DEFAULT 0,
+                alert_style TEXT NOT NULL DEFAULT 'neutral_grey',
+                cooldown_suppressed INTEGER NOT NULL DEFAULT 0,
+                last_suppression_reason TEXT NOT NULL DEFAULT '',
                 metadata_json TEXT NOT NULL DEFAULT '{}',
                 provenance_json TEXT NOT NULL DEFAULT '{}'
             );
@@ -653,10 +748,77 @@ class AuditDatabase:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS event_alert_traces (
+                trace_id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                original_event_type TEXT NOT NULL DEFAULT '',
+                normalized_event_type TEXT NOT NULL DEFAULT '',
+                detector_source TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                stored_db_path TEXT NOT NULL DEFAULT '',
+                stored_success INTEGER NOT NULL DEFAULT 0,
+                notifier_db_path TEXT NOT NULL DEFAULT '',
+                notifier_seen INTEGER NOT NULL DEFAULT 0,
+                notifier_seen_at TEXT NOT NULL DEFAULT '',
+                notification_policy_checked INTEGER NOT NULL DEFAULT 0,
+                notification_policy_result TEXT NOT NULL DEFAULT '',
+                notification_policy_reason TEXT NOT NULL DEFAULT '',
+                severity_before_policy TEXT NOT NULL DEFAULT '',
+                severity_after_policy TEXT NOT NULL DEFAULT '',
+                alert_required INTEGER NOT NULL DEFAULT 0,
+                alert_suppressed INTEGER NOT NULL DEFAULT 0,
+                alert_suppression_reason TEXT NOT NULL DEFAULT '',
+                overlay_dispatch_attempted INTEGER NOT NULL DEFAULT 0,
+                overlay_dispatch_at TEXT NOT NULL DEFAULT '',
+                overlay_dispatch_result TEXT NOT NULL DEFAULT '',
+                overlay_error TEXT NOT NULL DEFAULT '',
+                visible_alert_id TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS notification_capabilities (
+                scope TEXT PRIMARY KEY,
+                updated_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS alert_delivery_records (
+                event_id TEXT PRIMARY KEY,
+                alert_type TEXT NOT NULL,
+                overlay_attempted INTEGER NOT NULL DEFAULT 0,
+                overlay_success INTEGER NOT NULL DEFAULT 0,
+                dialog_attempted INTEGER NOT NULL DEFAULT 0,
+                dialog_success INTEGER NOT NULL DEFAULT 0,
+                notification_attempted INTEGER NOT NULL DEFAULT 0,
+                notification_success INTEGER NOT NULL DEFAULT 0,
+                delivery_method_used TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
             CREATE TABLE IF NOT EXISTS background_monitor_heartbeats (
                 heartbeat_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL,
                 status_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS legal_notice_acknowledgements (
+                notice_version TEXT PRIMARY KEY,
+                acknowledged_at TEXT NOT NULL,
+                acknowledged INTEGER NOT NULL DEFAULT 1,
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS security_decoy_connections (
+                connection_id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                source_ip TEXT NOT NULL,
+                source_port INTEGER NOT NULL,
+                destination_port INTEGER NOT NULL,
+                listen_address TEXT NOT NULL DEFAULT '',
+                protocol_profile TEXT NOT NULL,
+                bytes_sent INTEGER NOT NULL DEFAULT 0,
+                bytes_received INTEGER NOT NULL DEFAULT 0,
+                connection_count INTEGER NOT NULL DEFAULT 1,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                correlation_id TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}'
             );
             CREATE TABLE IF NOT EXISTS investigation_notes (
                 note_id TEXT PRIMARY KEY,
@@ -780,9 +942,63 @@ class AuditDatabase:
         self._ensure_column("background_monitor_events", "notification_reason", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("background_monitor_events", "cooldown_remaining_seconds", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("background_monitor_events", "popup_allowed", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("background_monitor_events", "visible_alert_shown", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("background_monitor_events", "alert_style", "TEXT NOT NULL DEFAULT 'neutral_grey'")
+        self._ensure_column("background_monitor_events", "cooldown_suppressed", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("background_monitor_events", "last_suppression_reason", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("background_monitor_events", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_column("background_monitor_events", "provenance_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("event_alert_traces", "original_event_type", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("event_alert_traces", "normalized_event_type", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("event_alert_traces", "detector_source", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("event_alert_traces", "stored_db_path", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("event_alert_traces", "stored_success", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("event_alert_traces", "notifier_db_path", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("event_alert_traces", "notifier_poll_seen", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("event_alert_traces", "notifier_poll_time", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("event_alert_traces", "notifier_cursor_before", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("event_alert_traces", "notifier_cursor_after", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("event_alert_traces", "notifier_seen", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("event_alert_traces", "notifier_seen_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("event_alert_traces", "notification_policy_checked", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("event_alert_traces", "notification_policy_result", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("event_alert_traces", "notification_policy_reason", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("event_alert_traces", "severity_before_policy", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("event_alert_traces", "severity_after_policy", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("event_alert_traces", "cooldown_checked", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("event_alert_traces", "cooldown_result", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("event_alert_traces", "alert_required", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("event_alert_traces", "alert_suppressed", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("event_alert_traces", "alert_suppression_reason", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("event_alert_traces", "alert_queue_enqueued", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("event_alert_traces", "alert_queue_length_before", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("event_alert_traces", "alert_queue_length_after", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("event_alert_traces", "overlay_dispatch_attempted", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("event_alert_traces", "overlay_dispatch_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("event_alert_traces", "overlay_dispatch_result", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("event_alert_traces", "overlay_error", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("event_alert_traces", "visible_alert_id", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("event_alert_traces", "displayed_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("notification_capabilities", "updated_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("notification_capabilities", "payload_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("alert_delivery_records", "alert_type", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("alert_delivery_records", "overlay_attempted", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("alert_delivery_records", "overlay_success", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("alert_delivery_records", "dialog_attempted", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("alert_delivery_records", "dialog_success", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("alert_delivery_records", "notification_attempted", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("alert_delivery_records", "notification_success", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("alert_delivery_records", "delivery_method_used", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("alert_delivery_records", "updated_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("alert_delivery_records", "payload_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("legal_notice_acknowledgements", "payload_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("security_decoy_connections", "listen_address", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("security_decoy_connections", "payload_json", "TEXT NOT NULL DEFAULT '{}'")
         self._migrate_command_logs_exit_code_nullable()
+        self.conn.execute(
+            "INSERT OR REPLACE INTO background_monitor_state (key, value) VALUES (?, ?)",
+            ("schema_version", str(DATABASE_SCHEMA_VERSION)),
+        )
         self.conn.commit()
 
     def _migrate_command_logs_exit_code_nullable(self) -> None:
@@ -1696,8 +1912,8 @@ class AuditDatabase:
         self.conn.execute(
             """
             INSERT OR REPLACE INTO background_monitor_events
-            (event_id, timestamp, event_type, severity, source, process_name, pid, evidence, confidence, recommendation, simulated, notification_sent, notification_error, notification_returncode, notification_decision, notification_reason, cooldown_remaining_seconds, popup_allowed, metadata_json, provenance_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (event_id, timestamp, event_type, severity, source, process_name, pid, evidence, confidence, recommendation, simulated, notification_sent, notification_error, notification_returncode, notification_decision, notification_reason, cooldown_remaining_seconds, popup_allowed, visible_alert_shown, alert_style, cooldown_suppressed, last_suppression_reason, metadata_json, provenance_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event.event_id,
@@ -1718,6 +1934,10 @@ class AuditDatabase:
                 event.notification_reason,
                 event.cooldown_remaining_seconds,
                 int(bool(event.popup_allowed)),
+                int(bool(getattr(event, "visible_alert_shown", False))),
+                str(getattr(event, "alert_style", "neutral_grey")),
+                int(bool(getattr(event, "cooldown_suppressed", False))),
+                str(getattr(event, "last_suppression_reason", "")),
                 event.metadata_json,
                 json.dumps(normalize_event_provenance(event), sort_keys=True),
             ),
@@ -1758,6 +1978,10 @@ class AuditDatabase:
             notification_reason=str(row["notification_reason"] or ""),
             cooldown_remaining_seconds=safe_int(row["cooldown_remaining_seconds"]) or 0,
             popup_allowed=bool(row["popup_allowed"]),
+            visible_alert_shown=bool(row["visible_alert_shown"]),
+            alert_style=str(row["alert_style"] or "neutral_grey"),
+            cooldown_suppressed=bool(row["cooldown_suppressed"]),
+            last_suppression_reason=str(row["last_suppression_reason"] or ""),
             metadata_json=str(row["metadata_json"] or "{}"),
             **{key: value for key, value in provenance.items() if key in EVENT_PROVENANCE_FIELDS},
         )
@@ -1773,11 +1997,15 @@ class AuditDatabase:
         notification_reason: str = "",
         cooldown_remaining_seconds: int = 0,
         popup_allowed: bool = False,
+        visible_alert_shown: bool = False,
+        alert_style: str = "neutral_grey",
+        cooldown_suppressed: bool = False,
+        last_suppression_reason: str = "",
     ) -> None:
         self.conn.execute(
             """
             UPDATE background_monitor_events
-            SET notification_sent = ?, notification_error = ?, notification_returncode = ?, notification_decision = ?, notification_reason = ?, cooldown_remaining_seconds = ?, popup_allowed = ?
+            SET notification_sent = ?, notification_error = ?, notification_returncode = ?, notification_decision = ?, notification_reason = ?, cooldown_remaining_seconds = ?, popup_allowed = ?, visible_alert_shown = ?, alert_style = ?, cooldown_suppressed = ?, last_suppression_reason = ?
             WHERE event_id = ?
             """,
             (
@@ -1788,6 +2016,10 @@ class AuditDatabase:
                 notification_reason,
                 cooldown_remaining_seconds,
                 int(bool(popup_allowed)),
+                int(bool(visible_alert_shown)),
+                alert_style,
+                int(bool(cooldown_suppressed)),
+                last_suppression_reason,
                 event_id,
             ),
         )
@@ -1816,6 +2048,18 @@ class AuditDatabase:
 
     def latest_monitor_events(self, limit: int = 100) -> list[BackgroundMonitorEvent]:
         return self.recent_background_monitor_events(limit=limit)
+
+    def pending_background_monitor_events(self, limit: int = 100) -> list[BackgroundMonitorEvent]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM background_monitor_events
+            WHERE notification_sent = 0
+            ORDER BY timestamp ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [self._background_event_from_row(row) for row in rows]
 
     def background_monitor_events_between(self, start_timestamp: str, end_timestamp: str) -> list[BackgroundMonitorEvent]:
         rows = self.conn.execute(
@@ -1872,6 +2116,204 @@ class AuditDatabase:
         row = self.conn.execute("SELECT value FROM background_monitor_state WHERE key = ?", (key,)).fetchone()
         return str(row["value"]) if row else default
 
+    def record_event_alert_trace(self, trace: EventAlertTrace | dict[str, Any]) -> None:
+        payload = trace.to_dict() if hasattr(trace, "to_dict") else dict(trace)
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO event_alert_traces
+            (trace_id, event_id, event_type, original_event_type, normalized_event_type, detector_source, created_at, stored_db_path, stored_success, notifier_db_path, notifier_poll_seen, notifier_poll_time, notifier_cursor_before, notifier_cursor_after, notifier_seen, notifier_seen_at, notification_policy_checked, notification_policy_result, notification_policy_reason, severity_before_policy, severity_after_policy, cooldown_checked, cooldown_result, alert_required, alert_suppressed, alert_suppression_reason, alert_queue_enqueued, alert_queue_length_before, alert_queue_length_after, overlay_dispatch_attempted, overlay_dispatch_at, overlay_dispatch_result, overlay_error, visible_alert_id, displayed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(payload.get("trace_id", "")),
+                str(payload.get("event_id", "")),
+                str(payload.get("event_type", "")),
+                str(payload.get("original_event_type", "")),
+                str(payload.get("normalized_event_type", "")),
+                str(payload.get("detector_source", "")),
+                str(payload.get("created_at", utc_now_iso())),
+                str(payload.get("stored_db_path", "")),
+                int(bool(payload.get("stored_success", False))),
+                str(payload.get("notifier_db_path", "")),
+                int(bool(payload.get("notifier_poll_seen", False))),
+                str(payload.get("notifier_poll_time", "")),
+                str(payload.get("notifier_cursor_before", "")),
+                str(payload.get("notifier_cursor_after", "")),
+                int(bool(payload.get("notifier_seen", False))),
+                str(payload.get("notifier_seen_at", "")),
+                int(bool(payload.get("notification_policy_checked", False))),
+                str(payload.get("notification_policy_result", "")),
+                str(payload.get("notification_policy_reason", "")),
+                str(payload.get("severity_before_policy", "")),
+                str(payload.get("severity_after_policy", "")),
+                int(bool(payload.get("cooldown_checked", False))),
+                str(payload.get("cooldown_result", "")),
+                int(bool(payload.get("alert_required", False))),
+                int(bool(payload.get("alert_suppressed", False))),
+                str(payload.get("alert_suppression_reason", "")),
+                int(bool(payload.get("alert_queue_enqueued", False))),
+                int(payload.get("alert_queue_length_before", 0) or 0),
+                int(payload.get("alert_queue_length_after", 0) or 0),
+                int(bool(payload.get("overlay_dispatch_attempted", False))),
+                str(payload.get("overlay_dispatch_at", "")),
+                str(payload.get("overlay_dispatch_result", "")),
+                str(payload.get("overlay_error", "")),
+                str(payload.get("visible_alert_id", "")),
+                str(payload.get("displayed_at", "")),
+            ),
+        )
+        self.conn.commit()
+
+    def update_event_alert_trace(self, trace_id: str, **updates: Any) -> None:
+        if not updates:
+            return
+        assignments = ", ".join(f"{key} = ?" for key in updates)
+        values = [int(bool(value)) if isinstance(value, bool) else value for value in updates.values()]
+        values.append(trace_id)
+        self.conn.execute(f"UPDATE event_alert_traces SET {assignments} WHERE trace_id = ?", values)
+        self.conn.commit()
+
+    def get_event_alert_trace(self, event_id: str) -> EventAlertTrace | None:
+        row = self.conn.execute(
+            "SELECT * FROM event_alert_traces WHERE event_id = ? OR trace_id = ? ORDER BY created_at DESC LIMIT 1",
+            (event_id, event_id),
+        ).fetchone()
+        if not row:
+            return None
+        return EventAlertTrace(
+            trace_id=str(row["trace_id"]),
+            event_id=str(row["event_id"]),
+            event_type=str(row["event_type"]),
+            original_event_type=str(row["original_event_type"] or ""),
+            normalized_event_type=str(row["normalized_event_type"] or ""),
+            detector_source=str(row["detector_source"] or ""),
+            created_at=str(row["created_at"]),
+            stored_db_path=str(row["stored_db_path"] or ""),
+            stored_success=bool(row["stored_success"]),
+            notifier_db_path=str(row["notifier_db_path"] or ""),
+            notifier_poll_seen=bool(row["notifier_poll_seen"]),
+            notifier_poll_time=str(row["notifier_poll_time"] or ""),
+            notifier_cursor_before=str(row["notifier_cursor_before"] or ""),
+            notifier_cursor_after=str(row["notifier_cursor_after"] or ""),
+            notifier_seen=bool(row["notifier_seen"]),
+            notifier_seen_at=str(row["notifier_seen_at"] or ""),
+            notification_policy_checked=bool(row["notification_policy_checked"]),
+            notification_policy_result=str(row["notification_policy_result"] or ""),
+            notification_policy_reason=str(row["notification_policy_reason"] or ""),
+            severity_before_policy=str(row["severity_before_policy"] or ""),
+            severity_after_policy=str(row["severity_after_policy"] or ""),
+            cooldown_checked=bool(row["cooldown_checked"]),
+            cooldown_result=str(row["cooldown_result"] or ""),
+            alert_required=bool(row["alert_required"]),
+            alert_suppressed=bool(row["alert_suppressed"]),
+            alert_suppression_reason=str(row["alert_suppression_reason"] or ""),
+            alert_queue_enqueued=bool(row["alert_queue_enqueued"]),
+            alert_queue_length_before=safe_int(row["alert_queue_length_before"]) or 0,
+            alert_queue_length_after=safe_int(row["alert_queue_length_after"]) or 0,
+            overlay_dispatch_attempted=bool(row["overlay_dispatch_attempted"]),
+            overlay_dispatch_at=str(row["overlay_dispatch_at"] or ""),
+            overlay_dispatch_result=str(row["overlay_dispatch_result"] or ""),
+            overlay_error=str(row["overlay_error"] or ""),
+            visible_alert_id=str(row["visible_alert_id"] or ""),
+            displayed_at=str(row["displayed_at"] or ""),
+        )
+
+    def latest_event_alert_traces(self, limit: int = 25) -> list[EventAlertTrace]:
+        rows = self.conn.execute("SELECT event_id FROM event_alert_traces ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        traces: list[EventAlertTrace] = []
+        for row in rows:
+            trace = self.get_event_alert_trace(str(row["event_id"]))
+            if trace is not None:
+                traces.append(trace)
+        return traces
+
+    def record_notification_capabilities(self, capabilities: NotificationCapabilities | dict[str, Any], *, scope: str = "current") -> None:
+        payload = capabilities.to_dict() if hasattr(capabilities, "to_dict") else dict(capabilities)
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO notification_capabilities (scope, updated_at, payload_json)
+            VALUES (?, ?, ?)
+            """,
+            (scope, payload.get("last_test_time", utc_now_iso()), json.dumps(payload, sort_keys=True)),
+        )
+        self.conn.commit()
+
+    def latest_notification_capabilities(self, scope: str = "current") -> NotificationCapabilities | None:
+        row = self.conn.execute(
+            "SELECT * FROM notification_capabilities WHERE scope = ? ORDER BY updated_at DESC LIMIT 1",
+            (scope,),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            payload = json.loads(str(row["payload_json"] or "{}"))
+        except json.JSONDecodeError:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        return NotificationCapabilities(
+            overlay_available=bool(payload.get("overlay_available", False)),
+            applescript_dialog_available=bool(payload.get("applescript_dialog_available", False)),
+            notification_center_available=bool(payload.get("notification_center_available", False)),
+            osascript_exists=bool(payload.get("osascript_exists", False)),
+            last_test_time=str(payload.get("last_test_time", row["updated_at"] or "")),
+            last_test_result=str(payload.get("last_test_result", "")),
+        )
+
+    def record_alert_delivery(self, record: AlertDeliveryRecord | dict[str, Any]) -> None:
+        payload = record.to_dict() if hasattr(record, "to_dict") else dict(record)
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO alert_delivery_records
+            (event_id, alert_type, overlay_attempted, overlay_success, dialog_attempted, dialog_success, notification_attempted, notification_success, delivery_method_used, updated_at, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(payload.get("event_id", "")),
+                str(payload.get("alert_type", "")),
+                int(bool(payload.get("overlay_attempted", False))),
+                int(bool(payload.get("overlay_success", False))),
+                int(bool(payload.get("dialog_attempted", False))),
+                int(bool(payload.get("dialog_success", False))),
+                int(bool(payload.get("notification_attempted", False))),
+                int(bool(payload.get("notification_success", False))),
+                str(payload.get("delivery_method_used", "")),
+                str(payload.get("updated_at", utc_now_iso())),
+                json.dumps(payload, sort_keys=True),
+            ),
+        )
+        self.conn.commit()
+
+    def latest_alert_delivery_records(self, limit: int = 25) -> list[AlertDeliveryRecord]:
+        rows = self.conn.execute("SELECT event_id FROM alert_delivery_records ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
+        records: list[AlertDeliveryRecord] = []
+        for row in rows:
+            record_row = self.conn.execute("SELECT * FROM alert_delivery_records WHERE event_id = ?", (str(row["event_id"]),)).fetchone()
+            if not record_row:
+                continue
+            try:
+                payload = json.loads(str(record_row["payload_json"] or "{}"))
+            except json.JSONDecodeError:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            records.append(
+                AlertDeliveryRecord(
+                    event_id=str(record_row["event_id"]),
+                    alert_type=str(record_row["alert_type"]),
+                    overlay_attempted=bool(record_row["overlay_attempted"]),
+                    overlay_success=bool(record_row["overlay_success"]),
+                    dialog_attempted=bool(record_row["dialog_attempted"]),
+                    dialog_success=bool(record_row["dialog_success"]),
+                    notification_attempted=bool(record_row["notification_attempted"]),
+                    notification_success=bool(record_row["notification_success"]),
+                    delivery_method_used=str(record_row["delivery_method_used"] or ""),
+                    updated_at=str(record_row["updated_at"] or ""),
+                    payload_json=json.dumps(payload, sort_keys=True),
+                )
+            )
+        return records
+
     def get_background_monitor_status(self) -> BackgroundMonitorStatus:
         now = datetime.now(timezone.utc)
         last_10_minutes = (now - timedelta(minutes=10)).isoformat()
@@ -1905,6 +2347,109 @@ class AuditDatabase:
             status_text=self.get_background_monitor_state("status_text", ""),
             current_snapshot=self.get_background_monitor_state("current_monitor_snapshot", ""),
         )
+
+    def record_legal_notice_acknowledgement(self, notice_version: str, payload: dict[str, Any] | None = None) -> None:
+        acknowledged_at = utc_now_iso()
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO legal_notice_acknowledgements
+            (notice_version, acknowledged_at, acknowledged, payload_json)
+            VALUES (?, ?, ?, ?)
+            """,
+            (notice_version, acknowledged_at, 1, json.dumps(payload or {}, sort_keys=True)),
+        )
+        self.conn.commit()
+
+    def legal_notice_acknowledged(self, notice_version: str) -> bool:
+        row = self.conn.execute(
+            "SELECT acknowledged FROM legal_notice_acknowledgements WHERE notice_version = ?",
+            (notice_version,),
+        ).fetchone()
+        return bool(row and int(row["acknowledged"]) == 1)
+
+    def record_security_decoy_connection(self, payload: dict[str, Any]) -> None:
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO security_decoy_connections
+            (connection_id, timestamp, source_ip, source_port, destination_port, listen_address, protocol_profile, bytes_sent, bytes_received, connection_count, first_seen, last_seen, correlation_id, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(payload.get("connection_id", "")),
+                str(payload.get("timestamp", "")),
+                str(payload.get("source_ip", "")),
+                safe_int(payload.get("source_port")) or 0,
+                safe_int(payload.get("destination_port")) or 0,
+                str(payload.get("listen_address", "")),
+                str(payload.get("protocol_profile", "")),
+                safe_int(payload.get("bytes_sent")) or 0,
+                safe_int(payload.get("bytes_received")) or 0,
+                safe_int(payload.get("connection_count")) or 1,
+                str(payload.get("first_seen", "")),
+                str(payload.get("last_seen", "")),
+                str(payload.get("correlation_id", "")),
+                json.dumps(payload.get("payload_json", payload), sort_keys=True),
+            ),
+        )
+        self.conn.commit()
+
+    def list_security_decoy_connections(self, limit: int = 200) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM security_decoy_connections ORDER BY timestamp DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["payload_json"] = json.loads(item.get("payload_json", "{}") or "{}")
+            except json.JSONDecodeError:
+                item["payload_json"] = {}
+            results.append(item)
+        return results
+
+    def security_decoy_summary(self, limit: int = 500) -> dict[str, Any]:
+        connections = self.list_security_decoy_connections(limit=limit)
+        by_source: dict[str, dict[str, Any]] = {}
+        for item in connections:
+            source = str(item.get("source_ip", ""))
+            if not source:
+                continue
+            summary = by_source.setdefault(
+                source,
+                {
+                    "source_ip": source,
+                    "connection_count": 0,
+                    "first_seen": str(item.get("first_seen", "")),
+                    "last_seen": str(item.get("last_seen", "")),
+                    "protocols": set(),
+                    "destination_ports": set(),
+                },
+            )
+            summary["connection_count"] += int(item.get("connection_count") or 1)
+            summary["protocols"].add(str(item.get("protocol_profile", "")))
+            summary["destination_ports"].add(int(item.get("destination_port") or 0))
+            summary["first_seen"] = min(str(summary["first_seen"]), str(item.get("first_seen", ""))) if summary["first_seen"] else str(item.get("first_seen", ""))
+            summary["last_seen"] = max(str(summary["last_seen"]), str(item.get("last_seen", ""))) if summary["last_seen"] else str(item.get("last_seen", ""))
+        top_sources = []
+        for item in by_source.values():
+            top_sources.append(
+                {
+                    "source_ip": item["source_ip"],
+                    "connection_count": item["connection_count"],
+                    "first_seen": item["first_seen"],
+                    "last_seen": item["last_seen"],
+                    "protocols": sorted(item["protocols"]),
+                    "destination_ports": sorted(port for port in item["destination_ports"] if port),
+                }
+            )
+        top_sources.sort(key=lambda item: int(item.get("connection_count", 0)), reverse=True)
+        return {
+            "connection_count": sum(int(item.get("connection_count") or 1) for item in connections),
+            "unique_sources": len(by_source),
+            "top_sources": top_sources[:20],
+            "connections": connections,
+        }
 
     def save_investigation_note(self, note: InvestigationNote) -> str:
         note_id = note.note_id or f"note-{uuid4()}"

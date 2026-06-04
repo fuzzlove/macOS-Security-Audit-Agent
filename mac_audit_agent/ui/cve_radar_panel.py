@@ -108,6 +108,7 @@ BUTTON_TOOLTIPS = {
     "update": "Check Apple security advisories and refresh the local forecast.",
     "diagnostics": "Show source status, cache age, inventory, and forecast generation details.",
     "demo": "Create simulated forecast cards to test the UI.",
+    "safari_demo": "Create a simulated Safari/WebKit forecast card without using Safari browsing state.",
     "details": "Open full CVE/advisory details for this forecast card.",
     "review": "Mark this forecast item as reviewed without hiding it permanently.",
     "snooze": "Temporarily hide alerts for this forecast item.",
@@ -286,6 +287,7 @@ class CveRadarPanel(QFrame):
     update_requested = Signal()
     diagnostics_requested = Signal()
     demo_requested = Signal()
+    safari_demo_requested = Signal()
     clear_demo_requested = Signal()
     export_requested = Signal()
     review_requested = Signal(object)
@@ -371,17 +373,18 @@ class CveRadarPanel(QFrame):
         self.update_button = make_forecast_button("Update Forecast", BUTTON_TOOLTIPS["update"], "primary")
         self.diagnostics_button = make_forecast_button("Diagnostics", BUTTON_TOOLTIPS["diagnostics"], "secondary")
         self.demo_button = make_forecast_button("Generate Demo", BUTTON_TOOLTIPS["demo"], "warning")
+        self.safari_demo_button = make_forecast_button("Safari/WebKit Demo", BUTTON_TOOLTIPS["safari_demo"], "warning")
         self.clear_demo_button = make_forecast_button("Clear Demo", "Remove simulated forecast cards from the local cache.", "secondary")
         self.export_button = make_forecast_button("Export Forecast", "Export the current Apple Security Forecast report.", "secondary")
         self.details_button = make_forecast_button("View Details", BUTTON_TOOLTIPS["details"], "primary")
         self.review_button = make_forecast_button("Reviewed", BUTTON_TOOLTIPS["review"], "secondary")
         self.snooze_button = make_forecast_button("Snooze", BUTTON_TOOLTIPS["snooze"], "warning")
         self.guidance_button = make_forecast_button("Update Guide", BUTTON_TOOLTIPS["guidance"], "urgent")
-        for button in [self.update_button, self.diagnostics_button, self.demo_button, self.clear_demo_button, self.export_button]:
+        for button in [self.update_button, self.diagnostics_button, self.demo_button, self.safari_demo_button, self.clear_demo_button, self.export_button]:
             button.setEnabled(False)
         for button in [self.update_button, self.diagnostics_button, self.demo_button]:
             top_button_row.addWidget(button)
-        for button in [self.clear_demo_button, self.export_button]:
+        for button in [self.safari_demo_button, self.clear_demo_button, self.export_button]:
             bottom_button_row.addWidget(button)
         button_grid.addLayout(top_button_row)
         button_grid.addLayout(bottom_button_row)
@@ -402,6 +405,7 @@ class CveRadarPanel(QFrame):
         self.update_button.clicked.connect(self.update_requested.emit)
         self.diagnostics_button.clicked.connect(self.diagnostics_requested.emit)
         self.demo_button.clicked.connect(self.demo_requested.emit)
+        self.safari_demo_button.clicked.connect(self.safari_demo_requested.emit)
         self.clear_demo_button.clicked.connect(self.clear_demo_requested.emit)
         self.export_button.clicked.connect(self.export_requested.emit)
         self.details_button.clicked.connect(self.open_details)
@@ -414,6 +418,7 @@ class CveRadarPanel(QFrame):
         self._pulse_timer.start(300)
         self.diagnostics_button.setEnabled(True)
         self.demo_button.setEnabled(True)
+        self.safari_demo_button.setEnabled(True)
         self.clear_demo_button.setEnabled(True)
         self.update_button.setEnabled(True)
         self.export_button.setEnabled(True)
@@ -615,7 +620,7 @@ class CveRadarPanel(QFrame):
 
     def _reason_text(self, payload: dict[str, Any]) -> str:
         if not payload.get("timestamp") and not payload.get("generated_at"):
-            return "No forecast has been checked yet."
+            return "No Apple Security Forecast has been checked yet."
         if payload.get("simulated"):
             return "Demo forecast is active."
         if payload.get("last_error") and not payload.get("display_cards"):
@@ -627,7 +632,14 @@ class CveRadarPanel(QFrame):
         if not payload.get("display_cards") and int(payload.get("hidden_review_needed_count", 0)) > 0:
             return "Only review-needed items were found and are hidden by default."
         if not payload.get("display_cards"):
-            return "No Apple-related high/critical items matched this Mac."
+            inventory = payload.get("inventory", {}) if isinstance(payload.get("inventory", {}), dict) else {}
+            if str(inventory.get("software_update_check_status", "")) == "failed":
+                return "Software update check failed; using cached advisory data."
+            if not inventory.get("safari_version") and payload.get("safari_required"):
+                return "Safari version could not be detected."
+            if payload.get("catalog_update_status") == "offline-rules":
+                return "Offline and no cache is available."
+            return "No applicable Apple security advisories matched this Mac."
         return str(payload.get("summary", "")) or "Forecast data loaded."
 
     def current_card(self) -> dict[str, Any] | None:
@@ -686,6 +698,7 @@ class CveRadarPanel(QFrame):
             self.update_button,
             self.diagnostics_button,
             self.demo_button,
+            self.safari_demo_button,
             self.clear_demo_button,
             self.export_button,
             self.details_button,

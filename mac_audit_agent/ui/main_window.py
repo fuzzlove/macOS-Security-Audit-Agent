@@ -29,6 +29,8 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSplitter,
     QStackedWidget,
+    QSizePolicy,
+    QListWidgetItem,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -41,9 +43,10 @@ from mac_audit_agent.assets import get_asset_path
 from mac_audit_agent.collectors import CollectorSuite
 from mac_audit_agent.command_registry import build_command_registry
 from mac_audit_agent.config import AuditConfig
-from mac_audit_agent.launch_agent import LaunchAgentManager
+from mac_audit_agent.launch_agent import LaunchAgentManager, default_monitor_db_path
 from mac_audit_agent.models import AuditCommand, RawLogEntry, ScanResult, ScanSummary, utc_now_iso
 from mac_audit_agent.models import Finding, InvestigationNote, NetworkDiscoveryResult, NetworkHostSnapshot
+from mac_audit_agent.notification_manager import NotificationManager
 from mac_audit_agent.network_discovery import (
     SCAN_PROFILES,
     detect_preferred_interface,
@@ -71,18 +74,29 @@ from mac_audit_agent.reporting import (
     export_scan_result_json,
     get_reports_dir,
 )
+from mac_audit_agent.investigation_priority import InvestigationPriorityEngine
 from mac_audit_agent.runner import RunnerConfig, SafeCommandRunner
 from mac_audit_agent.storage import AuditDatabase, json_safe
 from mac_audit_agent.cve_radar import CveRadarEngine
 from mac_audit_agent.execution_evidence import ExecutionEvidenceEngine
+from mac_audit_agent.intrusion_correlation import IntrusionCorrelationEngine
+from mac_audit_agent.operational_health import OperationalHealthEngine
+from mac_audit_agent.ui.investigation_priority_panel import InvestigationPriorityPanel
 from mac_audit_agent.ui.context_dialog import ContextDialog
 from mac_audit_agent.ui.provenance_dialog import AlertProvenanceDialog
 from mac_audit_agent.ui.cve_radar_panel import CveRadarDetailsDialog, CveRadarPanel, make_forecast_button
+from mac_audit_agent.ui.flight_recorder_panel import FlightRecorderPanel
+from mac_audit_agent.ui.intrusion_detection_panel import IntrusionDetectionPanel
+from mac_audit_agent.ui.logs_panel import LogsPanel
+from mac_audit_agent.ui.operational_health_panel import OperationalHealthPanel
 from mac_audit_agent.ui.system_recovery_panel import RecoveryEvidenceWarningDialog, SystemRecoveryPanel
+from mac_audit_agent.ui.theme_panel import ThemeSettingsPanel
 from mac_audit_agent.recovery_center import SystemRecoveryCenter
+from mac_audit_agent.system_monitor_readiness import SystemMonitorReadiness
 from mac_audit_agent.workflow_layer import InvestigatorWorkflowLayer
 from mac_audit_agent.ui.background_monitor_panel import BackgroundMonitorPanel
 from mac_audit_agent.vulnerability_review import AggressiveLocalVulnerabilityReviewer
+from mac_audit_agent.themes import DEFAULT_THEME_NAME, theme_for_name, theme_stylesheet
 
 
 LOGGER = logging.getLogger(__name__)
@@ -538,10 +552,13 @@ class MainWindow(QMainWindow):
         self.runner = SafeCommandRunner(RunnerConfig(dry_run=self.config.dry_run))
         self.collectors = CollectorSuite(self.runner, self.config)
         self.db = AuditDatabase(db_path, self.config.logs_dir, self.config.log_retention_days)
+        self.notification_manager = NotificationManager(self.db)
         self.cve_radar_engine = CveRadarEngine(self.db, self.config)
         self.recovery_center = SystemRecoveryCenter(self.db, self.config)
         self.workflow_layer = InvestigatorWorkflowLayer(self.db)
+        self.intrusion_correlation_engine = IntrusionCorrelationEngine(self.db, self.workflow_layer)
         self.execution_evidence_engine = ExecutionEvidenceEngine()
+        self.investigation_priority_engine = InvestigationPriorityEngine(self.db, self.workflow_layer)
         self.launch_agent_manager = LaunchAgentManager(db_path)
         self.vulnerability_reviewer = AggressiveLocalVulnerabilityReviewer(self.config)
         self.current_scan_summary: ScanSummary | None = None
@@ -549,6 +566,14 @@ class MainWindow(QMainWindow):
         self.current_visible_findings: list[dict] = []
         self.current_selected_finding: dict | None = None
         self.execution_evidence_findings: list[dict] = []
+        self.operational_health_engine = OperationalHealthEngine(
+            self.db,
+            user_launch_agent=self.launch_agent_manager,
+            system_launch_agent=LaunchAgentManager(self.db_path, scope="system"),
+            notification_manager=self.notification_manager,
+            system_readiness=SystemMonitorReadiness(default_monitor_db_path("system")),
+            cve_radar_engine=self.cve_radar_engine,
+        )
         self._active_network_discovery_dialog: NetworkDiscoveryProgressDialog | None = None
         self.findings_sort_order = "critical_to_low"
         self.last_ui_debug: dict[str, object] = {}
@@ -564,10 +589,18 @@ class MainWindow(QMainWindow):
         self._load_registry()
         self._refresh_command_preview_page()
         self._refresh_dashboard()
+        self.refresh_operational_health()
+        self.apply_theme_choice(
+            self.db.get_background_monitor_state("selected_theme", DEFAULT_THEME_NAME),
+            self.db.get_background_monitor_state("accessibility_high_contrast", "0") == "1",
+        )
         if self.current_scan_result is not None:
             self._load_scan_result(self.current_scan_result)
         else:
             self.summary_label.setText("No active scan. Run a scan to begin.")
+            self.refresh_intrusion_detection()
+            self.refresh_flight_recorder()
+            self.refresh_logs_page()
         self.refresh_apple_security_forecast(manual=False, initial_load=True)
         self.refresh_system_recovery(manual=False, initial_load=True)
 
@@ -579,20 +612,58 @@ class MainWindow(QMainWindow):
         outer.setSpacing(8)
 
         self.sidebar = QListWidget()
-        self.sidebar.addItems(["Dashboard", "Apple Security Forecast", "Scan Categories", "Results", "Investigation Notes", "Background Monitor", "Command Preview", "System Recovery"])
-        self.sidebar.setMaximumWidth(180)
-        self.sidebar.setMinimumWidth(140)
+        self.sidebar.addItems([
+            "Dashboard",
+            "Intrusion Detection",
+            "Investigation Priorities",
+            "Flight Recorder",
+            "Evidence Snapshots",
+            "Apple Security Forecast",
+            "Logs",
+            "Settings",
+            "Skins",
+            "Scan Categories",
+            "Results",
+            "Investigation Notes",
+            "Command Preview",
+        ])
+        self.sidebar.setMaximumWidth(240)
+        self.sidebar.setMinimumWidth(150)
         self.sidebar.currentRowChanged.connect(self._change_page)
 
         self.cve_radar_panel = CveRadarPanel(self)
         self.cve_radar_panel.update_requested.connect(lambda: self.refresh_apple_security_forecast(manual=True))
         self.cve_radar_panel.diagnostics_requested.connect(self.show_apple_security_forecast_diagnostics)
         self.cve_radar_panel.demo_requested.connect(self.generate_demo_apple_security_forecast)
+        self.cve_radar_panel.safari_demo_requested.connect(self.generate_safari_webkit_demo_apple_security_forecast)
         self.cve_radar_panel.clear_demo_requested.connect(self.clear_demo_apple_security_forecast)
         self.cve_radar_panel.export_requested.connect(self.export_html)
         self.cve_radar_panel.review_requested.connect(self._review_cve_radar_card)
         self.cve_radar_panel.snooze_requested.connect(self._snooze_cve_radar_card)
         self.cve_radar_panel.set_status("Forecast not checked yet")
+        self.intrusion_detection_panel = IntrusionDetectionPanel()
+        self.intrusion_detection_panel.refresh_requested.connect(self.refresh_intrusion_detection)
+        self.intrusion_detection_panel.show_context_requested.connect(self._show_intrusion_context)
+        self.intrusion_detection_panel.snapshot_requested.connect(self.create_system_recovery_snapshot)
+        self.intrusion_detection_panel.export_ai_summary_requested.connect(self.export_intrusion_ai_summary)
+        self.intrusion_detection_panel.open_logs_requested.connect(self.show_logs_page)
+        self.flight_recorder_panel = FlightRecorderPanel("Flight Recorder", "Timeline of surrounding activity and correlated patterns.")
+        self.flight_recorder_panel.refresh_requested.connect(self.refresh_flight_recorder)
+        self.flight_recorder_panel.show_context_requested.connect(self._show_intrusion_context)
+        self.flight_recorder_panel.snapshot_requested.connect(self.create_system_recovery_snapshot)
+        self.flight_recorder_panel.export_ai_summary_requested.connect(self.export_intrusion_ai_summary)
+        self.flight_recorder_panel.open_logs_requested.connect(self.show_logs_page)
+        self.investigation_priority_nav_panel = InvestigationPriorityPanel()
+        self.logs_panel = LogsPanel(self)
+        self.logs_panel.refresh_requested.connect(self.refresh_logs_page)
+        self.logs_panel.open_reports_requested.connect(self.open_reports_folder)
+        self.theme_panel = ThemeSettingsPanel(self)
+        self.theme_panel.theme_changed.connect(self.apply_theme_choice)
+        self.operational_health_panel = OperationalHealthPanel(self)
+        self.operational_health_panel.refresh_requested.connect(self.refresh_operational_health)
+        self.background_monitor_panel = BackgroundMonitorPanel(self.db, self.launch_agent_manager, self)
+        self.operational_health_panel.audit_deployment_requested.connect(self.background_monitor_panel.audit_system_monitor_deployment)
+        self.operational_health_panel.verify_event_flow_requested.connect(self.background_monitor_panel.verify_system_monitor_event_flow)
         self.system_recovery_panel = SystemRecoveryPanel(self)
         self.system_recovery_panel.incident_check_requested.connect(self.run_system_recovery_incident_check)
         self.system_recovery_panel.snapshot_requested.connect(self.create_system_recovery_snapshot)
@@ -602,14 +673,19 @@ class MainWindow(QMainWindow):
 
         self.pages = QStackedWidget()
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_dashboard_page(), resizable=True))
+        self.pages.addWidget(self._wrap_in_scroll_area(self._build_intrusion_detection_page(), resizable=True))
+        self.pages.addWidget(self._wrap_in_scroll_area(self._build_investigation_priorities_page(), resizable=True))
+        self.pages.addWidget(self._wrap_in_scroll_area(self._build_flight_recorder_page(), resizable=True))
+        self.pages.addWidget(self._wrap_in_scroll_area(self._build_system_recovery_page(), resizable=True))
         self.forecast_page_widget = self._build_forecast_page()
         self.pages.addWidget(self._wrap_in_scroll_area(self.forecast_page_widget, resizable=True))
+        self.pages.addWidget(self._wrap_in_scroll_area(self._build_logs_page(), resizable=True))
+        self.pages.addWidget(self._wrap_in_scroll_area(self._build_settings_page(), resizable=True))
+        self.pages.addWidget(self._wrap_in_scroll_area(self._build_skins_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_categories_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_results_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_investigation_notes_page(), resizable=True))
-        self.pages.addWidget(self._wrap_in_scroll_area(self._build_background_monitor_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_preview_page(), resizable=True))
-        self.pages.addWidget(self._wrap_in_scroll_area(self._build_system_recovery_page(), resizable=True))
         self.sidebar.setCurrentRow(0)
 
         self.details_panel = self._build_selected_command_panel()
@@ -662,10 +738,25 @@ class MainWindow(QMainWindow):
         test_dialog_action = QAction("Test High Priority Dialog", self)
         test_dialog_action.triggered.connect(self.trigger_background_monitor_test_dialog)
         background_monitor_menu.addAction(test_dialog_action)
+        test_overlay_action = QAction("Test Bottom-Right Alert", self)
+        test_overlay_action.triggered.connect(self.trigger_background_monitor_test_overlay)
+        background_monitor_menu.addAction(test_overlay_action)
+        test_idle_warning_action = QAction("Test Idle Activity Warning", self)
+        test_idle_warning_action.triggered.connect(self.trigger_background_monitor_test_idle_warning)
+        background_monitor_menu.addAction(test_idle_warning_action)
         settings_menu = self.menuBar().addMenu("Settings")
+        appearance_action = QAction("Appearance", self)
+        appearance_action.triggered.connect(self.show_skins_page)
+        settings_menu.addAction(appearance_action)
         event_priorities_action = QAction("Event Priorities", self)
         event_priorities_action.triggered.connect(lambda: self.background_monitor_panel.show_event_priorities_dialog())
         settings_menu.addAction(event_priorities_action)
+        monitor_protection_action = QAction("Monitor Protection", self)
+        monitor_protection_action.triggered.connect(lambda: self.background_monitor_panel.show_monitor_protection_dialog())
+        settings_menu.addAction(monitor_protection_action)
+        monitor_mode_action = QAction("Monitor Mode", self)
+        monitor_mode_action.triggered.connect(lambda: self.background_monitor_panel.show_monitor_mode_dialog())
+        settings_menu.addAction(monitor_mode_action)
         help_menu = self.menuBar().addMenu("Help")
         about_action = QAction("About Mac Audit Agent", self)
         about_action.triggered.connect(self.show_about_dialog)
@@ -775,6 +866,39 @@ class MainWindow(QMainWindow):
         forecast_layout.addWidget(self.dashboard_forecast_kev_label)
         forecast_layout.addWidget(self.open_forecast_button)
 
+        self.dashboard_health_frame = QFrame()
+        self.dashboard_health_frame.setObjectName("dashboardHealthSummary")
+        self.dashboard_health_frame.setStyleSheet(
+            """
+            QFrame#dashboardHealthSummary {
+                background: rgba(24, 31, 46, 220);
+                border: 1px solid rgba(151, 190, 255, 100);
+                border-radius: 12px;
+            }
+            """
+        )
+        health_layout = QVBoxLayout(self.dashboard_health_frame)
+        health_layout.setContentsMargins(14, 14, 14, 14)
+        health_layout.setSpacing(6)
+        health_title = QLabel("Operational Health")
+        health_title.setStyleSheet("font-size: 16px; font-weight: 700; color: #F0F6FC;")
+        self.dashboard_health_status_label = QLabel("Status: not checked yet")
+        self.dashboard_health_score_label = QLabel("Score: 0/100")
+        self.dashboard_health_summary_label = QLabel("Open Settings to inspect the full health dashboard.")
+        self.dashboard_health_summary_label.setWordWrap(True)
+        for label in [self.dashboard_health_status_label, self.dashboard_health_score_label, self.dashboard_health_summary_label]:
+            label.setStyleSheet("color: #D6E4FF;")
+        self.open_health_button = QPushButton("Open Health")
+        self.open_health_button.setMinimumHeight(36)
+        self.open_health_button.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
+        self.open_health_button.setToolTip("Open the operational health dashboard in Settings.")
+        self.open_health_button.clicked.connect(self.show_settings_page)
+        health_layout.addWidget(health_title)
+        health_layout.addWidget(self.dashboard_health_status_label)
+        health_layout.addWidget(self.dashboard_health_score_label)
+        health_layout.addWidget(self.dashboard_health_summary_label)
+        health_layout.addWidget(self.open_health_button)
+
         privacy = QLabel(
             "Privacy warning: shell history review stores only matched indicators and counts by default. "
             "Snippets are redacted and context is disabled unless you change the configuration."
@@ -782,6 +906,7 @@ class MainWindow(QMainWindow):
         privacy.setWordWrap(True)
 
         layout.addWidget(self.dashboard_forecast_frame)
+        layout.addWidget(self.dashboard_health_frame)
         self.dashboard_cards = {}
         self.severity_cards = {}
         self.dashboard_card_widgets: list[QFrame] = []
@@ -848,6 +973,27 @@ class MainWindow(QMainWindow):
         self.categories_table.itemSelectionChanged.connect(self._update_command_preview_from_selection)
         self.categories_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.categories_table)
+        return page
+
+    def _build_intrusion_detection_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(self.intrusion_detection_panel)
+        return page
+
+    def _build_investigation_priorities_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(self.investigation_priority_nav_panel)
+        return page
+
+    def _build_flight_recorder_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(self.flight_recorder_panel)
         return page
 
     def _build_results_page(self) -> QWidget:
@@ -946,6 +1092,7 @@ class MainWindow(QMainWindow):
         execution_layout.addWidget(QLabel("Execution Evidence view: evidence only, no compromise claims."))
         self.execution_evidence_table = self._make_table(["Confidence", "Evidence", "Timeline", "Explanation", "Recommended Actions"])
         execution_layout.addWidget(self.execution_evidence_table)
+        self.investigation_priority_panel = InvestigationPriorityPanel()
         for name, widget in [
             ("Findings", findings_page),
             ("Ports", self.ports_table),
@@ -954,6 +1101,7 @@ class MainWindow(QMainWindow):
             ("Packet Capture Snapshot", self.packet_capture_table),
             ("Local Network Device Discovery", self.network_discovery_page),
             ("Workflow Layer", self.workflow_page),
+            ("Investigation Priorities", self.investigation_priority_panel),
             ("Execution Evidence", self.execution_evidence_page),
             ("Catalog Update Status", self.catalog_status_table),
             ("CVE Findings", cve_findings_page),
@@ -970,6 +1118,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.results_tabs)
         return page
 
+    def _build_logs_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(self.logs_panel)
+        return page
+
     def _build_forecast_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -982,6 +1137,29 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.system_recovery_panel)
+        return page
+
+    def _build_settings_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+        health_label = QLabel("Operational Health")
+        health_label.setStyleSheet("font-size: 18px; font-weight: 700; color: #F0F6FC;")
+        health_label.setWordWrap(True)
+        layout.addWidget(health_label)
+        layout.addWidget(self.operational_health_panel)
+        monitor_label = QLabel("Monitor Settings")
+        monitor_label.setStyleSheet("font-size: 18px; font-weight: 700; color: #F0F6FC;")
+        monitor_label.setWordWrap(True)
+        layout.addWidget(monitor_label)
+        layout.addWidget(self.background_monitor_panel)
+        return page
+
+    def _build_skins_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(self.theme_panel)
         return page
 
     def _build_preview_page(self) -> QWidget:
@@ -2022,7 +2200,12 @@ class MainWindow(QMainWindow):
         }
         self._populate_scan_results(self.current_payload)
         self._refresh_workflow_layer()
+        self.refresh_investigation_priorities()
+        self.refresh_intrusion_detection()
+        self.refresh_flight_recorder()
+        self.refresh_logs_page()
         self.refresh_investigation_notes_page()
+        self.refresh_operational_health()
         self.refresh_cve_radar(manual=False)
         self.refresh_system_recovery(manual=False)
 
@@ -2076,6 +2259,175 @@ class MainWindow(QMainWindow):
         rows.insert(3, ["Review State", item.review_state])
         rows.insert(4, ["Suppressed", "yes" if item.suppressed else "no"])
         self._populate_table(self.workflow_explanation_table, rows)
+
+    def refresh_investigation_priorities(self) -> None:
+        if not hasattr(self, "investigation_priority_panel"):
+            return
+        try:
+            report = self.investigation_priority_engine.build_priorities(scan_result=self.current_scan_result)
+            report_dict = report.to_dict()
+            self.investigation_priority_panel.set_report(report_dict)
+            if hasattr(self, "investigation_priority_nav_panel"):
+                self.investigation_priority_nav_panel.set_report(report_dict)
+            if self.current_payload is not None:
+                self.current_payload["investigation_priorities"] = report_dict
+            if self.current_scan_result is not None:
+                self.current_scan_result.collected_artifacts["investigation_priorities"] = report_dict
+            LOGGER.info("Investigation Priorities rendered count=%s top3=%s", len(report.full_queue), len(report.top_3))
+        except Exception as exc:
+            LOGGER.exception("Failed to refresh Investigation Priorities: %s", exc)
+            self.investigation_priority_panel.set_report(
+                {
+                    "generated_at": utc_now_iso(),
+                    "scan_id": self.current_scan_result.scan_id if self.current_scan_result else "",
+                    "summary": f"Unable to rank findings: {exc}",
+                    "top_3": [],
+                    "top_10": [],
+                    "full_queue": [],
+                    "counts": {"top_3": 0, "top_10": 0, "full_queue": 0},
+                }
+            )
+            if hasattr(self, "investigation_priority_nav_panel"):
+                self.investigation_priority_nav_panel.set_report(
+                    {
+                        "generated_at": utc_now_iso(),
+                        "scan_id": self.current_scan_result.scan_id if self.current_scan_result else "",
+                        "summary": f"Unable to rank findings: {exc}",
+                        "top_3": [],
+                        "top_10": [],
+                        "full_queue": [],
+                        "counts": {"top_3": 0, "top_10": 0, "full_queue": 0},
+                    }
+                )
+
+    def refresh_intrusion_detection(self) -> None:
+        if not hasattr(self, "intrusion_detection_panel"):
+            return
+        try:
+            report = self.intrusion_correlation_engine.build_report(scan_result=self.current_scan_result)
+            report_dict = report.to_dict()
+            self.intrusion_detection_panel.set_report(report)
+            if self.current_payload is not None:
+                self.current_payload["intrusion_correlation"] = report_dict
+            if self.current_scan_result is not None:
+                self.current_scan_result.collected_artifacts["intrusion_correlation"] = report_dict
+            LOGGER.info("Intrusion Detection rendered patterns=%s coverage=%s", len(report.patterns), report.coverage.score if report.coverage else 0)
+        except Exception as exc:
+            LOGGER.exception("Failed to refresh Intrusion Detection: %s", exc)
+            self.intrusion_detection_panel.set_report(
+                {
+                    "generated_at": utc_now_iso(),
+                    "scan_id": self.current_scan_result.scan_id if self.current_scan_result else "",
+                    "summary": f"Unable to build intrusion correlation report: {exc}",
+                    "patterns": [],
+                    "top_patterns": [],
+                    "user_presence": {"state": "unknown", "reason": "report unavailable", "confidence": "low"},
+                    "coverage": {"score": 0, "summary": "Monitoring Coverage: 0%", "missing": [str(exc)]},
+                    "recent_events": [item.to_dict() for item in self.db.recent_background_monitor_events(limit=50)],
+                    "ai_summary": {},
+                    "ai_summary_path": "",
+                }
+            )
+
+    def refresh_flight_recorder(self) -> None:
+        if not hasattr(self, "flight_recorder_panel"):
+            return
+        try:
+            report = self.intrusion_correlation_engine.build_report(scan_result=self.current_scan_result)
+            self.flight_recorder_panel.set_report(report)
+        except Exception as exc:
+            LOGGER.exception("Failed to refresh Flight Recorder: %s", exc)
+            self.flight_recorder_panel.set_report(
+                {
+                    "generated_at": utc_now_iso(),
+                    "scan_id": self.current_scan_result.scan_id if self.current_scan_result else "",
+                    "summary": f"Unable to build flight recorder: {exc}",
+                    "patterns": [],
+                    "top_patterns": [],
+                    "user_presence": {"state": "unknown", "reason": "report unavailable", "confidence": "low"},
+                    "coverage": {"score": 0, "summary": "Monitoring Coverage: 0%"},
+                    "recent_events": [],
+                    "ai_summary": {},
+                    "ai_summary_path": "",
+                }
+            )
+
+    def refresh_logs_page(self) -> None:
+        if not hasattr(self, "logs_panel"):
+            return
+        scan_logs = [entry.to_dict() for entry in self.current_scan_result.raw_logs[-200:]] if self.current_scan_result is not None else []
+        events = [event.to_dict() for event in self.db.recent_background_monitor_events(limit=200)]
+        self.logs_panel.set_logs(
+            {
+                "summary": f"{len(events)} background events and {len(scan_logs)} scan log entries loaded locally.",
+                "events": events,
+                "scan_logs": scan_logs,
+            }
+        )
+
+    def refresh_operational_health(self) -> None:
+        if not hasattr(self, "operational_health_panel"):
+            return
+        try:
+            report = self.operational_health_engine.build_report()
+            self.operational_health_panel.set_report(report.to_dict())
+            if hasattr(self, "dashboard_health_status_label"):
+                self.dashboard_health_status_label.setText(f"Status: {report.overall_status}")
+                self.dashboard_health_score_label.setText(f"Score: {report.health_score}/100")
+                top_issue = next((check.summary for check in report.checks if check.status != "healthy"), "All core components are healthy.")
+                self.dashboard_health_summary_label.setText(top_issue)
+            if self.current_payload is not None:
+                self.current_payload["operational_health"] = report.to_dict()
+            LOGGER.info("Operational Health rendered status=%s score=%d", report.overall_status, report.health_score)
+        except Exception as exc:
+            LOGGER.exception("Failed to refresh Operational Health: %s", exc)
+            if hasattr(self, "dashboard_health_status_label"):
+                self.dashboard_health_status_label.setText("Status: broken")
+                self.dashboard_health_score_label.setText("Score: 0/100")
+                self.dashboard_health_summary_label.setText(str(exc))
+            self.operational_health_panel.set_report(
+                {
+                    "generated_at": utc_now_iso(),
+                    "overall_status": "broken",
+                    "health_score": 0,
+                    "checks": [
+                        {
+                            "component": "Operational Health",
+                            "status": "broken",
+                            "summary": f"Unable to build health report: {exc}",
+                            "evidence": str(exc),
+                            "next_step": "Open the logs and repair the failing component.",
+                        }
+                    ],
+                    "details": {},
+                }
+            )
+
+    def apply_theme_choice(self, theme_name: str, accessibility: bool) -> None:
+        theme = theme_for_name(theme_name)
+        self.db.set_background_monitor_state("selected_theme", theme.name)
+        self.db.set_background_monitor_state("accessibility_high_contrast", "1" if accessibility else "0")
+        self.setStyleSheet(theme_stylesheet(theme, accessibility_override=accessibility))
+        if hasattr(self, "theme_panel"):
+            self.theme_panel.set_theme(theme.name, accessibility)
+        self.statusBar().showMessage(f"Theme applied: {theme.name}", 3000)
+
+    def export_intrusion_ai_summary(self) -> None:
+        try:
+            report = self.intrusion_correlation_engine.build_report(scan_result=self.current_scan_result)
+            path = self.intrusion_correlation_engine.write_ai_summary(report.ai_summary)
+        except Exception as exc:
+            LOGGER.exception("Failed to export AI summary: %s", exc)
+            QMessageBox.warning(self, "Export AI Summary Failed", str(exc))
+            return
+        QMessageBox.information(self, "AI Summary Exported", f"Local AI-ready summary saved to:\n{path}")
+
+    def _show_intrusion_context(self, item: object) -> None:
+        payload = item.to_dict() if hasattr(item, "to_dict") else dict(item or {})
+        if not isinstance(payload, dict):
+            return
+        window = self.intrusion_correlation_engine.build_context_window_for_event(payload)
+        ContextDialog(window, self).exec()
 
     def _apply_cve_radar_payload(self, radar_payload: dict[str, object]) -> None:
         if self.current_payload is None:
@@ -2331,6 +2683,8 @@ class MainWindow(QMainWindow):
     def show_apple_security_forecast_diagnostics(self) -> None:
         diagnostics = self.cve_radar_engine.diagnostics_snapshot()
         lines = [
+            "Safari Private Browsing does not affect this forecast. The forecast uses installed Safari/macOS version and Apple advisory/update data only.",
+            "",
             f"Last update time: {diagnostics.get('last_update_time', 'not yet')}",
             f"Last successful update time: {diagnostics.get('last_successful_update_time', 'not yet')}",
             f"Cache age: {diagnostics.get('cache_age', 'unknown')}",
@@ -2339,14 +2693,18 @@ class MainWindow(QMainWindow):
             f"EPSS source status: {diagnostics.get('epss_source_status', 'cache')}",
             f"macOS version/build: {diagnostics.get('inventory', {}).get('macos_version', '')} {diagnostics.get('inventory', {}).get('macos_build', '')}".strip(),
             f"Safari version: {diagnostics.get('inventory', {}).get('safari_version', '')}",
+            f"Safari build: {diagnostics.get('inventory', {}).get('safari_build', '')}",
+            f"Safari detection method: {diagnostics.get('inventory', {}).get('safari_detection_method', '')}",
             f"WebKit version: {diagnostics.get('inventory', {}).get('webkit_version', '')}",
             f"Xcode version: {diagnostics.get('inventory', {}).get('xcode_version', '')}",
             f"CLT version: {diagnostics.get('inventory', {}).get('command_line_tools_version', '')}",
             f"Architecture: {diagnostics.get('inventory', {}).get('architecture', '')}",
             f"Model identifier: {diagnostics.get('inventory', {}).get('device_model', '')}",
+            f"Software update check status: {diagnostics.get('inventory', {}).get('software_update_check_status', '')}",
             f"Cards generated: {diagnostics.get('cards_generated_count', 0)}",
             f"Filtered non-Apple CVEs: {diagnostics.get('filtered_non_apple_cves_count', 0)}",
             f"Hidden review-needed: {diagnostics.get('hidden_review_needed_count', 0)}",
+            f"Why no cards were shown: {diagnostics.get('why_no_cards', '') or 'not applicable'}",
             f"Last error: {diagnostics.get('last_error', 'none') or 'none'}",
             "SQLite table counts:",
             f"  apple_security_forecasts: {diagnostics.get('table_counts', {}).get('apple_security_forecasts', 0)}",
@@ -2360,6 +2718,17 @@ class MainWindow(QMainWindow):
     def generate_demo_apple_security_forecast(self) -> None:
         LOGGER.info("Generating demo Apple Security Forecast")
         self.refresh_apple_security_forecast(manual=True, force=True, demo=True)
+
+    def generate_safari_webkit_demo_apple_security_forecast(self) -> None:
+        LOGGER.info("Generating Safari/WebKit demo Apple Security Forecast")
+        forecast = self.cve_radar_engine.generate_safari_webkit_demo_forecast()
+        self.cve_radar_engine.db.record_apple_security_forecast(forecast.to_dict())
+        self.cve_radar_engine.db.record_apple_security_forecast_cards([
+            card.to_dict() if hasattr(card, "to_dict") else dict(card)
+            for card in forecast.cards
+        ])
+        self._apply_cve_radar_payload(forecast.to_dict())
+        self.statusBar().showMessage("Safari/WebKit demo Apple Security Forecast generated", 3000)
 
     def clear_demo_apple_security_forecast(self) -> None:
         LOGGER.info("Clearing demo Apple Security Forecast rows")
@@ -2395,18 +2764,45 @@ class MainWindow(QMainWindow):
     def _change_page(self, row: int) -> None:
         if row >= 0 and hasattr(self, "pages"):
             self.pages.setCurrentIndex(row)
+            if row == 2 and hasattr(self, "results_tabs"):
+                self.results_tabs.setCurrentWidget(self.investigation_priority_panel)
+            elif row == 10 and hasattr(self, "results_tabs"):
+                self.results_tabs.setCurrentIndex(0)
 
     def show_forecast_page(self) -> None:
         if hasattr(self, "sidebar"):
+            self.sidebar.setCurrentRow(5)
+
+    def show_intrusion_detection_page(self) -> None:
+        if hasattr(self, "sidebar"):
             self.sidebar.setCurrentRow(1)
 
-    def show_background_monitor_page(self) -> None:
+    def show_investigation_priorities_page(self) -> None:
         if hasattr(self, "sidebar"):
-            self.sidebar.setCurrentRow(5)
+            self.sidebar.setCurrentRow(2)
+
+    def show_flight_recorder_page(self) -> None:
+        if hasattr(self, "sidebar"):
+            self.sidebar.setCurrentRow(3)
 
     def show_system_recovery_page(self) -> None:
         if hasattr(self, "sidebar"):
+            self.sidebar.setCurrentRow(4)
+
+    def show_logs_page(self) -> None:
+        if hasattr(self, "sidebar"):
+            self.sidebar.setCurrentRow(6)
+
+    def show_settings_page(self) -> None:
+        if hasattr(self, "sidebar"):
             self.sidebar.setCurrentRow(7)
+
+    def show_skins_page(self) -> None:
+        if hasattr(self, "sidebar"):
+            self.sidebar.setCurrentRow(8)
+
+    def show_background_monitor_page(self) -> None:
+        self.show_settings_page()
 
     def trigger_background_monitor_test_event(self) -> None:
         self.show_background_monitor_page()
@@ -2422,6 +2818,16 @@ class MainWindow(QMainWindow):
         self.show_background_monitor_page()
         if hasattr(self, "background_monitor_panel"):
             self.background_monitor_panel.test_high_priority_dialog()
+
+    def trigger_background_monitor_test_overlay(self) -> None:
+        self.show_background_monitor_page()
+        if hasattr(self, "background_monitor_panel"):
+            self.background_monitor_panel.test_bottom_right_alert()
+
+    def trigger_background_monitor_test_idle_warning(self) -> None:
+        self.show_background_monitor_page()
+        if hasattr(self, "background_monitor_panel"):
+            self.background_monitor_panel.test_idle_activity_warning()
 
     def run_scan(self) -> None:
         self.statusBar().showMessage("scan started")
@@ -3336,6 +3742,7 @@ class MainWindow(QMainWindow):
         investigation_notes = [item.to_dict() for item in self.db.list_investigation_notes(linked_scan_id=self._current_scan_id(), limit=1000)] if include_investigation_notes else []
         investigation_audit_trail = [item.to_dict() for item in self.db.list_investigation_audit_trail(limit=1000)] if include_investigation_notes else []
         try:
+            investigation_priorities = self.investigation_priority_engine.build_priorities(scan_result=self.current_scan_result).to_dict() if self.current_scan_result else None
             saved_path = export_scan_result_json(
                 self.current_scan_result,
                 Path(path),
@@ -3344,6 +3751,7 @@ class MainWindow(QMainWindow):
                 include_investigation_notes=include_investigation_notes,
                 investigation_notes=investigation_notes,
                 investigation_audit_trail=investigation_audit_trail,
+                investigation_priorities=investigation_priorities,
             )
         except OSError as exc:
             self.statusBar().showMessage("export failed", 5000)
@@ -3365,6 +3773,7 @@ class MainWindow(QMainWindow):
         investigation_notes = [item.to_dict() for item in self.db.list_investigation_notes(linked_scan_id=self._current_scan_id(), limit=1000)] if include_investigation_notes else []
         investigation_audit_trail = [item.to_dict() for item in self.db.list_investigation_audit_trail(limit=1000)] if include_investigation_notes else []
         try:
+            investigation_priorities = self.investigation_priority_engine.build_priorities(scan_result=self.current_scan_result).to_dict() if self.current_scan_result else None
             saved_path = export_scan_result_html(
                 self.current_scan_result,
                 Path(path),
@@ -3373,6 +3782,7 @@ class MainWindow(QMainWindow):
                 include_investigation_notes=include_investigation_notes,
                 investigation_notes=investigation_notes,
                 investigation_audit_trail=investigation_audit_trail,
+                investigation_priorities=investigation_priorities,
             )
         except OSError as exc:
             self.statusBar().showMessage("export failed", 5000)

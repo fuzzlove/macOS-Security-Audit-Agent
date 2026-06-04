@@ -64,5 +64,7 @@ class AuditConfig:
     redact_usernames: bool = True
     redact_paths: bool = True
     redact_ips: bool = True
+    redact_hostnames: bool = True
+    redact_macs: bool = True
     redact_url_secrets: bool = True
     concerning_ports: dict[int, str] = field(default_factory=lambda: dict(DEFAULT_CONCERNING_PORTS))

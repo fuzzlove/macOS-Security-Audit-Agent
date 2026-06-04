@@ -8,9 +8,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from mac_audit_agent.assets import get_asset_data_uri
+from mac_audit_agent.investigation_priority import build_investigation_priority_report_from_scan
 from mac_audit_agent.cve_radar import group_forecast_cards_for_display
 from mac_audit_agent.execution_evidence import ExecutionEvidenceEngine
 from mac_audit_agent.models import BaselineComparison, Finding, ScanResult, ScanSummary
+from mac_audit_agent.privacy import redact_structure, redact_text
 from mac_audit_agent.storage import json_safe
 
 SEVERITY_COLOR_MAP = {
@@ -214,6 +216,7 @@ def export_scan_result_json(
     include_investigation_notes: bool = False,
     investigation_notes: list[dict] | None = None,
     investigation_audit_trail: list[dict] | None = None,
+    investigation_priorities: dict | None = None,
 ) -> Path:
     output_path = output_path or default_json_report_path()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -224,11 +227,14 @@ def export_scan_result_json(
     packet_captures = payload.get("collected_artifacts", {}).get("packet_captures", [])
     network_discovery = payload.get("collected_artifacts", {}).get("network_discovery", {})
     apple_security_forecast = payload.get("collected_artifacts", {}).get("apple_security_forecast", payload.get("collected_artifacts", {}).get("cve_radar", {}))
+    intrusion_correlation = payload.get("collected_artifacts", {}).get("intrusion_correlation", payload.get("intrusion_correlation", {}))
     execution_evidence = execution_evidence_from_scan(scan_result)
+    investigation_priorities = investigation_priorities or build_investigation_priority_report_from_scan(scan_result).to_dict()
     score, score_label = score_from_findings(scan_result.findings)
     payload["security_score"] = score
     payload["score_label"] = score_label
     payload["apple_security_forecast"] = apple_security_forecast
+    payload["intrusion_correlation"] = intrusion_correlation
     payload["report_summary"] = {
         "security_score": score,
         "score_label": score_label,
@@ -245,7 +251,9 @@ def export_scan_result_json(
         "packet_captures": packet_captures,
         "network_discovery": network_discovery,
         "apple_security_forecast": apple_security_forecast,
+        "intrusion_correlation": intrusion_correlation,
         "execution_evidence": execution_evidence,
+        "investigation_priorities": investigation_priorities,
         "alert_storm_summaries": [
             {
                 "timestamp": item.get("timestamp", ""),
@@ -261,6 +269,13 @@ def export_scan_result_json(
     }
     if execution_evidence:
         payload["report_summary"]["execution_evidence_count"] = len(execution_evidence)
+    payload["report_summary"]["investigation_priorities"] = {
+        "generated_at": investigation_priorities.get("generated_at", ""),
+        "summary": investigation_priorities.get("summary", ""),
+        "top_3_count": len(investigation_priorities.get("top_3", [])),
+        "top_10_count": len(investigation_priorities.get("top_10", [])),
+        "full_queue_count": len(investigation_priorities.get("full_queue", [])),
+    }
     payload["report_summary"]["apple_security_forecast_summary"] = {
         "generated_at": apple_security_forecast.get("generated_at", apple_security_forecast.get("timestamp", "")) if apple_security_forecast else "",
         "level": apple_security_forecast.get("level", apple_security_forecast.get("forecast_level", "")) if apple_security_forecast else "clear",
@@ -274,6 +289,15 @@ def export_scan_result_json(
         "kev_source_status": apple_security_forecast.get("kev_source_status", "") if apple_security_forecast else "",
         "epss_source_status": apple_security_forecast.get("epss_source_status", "") if apple_security_forecast else "",
         "errors": apple_security_forecast.get("errors", []) if apple_security_forecast else [],
+    }
+    payload["report_summary"]["intrusion_correlation_summary"] = {
+        "generated_at": intrusion_correlation.get("generated_at", ""),
+        "scan_id": intrusion_correlation.get("scan_id", ""),
+        "patterns": len(intrusion_correlation.get("patterns", [])),
+        "top_patterns": len(intrusion_correlation.get("top_patterns", [])),
+        "coverage": intrusion_correlation.get("coverage", {}).get("score", 0) if intrusion_correlation else 0,
+        "user_presence": intrusion_correlation.get("user_presence", {}).get("state", "unknown") if intrusion_correlation else "unknown",
+        "ai_summary_path": intrusion_correlation.get("ai_summary_path", "") if intrusion_correlation else "",
     }
     if include_background_monitor_logs:
         payload["background_monitor_events"] = background_monitor_events or []
@@ -430,6 +454,7 @@ def export_scan_result_html(
     include_investigation_notes: bool = False,
     investigation_notes: list[dict] | None = None,
     investigation_audit_trail: list[dict] | None = None,
+    investigation_priorities: dict | None = None,
 ) -> Path:
     output_path = output_path or default_html_report_path()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -442,7 +467,9 @@ def export_scan_result_html(
     packet_captures = artifacts.get("packet_captures", [])
     network_discovery = artifacts.get("network_discovery", {})
     apple_security_forecast = artifacts.get("apple_security_forecast", artifacts.get("cve_radar", {}))
+    intrusion_correlation = artifacts.get("intrusion_correlation", {})
     execution_evidence = execution_evidence_from_scan(scan_result)
+    investigation_priorities = investigation_priorities or build_investigation_priority_report_from_scan(scan_result).to_dict()
     score, score_label = score_from_findings(findings)
     severity_counts = summarize_findings_by_severity(findings)
     severity_cards = "".join(
@@ -497,6 +524,31 @@ def export_scan_result_html(
         """
         for finding in findings
     ) or '<tr><td colspan="10">No provenance data recorded.</td></tr>'
+    investigation_priority_summary_rows = "".join(
+        f"<tr><td>{html.escape(str(label))}</td><td>{html.escape(str(value))}</td></tr>"
+        for label, value in [
+            ("Generated At", investigation_priorities.get("generated_at", "")),
+            ("Summary", investigation_priorities.get("summary", "")),
+            ("Top 3 Count", len(investigation_priorities.get("top_3", []))),
+            ("Top 10 Count", len(investigation_priorities.get("top_10", []))),
+            ("Full Queue Count", len(investigation_priorities.get("full_queue", []))),
+        ]
+    )
+    investigation_priority_rows = "".join(
+        f"""
+        <tr class="{severity_css_class(str(item.get('severity', 'info')))}">
+          <td>{html.escape(str(index + 1))}</td>
+          <td>{html.escape(str(item.get('title', '')))}</td>
+          <td>{html.escape(str(item.get('rank_score', item.get('priority_score', ''))))}</td>
+          <td>{html.escape(str(item.get('severity', '')))}</td>
+          <td>{html.escape(str(item.get('confidence', '')))}</td>
+          <td>{html.escape(str(item.get('why_ranked_here', '')))}</td>
+          <td>{html.escape(str(item.get('recommended_next_action', '')))}</td>
+          <td>{html.escape(str(item.get('estimated_investigation_effort', '')))}</td>
+        </tr>
+        """
+        for index, item in enumerate(investigation_priorities.get("top_10", []) or investigation_priorities.get("full_queue", []))
+    ) or '<tr><td colspan="8">No investigation priorities available.</td></tr>'
     ports_rows = "".join(
         f"""
         <tr>
@@ -662,6 +714,30 @@ def export_scan_result_html(
         """
         for card in forecast_cards
     ) or '<tr><td colspan="10">Apple Security Forecast: no applicable cards at report time.</td></tr>'
+    intrusion_patterns = intrusion_correlation.get("patterns", []) if isinstance(intrusion_correlation, dict) else []
+    intrusion_summary_rows = "".join(
+        f"<tr><td>{html.escape(str(label))}</td><td>{html.escape(str(value))}</td></tr>"
+        for label, value in [
+            ("Generated", str(intrusion_correlation.get("generated_at", "")) or "not run"),
+            ("Patterns", str(len(intrusion_patterns))),
+            ("Coverage", str(intrusion_correlation.get("coverage", {}).get("score", 0) if intrusion_correlation else 0)),
+            ("User Presence", str(intrusion_correlation.get("user_presence", {}).get("state", "unknown") if intrusion_correlation else "unknown")),
+            ("AI Summary", str(intrusion_correlation.get("ai_summary_path", "") or "local only")),
+        ]
+    )
+    intrusion_rows = "".join(
+        f"""
+        <tr class="{severity_css_class(str(pattern.get('severity', 'info')))}">
+          <td>{html.escape(str(pattern.get('title', '')))}</td>
+          <td>{html.escape(str(pattern.get('severity', '')))}</td>
+          <td>{html.escape(str(pattern.get('confidence', '')))}</td>
+          <td>{html.escape(str(pattern.get('why_it_matters', '')))}</td>
+          <td>{html.escape(', '.join(str(step) for step in pattern.get('recommended_next_steps', [])))}</td>
+          <td>{html.escape(', '.join(str(step) for step in pattern.get('evidence_to_preserve', [])))}</td>
+        </tr>
+        """
+        for pattern in intrusion_patterns
+    ) or '<tr><td colspan="6">No correlated intrusion patterns identified from the current local evidence.</td></tr>'
     network_change_rows = "".join(
         f"<tr><td>{html.escape(str(change_type).replace('_', ' ').title())}</td><td>{html.escape(json.dumps(item, sort_keys=True))}</td></tr>"
         for change_type, items in network_discovery.get("comparison", {}).items()
@@ -753,11 +829,37 @@ def export_scan_result_html(
     </table>
   </div>
   <div class="card">
+    <h2>Intrusion Correlation</h2>
+    <p>Possible intrusion patterns are correlated locally from monitor events and findings. This section does not claim compromise.</p>
+    <table>
+      <thead><tr><th>Field</th><th>Value</th></tr></thead>
+      <tbody>{intrusion_summary_rows}</tbody>
+    </table>
+    <h3>Pattern Summary</h3>
+    <table>
+      <thead><tr><th>Title</th><th>Severity</th><th>Confidence</th><th>Why it matters</th><th>Next steps</th><th>Evidence to preserve</th></tr></thead>
+      <tbody>{intrusion_rows}</tbody>
+    </table>
+  </div>
+  <div class="card">
     <h2>Alert Provenance</h2>
     <p>Each alert below includes the rule, detector, before/after state, correlation, false-positive hints, and verification steps.</p>
     <table>
       <thead><tr><th>Finding</th><th>Rule ID</th><th>Detector</th><th>Subsource</th><th>Confidence</th><th>Previous State</th><th>Current State</th><th>Correlation</th><th>False Positive Hints</th><th>Verification Steps</th></tr></thead>
       <tbody>{provenance_rows}</tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h2>Investigation Priorities</h2>
+    <p>Findings are ranked by actual investigative value, not severity alone.</p>
+    <table>
+      <thead><tr><th>Field</th><th>Value</th></tr></thead>
+      <tbody>{investigation_priority_summary_rows}</tbody>
+    </table>
+    <h3>Top Priorities</h3>
+    <table>
+      <thead><tr><th>Rank</th><th>Title</th><th>Score</th><th>Severity</th><th>Confidence</th><th>Why Ranked Here</th><th>Next Action</th><th>Effort</th></tr></thead>
+      <tbody>{investigation_priority_rows}</tbody>
     </table>
   </div>
   <div class="card">
@@ -932,6 +1034,9 @@ def _serialize_notes(notes: list[dict], *, redact: bool) -> list[dict]:
     serialized = []
     for item in notes:
         cleaned = dict(item)
-        cleaned["body"] = "[REDACTED]"
-        serialized.append(cleaned)
+        cleaned["title"] = redact_text(str(cleaned.get("title", "")))
+        cleaned["body"] = redact_text(str(cleaned.get("body", "")))
+        cleaned["investigator_name"] = redact_text(str(cleaned.get("investigator_name", "")))
+        cleaned["tags"] = [redact_text(str(tag)) for tag in cleaned.get("tags", [])]
+        serialized.append(redact_structure(cleaned))
     return serialized
