@@ -181,6 +181,7 @@ If you are unsure whether you are authorized, stop and obtain written approval b
 - [Operational Safety](docs/OPERATIONAL_SAFETY.md)
 - [Government / Enterprise Evaluation](docs/GOVERNMENT_EVALUATION.md)
 - [Public Release Checklist](docs/PUBLIC_RELEASE_CHECKLIST.md)
+- [Thank you](https://github.com/fuzzlove/macOS-Audit-Agent/blob/main/Thankyou.md)
 
 ## Tests
 
