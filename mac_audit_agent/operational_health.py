@@ -10,6 +10,7 @@ from mac_audit_agent.cve_radar import CveRadarEngine
 from mac_audit_agent.launch_agent import LaunchAgentManager
 from mac_audit_agent.notification_manager import NotificationManager
 from mac_audit_agent.rules import rule_registry_summary
+from mac_audit_agent.source_integrity import verify_source_integrity
 from mac_audit_agent.storage import AuditDatabase
 from mac_audit_agent.system_monitor_readiness import SystemMonitorReadiness
 from mac_audit_agent.version import APP_VERSION, current_git_commit
@@ -89,6 +90,7 @@ class OperationalHealthEngine:
         details: dict[str, Any] = {}
 
         checks.append(self._app_health())
+        checks.append(self._source_integrity_health())
         checks.append(self._sqlite_health())
         checks.append(self._rule_registry_health())
         checks.append(self._monitor_health())
@@ -103,6 +105,7 @@ class OperationalHealthEngine:
         details["rule_registry"] = rule_registry_summary()
         details["database_path"] = str(self.db.path)
         details["reports_dir"] = str(self.reports_dir)
+        details["source_integrity"] = verify_source_integrity(self.db)
         return OperationalHealthReport(
             generated_at=datetime.now(timezone.utc).isoformat(),
             overall_status=self._overall_status(checks),
@@ -120,6 +123,43 @@ class OperationalHealthEngine:
             summary=f"Version {APP_VERSION} commit {git_commit}",
             evidence="Application modules imported successfully.",
             next_step="Review the release checklist before publishing.",
+        )
+
+    def _source_integrity_health(self) -> HealthCheck:
+        try:
+            integrity = verify_source_integrity(self.db)
+        except Exception as exc:
+            return HealthCheck("Source Integrity", "broken", "Unable to verify Python source hashes.", str(exc), "Rebuild the trusted source baseline from a known-good copy.")
+        evidence_items = [
+            f"files={integrity.get('file_count', 0)}",
+            f"root={str(integrity.get('merkle_root_sha3_512', ''))[:16]}",
+            f"changed={len(integrity.get('changed_files', []))}",
+            f"missing={len(integrity.get('missing_files', []))}",
+            f"added={len(integrity.get('added_files', []))}",
+        ]
+        if integrity.get("tamper_detected"):
+            changed = [*integrity.get("changed_files", []), *integrity.get("missing_files", []), *integrity.get("added_files", [])]
+            return HealthCheck(
+                "Source Integrity",
+                "broken",
+                "Python source hash drift detected.",
+                "; ".join([*evidence_items, ", ".join(str(item) for item in changed[:5])]),
+                "Compare against a trusted release and rebuild the baseline only after validation.",
+            )
+        if integrity.get("status") == "baseline-created":
+            return HealthCheck(
+                "Source Integrity",
+                "repair recommended",
+                "Created initial Python source integrity baseline.",
+                "; ".join(evidence_items),
+                "Treat this baseline as trusted only if the current source tree is known good.",
+            )
+        return HealthCheck(
+            "Source Integrity",
+            "healthy",
+            "Python source hashes match the trusted baseline.",
+            "; ".join(evidence_items),
+            "Rebuild the baseline after intentional source updates.",
         )
 
     def _sqlite_health(self) -> HealthCheck:
@@ -234,6 +274,7 @@ class OperationalHealthEngine:
     def _score(self, checks: list[HealthCheck]) -> int:
         weights = {
             "App": 10,
+            "Source Integrity": 10,
             "SQLite": 15,
             "Rule Registry": 10,
             "System Monitor": 15,

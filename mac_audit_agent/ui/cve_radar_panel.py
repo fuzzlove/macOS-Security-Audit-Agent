@@ -21,8 +21,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from mac_audit_agent.ui.action_state import ActionState, apply_action_state
+
 
 FORECAST_STYLES = {
+    "critical": "background: rgba(98, 28, 28, 180); border: 1px solid rgba(255, 125, 125, 200);",
     "urgent": "background: rgba(82, 28, 92, 175); border: 1px solid rgba(186, 118, 255, 190);",
     "elevated": "background: rgba(110, 82, 18, 165); border: 1px solid rgba(240, 180, 70, 185);",
     "watch": "background: rgba(18, 58, 102, 150); border: 1px solid rgba(110, 168, 232, 170);",
@@ -105,11 +108,9 @@ BUTTON_STYLES = {
 }
 
 BUTTON_TOOLTIPS = {
-    "update": "Check Apple security advisories and refresh the local forecast.",
+    "update": "Check Apple security advisories and refresh the local exposure forecast.",
     "diagnostics": "Show source status, cache age, inventory, and forecast generation details.",
-    "demo": "Create simulated forecast cards to test the UI.",
-    "safari_demo": "Create a simulated Safari/WebKit forecast card without using Safari browsing state.",
-    "details": "Open full CVE/advisory details for this forecast card.",
+    "details": "Open full advisory details and local evidence for this forecast card.",
     "review": "Mark this forecast item as reviewed without hiding it permanently.",
     "snooze": "Temporarily hide alerts for this forecast item.",
     "guidance": "Show recommended Apple update steps.",
@@ -204,8 +205,16 @@ class CveRadarCardWidget(QFrame):
         layout.addWidget(title)
         layout.addWidget(self._meta_label(card))
         layout.addWidget(self._summary_label("Why shown", self._why_text(card)))
+        if card.get("forecast_phrase") or card.get("planning_guidance"):
+            layout.addWidget(self._summary_label("Forecast", self._forecast_text(card)))
         layout.addWidget(self._summary_label("What to do now", str(card.get("recommended_action", card.get("what_to_do", "")))))
         layout.addWidget(self._summary_label("Update guidance", str(card.get("update_guidance", card.get("update_path", "")))))
+        false_positive_review = card.get("false_positive_review", {})
+        if isinstance(false_positive_review, dict) and false_positive_review:
+            layout.addWidget(self._summary_label("False-positive check", self._false_positive_text(false_positive_review)))
+        risk_factors = card.get("risk_factors", {})
+        if isinstance(risk_factors, dict) and risk_factors:
+            layout.addWidget(self._summary_label("Risk factors", self._risk_text(risk_factors)))
         references = ", ".join(str(item) for item in card.get("references", []))
         if references:
             layout.addWidget(self._summary_label("References", references))
@@ -233,6 +242,27 @@ class CveRadarCardWidget(QFrame):
         label.setWordWrap(True)
         return label
 
+    def _risk_text(self, risk_factors: dict[str, Any]) -> str:
+        parts = [
+            f"Likelihood {risk_factors.get('likelihood', 'Unknown')}",
+            f"Impact {risk_factors.get('impact', 'Unknown')}",
+            f"Known exploited {risk_factors.get('known_exploitation', 'Unknown')}",
+            f"Patch available {risk_factors.get('patch_availability', 'Unknown')}",
+        ]
+        return "; ".join(parts)
+
+    def _forecast_text(self, card: dict[str, Any]) -> str:
+        phrase = str(card.get("forecast_phrase", "")).strip()
+        guidance = str(card.get("planning_guidance", "")).strip()
+        if phrase and guidance:
+            return f"{phrase}. {guidance}"
+        return phrase or guidance
+
+    def _false_positive_text(self, review: dict[str, Any]) -> str:
+        result = str(review.get("result", "Review before acting"))
+        reason = str(review.get("reason", "Local applicability could not be fully verified."))
+        return f"{result}. {reason}"
+
     def _action_layout(self) -> QVBoxLayout:
         container = QVBoxLayout()
         container.setSpacing(6)
@@ -249,11 +279,11 @@ class CveRadarCardWidget(QFrame):
         top_row = QHBoxLayout()
         top_row.setSpacing(6)
         top_row.addWidget(primary)
+        top_row.addWidget(guidance)
         bottom_row = QHBoxLayout()
         bottom_row.setSpacing(6)
         bottom_row.addWidget(review)
         bottom_row.addWidget(snooze)
-        bottom_row.addWidget(guidance)
         container.addLayout(top_row)
         container.addLayout(bottom_row)
         return container
@@ -272,7 +302,7 @@ class CveRadarCardWidget(QFrame):
     def _card_stylesheet(self, card: dict[str, Any]) -> str:
         forecast_level = str(card.get("forecast_level", "watch"))
         base = FORECAST_STYLES.get(forecast_level, FORECAST_STYLES["watch"])
-        accent = "rgba(147, 197, 253, 160)" if forecast_level == "clear" else "rgba(216, 180, 254, 140)" if forecast_level == "urgent" else "rgba(120, 169, 255, 150)"
+        accent = "rgba(255, 125, 125, 170)" if forecast_level == "critical" else "rgba(147, 197, 253, 160)" if forecast_level == "clear" else "rgba(216, 180, 254, 140)" if forecast_level == "urgent" else "rgba(120, 169, 255, 150)"
         return (
             "QFrame#cveRadarCard {"
             f" {base}"
@@ -286,9 +316,6 @@ class CveRadarCardWidget(QFrame):
 class CveRadarPanel(QFrame):
     update_requested = Signal()
     diagnostics_requested = Signal()
-    demo_requested = Signal()
-    safari_demo_requested = Signal()
-    clear_demo_requested = Signal()
     export_requested = Signal()
     review_requested = Signal(object)
     snooze_requested = Signal(object, object)
@@ -310,9 +337,9 @@ class CveRadarPanel(QFrame):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
 
-        header = QLabel("Apple Security Forecast")
+        header = QLabel("Apple Security Intelligence")
         header.setStyleSheet("font-size: 18px; font-weight: 700; color: #D9E6FF;")
-        subtitle = QLabel("Apple-related security advisories matched to this Mac.")
+        subtitle = QLabel("Local Apple exposure assessment based on this Mac, Apple advisories, and exploitation intelligence.")
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet("color: #9DB0C9;")
         self.radar_sweep = QLabel("◐")
@@ -326,8 +353,13 @@ class CveRadarPanel(QFrame):
 
         self.last_updated_label = QLabel("Last updated: not yet")
         self.next_check_label = QLabel("Next check: not yet")
-        self.cves_evaluated_label = QLabel("CVEs evaluated: 0")
-        self.applicable_label = QLabel("Applicable CVEs: 0")
+        self.detected_macos_label = QLabel("Detected macOS: not checked")
+        self.detected_safari_label = QLabel("Detected Safari: not checked")
+        self.cves_evaluated_label = QLabel("Advisories assessed: 0")
+        self.applicable_label = QLabel("Active forecast cards: 0")
+        self.filtered_stale_label = QLabel("Filtered stale/invalid records: 0")
+        self.hidden_review_needed_label = QLabel("Hidden review-needed: 0")
+        self.source_status_label = QLabel("Source status: not checked")
         self.kev_label = QLabel("KEV matches: 0")
         self.apple_updates_label = QLabel("Apple updates available: no")
         self.status_label = QLabel("Forecast not checked yet")
@@ -336,8 +368,13 @@ class CveRadarPanel(QFrame):
         for widget in [
             self.last_updated_label,
             self.next_check_label,
+            self.detected_macos_label,
+            self.detected_safari_label,
             self.cves_evaluated_label,
             self.applicable_label,
+            self.filtered_stale_label,
+            self.hidden_review_needed_label,
+            self.source_status_label,
             self.kev_label,
             self.apple_updates_label,
             self.status_label,
@@ -369,25 +406,19 @@ class CveRadarPanel(QFrame):
 
         button_grid = QVBoxLayout()
         top_button_row = QHBoxLayout()
-        bottom_button_row = QHBoxLayout()
         self.update_button = make_forecast_button("Update Forecast", BUTTON_TOOLTIPS["update"], "primary")
         self.diagnostics_button = make_forecast_button("Diagnostics", BUTTON_TOOLTIPS["diagnostics"], "secondary")
-        self.demo_button = make_forecast_button("Generate Demo", BUTTON_TOOLTIPS["demo"], "warning")
-        self.safari_demo_button = make_forecast_button("Safari/WebKit Demo", BUTTON_TOOLTIPS["safari_demo"], "warning")
-        self.clear_demo_button = make_forecast_button("Clear Demo", "Remove simulated forecast cards from the local cache.", "secondary")
         self.export_button = make_forecast_button("Export Forecast", "Export the current Apple Security Forecast report.", "secondary")
         self.details_button = make_forecast_button("View Details", BUTTON_TOOLTIPS["details"], "primary")
         self.review_button = make_forecast_button("Reviewed", BUTTON_TOOLTIPS["review"], "secondary")
         self.snooze_button = make_forecast_button("Snooze", BUTTON_TOOLTIPS["snooze"], "warning")
         self.guidance_button = make_forecast_button("Update Guide", BUTTON_TOOLTIPS["guidance"], "urgent")
-        for button in [self.update_button, self.diagnostics_button, self.demo_button, self.safari_demo_button, self.clear_demo_button, self.export_button]:
+        for button in [self.update_button, self.diagnostics_button, self.export_button]:
             button.setEnabled(False)
-        for button in [self.update_button, self.diagnostics_button, self.demo_button]:
+        for button in [self.update_button, self.diagnostics_button]:
             top_button_row.addWidget(button)
-        for button in [self.safari_demo_button, self.clear_demo_button, self.export_button]:
-            bottom_button_row.addWidget(button)
+        top_button_row.addWidget(self.export_button)
         button_grid.addLayout(top_button_row)
-        button_grid.addLayout(bottom_button_row)
         layout.addLayout(button_grid)
 
         self.cards = QListWidget()
@@ -402,11 +433,27 @@ class CveRadarPanel(QFrame):
         self.details.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         layout.addWidget(self.details)
 
+        self.selected_action_frame = QFrame()
+        self.selected_action_frame.setObjectName("forecastSelectedActions")
+        selected_action_layout = QVBoxLayout(self.selected_action_frame)
+        selected_action_layout.setContentsMargins(8, 8, 8, 8)
+        selected_action_layout.setSpacing(6)
+        selected_top_row = QHBoxLayout()
+        selected_top_row.setSpacing(6)
+        selected_bottom_row = QHBoxLayout()
+        selected_bottom_row.setSpacing(6)
+        for button in [self.details_button, self.guidance_button, self.review_button, self.snooze_button]:
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        selected_top_row.addWidget(self.details_button)
+        selected_top_row.addWidget(self.guidance_button)
+        selected_bottom_row.addWidget(self.review_button)
+        selected_bottom_row.addWidget(self.snooze_button)
+        selected_action_layout.addLayout(selected_top_row)
+        selected_action_layout.addLayout(selected_bottom_row)
+        layout.addWidget(self.selected_action_frame)
+
         self.update_button.clicked.connect(self.update_requested.emit)
         self.diagnostics_button.clicked.connect(self.diagnostics_requested.emit)
-        self.demo_button.clicked.connect(self.demo_requested.emit)
-        self.safari_demo_button.clicked.connect(self.safari_demo_requested.emit)
-        self.clear_demo_button.clicked.connect(self.clear_demo_requested.emit)
         self.export_button.clicked.connect(self.export_requested.emit)
         self.details_button.clicked.connect(self.open_details)
         self.review_button.clicked.connect(self.mark_reviewed)
@@ -417,9 +464,6 @@ class CveRadarPanel(QFrame):
         self._pulse_timer.timeout.connect(self._animate_pulse)
         self._pulse_timer.start(300)
         self.diagnostics_button.setEnabled(True)
-        self.demo_button.setEnabled(True)
-        self.safari_demo_button.setEnabled(True)
-        self.clear_demo_button.setEnabled(True)
         self.update_button.setEnabled(True)
         self.export_button.setEnabled(True)
 
@@ -455,6 +499,11 @@ class CveRadarPanel(QFrame):
                 border-radius: 8px;
                 color: #ECF4FF;
             }
+            QFrame#forecastSelectedActions {
+                background: rgba(10, 14, 24, 90);
+                border: 1px solid rgba(127, 139, 166, 80);
+                border-radius: 10px;
+            }
             """
         )
 
@@ -469,10 +518,23 @@ class CveRadarPanel(QFrame):
         self._radar_payload = dict(payload or {})
         self.last_updated_label.setText(f"Last updated: {self._radar_payload.get('generated_at', self._radar_payload.get('timestamp', 'not yet'))}")
         self.next_check_label.setText(f"Next check: {self._radar_payload.get('next_check_at', 'not yet')}")
-        self.cves_evaluated_label.setText(f"CVEs evaluated: {self._radar_payload.get('cve_count', self._radar_payload.get('cves_evaluated', 0))}")
-        self.applicable_label.setText(f"Applicable CVEs: {self._radar_payload.get('card_count', self._radar_payload.get('applicable_cves', len(self._radar_payload.get('display_cards', []))))}")
+        inventory = self._radar_payload.get("inventory", {}) if isinstance(self._radar_payload.get("inventory", {}), dict) else {}
+        self.detected_macos_label.setText(f"Detected macOS: {inventory.get('macos_version', 'not checked')} {inventory.get('macos_build', '')}".strip())
+        self.detected_safari_label.setText(f"Detected Safari: {inventory.get('safari_version', 'not checked')}")
+        self.cves_evaluated_label.setText(f"Advisories assessed: {self._radar_payload.get('cve_count', self._radar_payload.get('cves_evaluated', 0))}")
+        self.applicable_label.setText(f"Active forecast cards: {self._radar_payload.get('card_count', self._radar_payload.get('applicable_cves', len(self._radar_payload.get('display_cards', []))))}")
+        diagnostics = self._radar_payload.get("diagnostics", {}) if isinstance(self._radar_payload.get("diagnostics", {}), dict) else {}
+        stale_invalid = int(diagnostics.get("stale_advisories", 0)) + int(diagnostics.get("invalid_advisories", 0))
+        self.filtered_stale_label.setText(f"Filtered stale/invalid records: {stale_invalid}")
+        self.hidden_review_needed_label.setText(f"Hidden review-needed: {self._radar_payload.get('hidden_review_needed_count', diagnostics.get('review_needed_hidden', 0))}")
+        self.source_status_label.setText(
+            "Source status: "
+            f"Apple {self._radar_payload.get('apple_source_status', 'cache')} | "
+            f"KEV {self._radar_payload.get('kev_source_status', 'cache')} | "
+            f"NVD {self._radar_payload.get('nvd_source_status', 'cache')}"
+        )
         self.kev_label.setText(f"KEV matches: {self._radar_payload.get('kev_count', self._radar_payload.get('kev_matches', 0))}")
-        self.apple_updates_label.setText(f"Apple updates available: {'yes' if self._radar_payload.get('level') in {'elevated', 'urgent'} or self._radar_payload.get('apple_updates_available') else 'no'}")
+        self.apple_updates_label.setText(f"Apple updates available: {'yes' if self._radar_payload.get('level') in {'elevated', 'urgent', 'critical'} or self._radar_payload.get('apple_updates_available') else 'no'}")
         self.status_label.setText(self._state_text(self._radar_payload))
         self.reason_label.setText(self._reason_text(self._radar_payload))
         self._display_cards = [card for card in self._radar_payload.get("display_cards", self._radar_payload.get("cards", [])) if isinstance(card, dict)]
@@ -486,14 +548,17 @@ class CveRadarPanel(QFrame):
             item = QListWidgetItem()
             item.setFlags(Qt.NoItemFlags)
             widget = QFrame()
-            title = QLabel("Clear — no applicable Apple security forecast cards.")
+            title = QLabel("No current Apple/macOS security forecast items matched this Mac.")
             title.setWordWrap(True)
             title.setStyleSheet("font-weight: 700; color: #D9E6FF;")
             label = QLabel(self._reason_text(self._radar_payload))
             label.setWordWrap(True)
+            extra = QLabel("Historical and unrelated Apple advisories are hidden by default.")
+            extra.setWordWrap(True)
             layout = QVBoxLayout(widget)
             layout.setSpacing(6)
             layout.addWidget(label)
+            layout.addWidget(extra)
             layout.insertWidget(0, title)
             item.setSizeHint(widget.sizeHint())
             self.cards.addItem(item)
@@ -552,12 +617,9 @@ class CveRadarPanel(QFrame):
 
     def _set_buttons_enabled(self, enabled: bool) -> None:
         self.diagnostics_button.setEnabled(True)
-        self.demo_button.setEnabled(True)
-        self.clear_demo_button.setEnabled(True)
-        self.details_button.setEnabled(enabled)
-        self.review_button.setEnabled(enabled)
-        self.snooze_button.setEnabled(enabled)
-        self.guidance_button.setEnabled(enabled)
+        state = ActionState(enabled, True, "Select a forecast card first.", ["selected forecast card"])
+        for button in [self.details_button, self.review_button, self.snooze_button, self.guidance_button]:
+            apply_action_state(button, state)
 
     def _detail_text(self, card: dict[str, Any]) -> str:
         alerts = card.get("alerts") or [card]
@@ -570,8 +632,14 @@ class CveRadarPanel(QFrame):
             f"KEV: {'yes' if card.get('kev') or card.get('kev_cves') else 'no'}",
             f"Apple related: {'yes' if card.get('apple_related') or card.get('source') == 'apple' else 'no'}",
             f"Why shown: {card.get('why_shown_to_you') or card.get('why_shown') or self._why_text(card)}",
+            f"Forecast phrase: {card.get('forecast_phrase', '')}",
+            f"Planning guidance: {card.get('planning_guidance', '')}",
+            f"False-positive review: {json.dumps(card.get('false_positive_review', {}), indent=2, sort_keys=True)}",
             f"What to do now: {card.get('recommended_action', card.get('what_to_do', ''))}",
             f"Update guidance: {card.get('update_guidance', card.get('update_path', ''))}",
+            f"Confidence reason: {card.get('confidence_reason', '')}",
+            f"Risk factors: {json.dumps(card.get('risk_factors', {}), indent=2, sort_keys=True)}",
+            f"Supporting evidence: {json.dumps(card.get('supporting_evidence', []), indent=2, sort_keys=True)}",
             f"References: {', '.join(str(item) for item in card.get('references', [])) or 'none'}",
             f"First seen: {card.get('first_seen', card.get('generated_at', ''))}",
             f"Last seen: {card.get('last_seen', card.get('generated_at', ''))}",
@@ -608,10 +676,12 @@ class CveRadarPanel(QFrame):
                 return "Unable to update forecast — using cache"
             return "Unable to update forecast — no cache available"
         level = str(payload.get("level", payload.get("forecast_level", ""))).lower()
+        if level == "critical":
+            return "Update Today"
         if level == "urgent":
-            return "Urgent"
+            return "Plan Update"
         if level == "elevated":
-            return "Elevated"
+            return "Check Today"
         if level == "watch":
             return "Watch"
         if payload.get("display_cards"):
@@ -621,8 +691,6 @@ class CveRadarPanel(QFrame):
     def _reason_text(self, payload: dict[str, Any]) -> str:
         if not payload.get("timestamp") and not payload.get("generated_at"):
             return "No Apple Security Forecast has been checked yet."
-        if payload.get("simulated"):
-            return "Demo forecast is active."
         if payload.get("last_error") and not payload.get("display_cards"):
             return "Update failed and the panel is using cached data." if payload.get("timestamp") else "Update failed and no cache exists."
         cards = payload.get("alerts") or payload.get("cards") or payload.get("display_cards") or []
@@ -697,9 +765,6 @@ class CveRadarPanel(QFrame):
         for button in [
             self.update_button,
             self.diagnostics_button,
-            self.demo_button,
-            self.safari_demo_button,
-            self.clear_demo_button,
             self.export_button,
             self.details_button,
             self.review_button,

@@ -78,6 +78,15 @@ class OperationalHealthPanel(QFrame):
         self.refresh_button.clicked.connect(self.refresh_requested.emit)
         self.audit_button.clicked.connect(self.audit_deployment_requested.emit)
         self.verify_button.clicked.connect(self.verify_event_flow_requested.emit)
+        self.set_developer_mode(False)
+
+    def set_developer_mode(self, enabled: bool) -> None:
+        self.verify_button.setVisible(enabled)
+        self.verify_button.setToolTip(
+            "Developer Mode only: verifies synthetic event flow through the monitor pipeline."
+            if enabled
+            else "Hidden unless Settings > Developer Mode is enabled."
+        )
 
     def set_report(self, payload: dict[str, Any]) -> None:
         checks = list(payload.get("checks", []))

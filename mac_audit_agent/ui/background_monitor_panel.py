@@ -11,6 +11,7 @@ import time
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -29,6 +30,21 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from mac_audit_agent.emergency_lockdown import (
+    CONFIRMATION_TEXT,
+    LAST_ACTION_STATE_KEY,
+    LAST_FAILURE_STATE_KEY,
+    LAST_TRACE_STATE_KEY,
+    POLICY_ASSIST_USER,
+    POLICY_ATTEMPT_ACTIVATION,
+    POLICY_DISABLED,
+    POLICY_MANAGED_ENVIRONMENT,
+    POLICY_RECOMMEND_ONLY,
+    enable_lockdown_with_user_policy,
+    get_lockdown_status,
+    load_policy,
+    save_policy,
+)
 from mac_audit_agent.launch_agent import (
     LaunchAgentManager,
     LAUNCHCTL_BIN,
@@ -53,6 +69,7 @@ from mac_audit_agent.monitor import (
     tail_text_file,
     truncate_monitor_log_file,
 )
+from mac_audit_agent.ui.action_state import ActionState, apply_action_state
 from mac_audit_agent.notification_manager import NotificationManager
 from mac_audit_agent.reporting import export_monitor_events_html, export_monitor_events_json, get_reports_dir
 from mac_audit_agent.models import BackgroundMonitorEvent, utc_now_iso
@@ -331,6 +348,7 @@ class BackgroundMonitorPanel(QWidget):
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
+        self.developer_mode_enabled = False
         self.status_label = QLabel("Status: unknown")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
@@ -464,6 +482,59 @@ class BackgroundMonitorPanel(QWidget):
         settings_layout.addWidget(self.cooldown_seconds_input, 3, 1)
         layout.addLayout(settings_layout)
 
+        emergency_layout = QGridLayout()
+        emergency_title = QLabel("Security Response > Emergency Lockdown")
+        emergency_title.setStyleSheet("font-weight: 700;")
+        emergency_layout.addWidget(emergency_title, 0, 0, 1, 4)
+        self.lockdown_status_label = QLabel("Current Lockdown Mode status: unknown")
+        self.lockdown_policy_label = QLabel("Response policy: Recommend Only")
+        self.lockdown_last_action_label = QLabel("Last emergency lockdown action: none")
+        self.lockdown_last_failure_label = QLabel("Last failure: none")
+        self.lockdown_diagnostics_label = QLabel("Lockdown Diagnostics: no activation trace recorded")
+        for row, label in enumerate(
+            [
+                self.lockdown_status_label,
+                self.lockdown_policy_label,
+                self.lockdown_last_action_label,
+                self.lockdown_last_failure_label,
+                self.lockdown_diagnostics_label,
+            ],
+            start=1,
+        ):
+            label.setWordWrap(True)
+            emergency_layout.addWidget(label, row, 0, 1, 4)
+        warning = QLabel(
+            "Emergency Lockdown may interrupt apps, websites, messages, attachments, device connections, and workflows. Automatic activation is only allowed when a supported macOS method is verified; otherwise Mac Audit Agent opens guidance and records the failure reason."
+        )
+        warning.setWordWrap(True)
+        emergency_layout.addWidget(warning, 6, 0, 1, 4)
+        emergency_layout.addWidget(QLabel("Policy"), 7, 0)
+        self.lockdown_policy_combo = QComboBox()
+        self.lockdown_policy_combo.addItem("Disabled", POLICY_DISABLED)
+        self.lockdown_policy_combo.addItem("Recommend Only", POLICY_RECOMMEND_ONLY)
+        self.lockdown_policy_combo.addItem("Assist User", POLICY_ASSIST_USER)
+        self.lockdown_policy_combo.addItem("Attempt Activation", POLICY_ATTEMPT_ACTIVATION)
+        self.lockdown_policy_combo.addItem("Managed Environment", POLICY_MANAGED_ENVIRONMENT)
+        emergency_layout.addWidget(self.lockdown_policy_combo, 7, 1)
+        self.lockdown_understand_checkbox = QCheckBox("I understand")
+        emergency_layout.addWidget(self.lockdown_understand_checkbox, 7, 2)
+        self.lockdown_require_admin_checkbox = QCheckBox("Require admin approval if needed")
+        self.lockdown_require_admin_checkbox.setChecked(True)
+        emergency_layout.addWidget(self.lockdown_require_admin_checkbox, 7, 3)
+        emergency_layout.addWidget(QLabel("Typed confirmation"), 8, 0)
+        self.lockdown_confirmation_input = QLineEdit()
+        self.lockdown_confirmation_input.setPlaceholderText(CONFIRMATION_TEXT)
+        emergency_layout.addWidget(self.lockdown_confirmation_input, 8, 1, 1, 2)
+        self.save_lockdown_policy_button = QPushButton("Save Emergency Lockdown Policy")
+        self.lockdown_dry_run_button = QPushButton("Emergency Lockdown Dry Run")
+        self.copy_lockdown_diagnostics_button = QPushButton("Copy Lockdown Diagnostics")
+        self.lockdown_dry_run_button.setToolTip("Dry-run only: shows what the policy would do for a critical event without changing Lockdown Mode.")
+        self.copy_lockdown_diagnostics_button.setToolTip("Copy the latest Lockdown activation trace and failure classification.")
+        emergency_layout.addWidget(self.save_lockdown_policy_button, 8, 3)
+        emergency_layout.addWidget(self.lockdown_dry_run_button, 9, 3)
+        emergency_layout.addWidget(self.copy_lockdown_diagnostics_button, 9, 2)
+        layout.addLayout(emergency_layout)
+
         filters = QHBoxLayout()
         filters.addWidget(QLabel("Event Type"))
         self.filter_combo = QComboBox()
@@ -478,8 +549,8 @@ class BackgroundMonitorPanel(QWidget):
         filters.addStretch(1)
         layout.addLayout(filters)
 
-        self.events_table = QTableWidget(0, 7)
-        self.events_table.setHorizontalHeaderLabels(["Timestamp", "Type", "Severity", "Source", "Process", "Confidence", "Evidence"])
+        self.events_table = QTableWidget(0, 8)
+        self.events_table.setHorizontalHeaderLabels(["Timestamp", "Type", "Severity", "Source", "Process", "Confidence", "Occurrences", "Evidence"])
         self.events_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.events_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.events_table.itemSelectionChanged.connect(self._update_selected_event_context_state)
@@ -545,11 +616,171 @@ class BackgroundMonitorPanel(QWidget):
         self.verify_event_flow_button.clicked.connect(self.verify_system_monitor_event_flow)
         self.repair_deployment_button.clicked.connect(self.repair_system_monitor_deployment)
         self.save_settings_button.clicked.connect(self.save_notification_settings)
+        self.save_lockdown_policy_button.clicked.connect(self.save_emergency_lockdown_policy)
+        self.lockdown_dry_run_button.clicked.connect(self.dry_run_emergency_lockdown_policy)
+        self.copy_lockdown_diagnostics_button.clicked.connect(self.copy_lockdown_diagnostics)
         self.continuous_monitoring_checkbox.toggled.connect(self.toggle_continuous_monitoring)
         self.start_at_login_checkbox.toggled.connect(self.toggle_start_at_login)
         self.filter_combo.currentIndexChanged.connect(self.refresh_events)
         self.export_json_button.clicked.connect(self.export_json)
         self.export_html_button.clicked.connect(self.export_html)
+        self.set_developer_mode(False)
+        self.refresh_emergency_lockdown_policy()
+
+    def developer_only_buttons(self) -> list[QPushButton]:
+        return [
+            self.test_notification_button,
+            self.test_dialog_button,
+            self.test_silent_event_button,
+            self.test_event_button,
+            self.test_bottom_right_alert_button,
+            self.test_critical_alert_button,
+            self.test_idle_warning_button,
+            self.verify_event_flow_button,
+        ]
+
+    def set_developer_mode(self, enabled: bool) -> None:
+        self.developer_mode_enabled = enabled
+        for button in self.developer_only_buttons():
+            button.setVisible(enabled)
+            button.setToolTip(
+                "Developer Mode only: generates synthetic monitor/notifier events and never belongs in the normal production workflow."
+                if enabled
+                else "Hidden unless Settings > Developer Mode is enabled."
+            )
+
+    def refresh_emergency_lockdown_policy(self) -> None:
+        policy = load_policy(self.db)
+        mode = str(policy.get("mode", POLICY_RECOMMEND_ONLY))
+        index = self.lockdown_policy_combo.findData(mode)
+        self.lockdown_policy_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.lockdown_understand_checkbox.setChecked(bool(policy.get("understood", False)))
+        self.lockdown_require_admin_checkbox.setChecked(bool(policy.get("require_admin_approval", True)))
+        self.lockdown_confirmation_input.setText(str(policy.get("confirmation", "")))
+        self.lockdown_policy_label.setText(f"Response policy: {self.lockdown_policy_combo.currentText()}")
+        status = get_lockdown_status()
+        self.lockdown_status_label.setText(f"Current Lockdown Mode status: {status.get('status', 'unknown')} ({status.get('evidence', '')})")
+        raw_last = self.db.get_background_monitor_state(LAST_ACTION_STATE_KEY, "")
+        if raw_last:
+            try:
+                last = json.loads(raw_last)
+            except json.JSONDecodeError:
+                last = {}
+            self.lockdown_last_action_label.setText(
+                f"Last emergency lockdown action: {last.get('timestamp', '')} | attempted={last.get('action_attempted', '')} | success={last.get('action_success', False)}"
+            )
+        else:
+            self.lockdown_last_action_label.setText("Last emergency lockdown action: none")
+        self.lockdown_last_failure_label.setText(f"Last failure: {self.db.get_background_monitor_state(LAST_FAILURE_STATE_KEY, 'none') or 'none'}")
+        trace = self._latest_lockdown_trace()
+        if trace:
+            self.lockdown_diagnostics_label.setText(
+                "Lockdown Diagnostics: "
+                f"policy={trace.get('policy_mode', '')} | "
+                f"configured_policy={trace.get('configured_policy_mode', trace.get('policy_mode', ''))} | "
+                f"dry_run={trace.get('dry_run', False)} | "
+                f"method={trace.get('activation_method', trace.get('enable_method', ''))} | "
+                f"auto_supported={trace.get('automatic_activation_supported', trace.get('activation_supported', False))} | "
+                f"assist_supported={trace.get('assisted_activation_supported', False)} | "
+                f"requires_user_action={trace.get('requires_user_action', False)} | "
+                f"settings_opened={trace.get('settings_opened', False)} | "
+                f"verification={trace.get('verification_method', 'unknown')} | "
+                f"status={trace.get('lockdown_status_before', 'unknown')}->{trace.get('lockdown_status_after', 'unknown')} | "
+                f"confidence={trace.get('status_confidence', 'unknown')} | "
+                f"result={trace.get('verification_result', trace.get('lockdown_status_after', 'unknown'))} | "
+                f"failure={trace.get('failure_reason', '')}"
+            )
+        else:
+            self.lockdown_diagnostics_label.setText("Lockdown Diagnostics: no activation trace recorded")
+
+    def _latest_lockdown_trace(self) -> dict:
+        raw = self.db.get_background_monitor_state(LAST_TRACE_STATE_KEY, "")
+        if not raw:
+            return {}
+        try:
+            trace = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return trace if isinstance(trace, dict) else {}
+
+    def copy_lockdown_diagnostics(self) -> None:
+        status = get_lockdown_status()
+        trace = self._latest_lockdown_trace()
+        action_raw = self.db.get_background_monitor_state(LAST_ACTION_STATE_KEY, "")
+        failure = self.db.get_background_monitor_state(LAST_FAILURE_STATE_KEY, "")
+        diagnostics = {
+            "policy_mode": trace.get("policy_mode", ""),
+            "configured_policy_mode": trace.get("configured_policy_mode", trace.get("policy_mode", "")),
+            "dry_run": trace.get("dry_run", False),
+            "current_status": status.get("status", "unknown"),
+            "current_status_evidence": status.get("evidence", ""),
+            "current_status_confidence": status.get("confidence", "unknown"),
+            "last_attempt": action_raw,
+            "last_trigger": trace.get("trigger_event", ""),
+            "last_trigger_id": trace.get("trigger_event_id", trace.get("trigger_event", "")),
+            "snapshot_created": trace.get("snapshot_created", False),
+            "snapshot_path": trace.get("snapshot_path", ""),
+            "activation_method": trace.get("activation_method", trace.get("enable_method", "")),
+            "activation_path": trace.get("activation_path", ""),
+            "automatic_activation_supported": trace.get("automatic_activation_supported", trace.get("activation_supported", False)),
+            "assisted_activation_supported": trace.get("assisted_activation_supported", False),
+            "requires_user_action": trace.get("requires_user_action", False),
+            "settings_opened": trace.get("settings_opened", False),
+            "status_before": trace.get("lockdown_status_before", ""),
+            "status_after": trace.get("lockdown_status_after", ""),
+            "status_confidence": trace.get("status_confidence", ""),
+            "verification_method": trace.get("verification_method", ""),
+            "verification_result": trace.get("verification_result", ""),
+            "failure_reason": trace.get("failure_reason", failure),
+            "full_error": failure,
+            "trace": trace,
+        }
+        QApplication.clipboard().setText(json.dumps(diagnostics, indent=2, sort_keys=True))
+        QMessageBox.information(self, "Lockdown Diagnostics", "Lockdown diagnostics copied to the clipboard.")
+
+    def save_emergency_lockdown_policy(self) -> None:
+        try:
+            policy = save_policy(
+                self.db,
+                mode=str(self.lockdown_policy_combo.currentData() or POLICY_DISABLED),
+                understood=self.lockdown_understand_checkbox.isChecked(),
+                confirmation=self.lockdown_confirmation_input.text(),
+                require_admin_approval=self.lockdown_require_admin_checkbox.isChecked(),
+                create_snapshot_first=True,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Emergency Lockdown Policy", str(exc))
+            return
+        QMessageBox.information(self, "Emergency Lockdown Policy", f"Policy saved: {policy.get('mode', POLICY_DISABLED)}")
+        self.refresh_emergency_lockdown_policy()
+
+    def dry_run_emergency_lockdown_policy(self) -> None:
+        event = BackgroundMonitorEvent(
+            event_id=f"lockdown-dry-run-{utc_now_iso()}",
+            timestamp=utc_now_iso(),
+            event_type="protected_monitor_tamper_detected",
+            severity="critical",
+            source="emergency_lockdown_dry_run",
+            evidence="Dry-run only; no system state changes.",
+            confidence="high",
+            simulated=True,
+        )
+        action = enable_lockdown_with_user_policy(self.db, event, dry_run=True)
+        QMessageBox.information(
+            self,
+            "Emergency Lockdown Dry Run",
+            "\n".join(
+                [
+                    f"Execution mode: {action.policy_mode}",
+                    f"Configured policy: {action.configured_policy_mode or action.policy_mode}",
+                    f"Would create snapshot: {'yes' if action.snapshot_created else 'no'}",
+                    f"Action path: {action.action_attempted}",
+                    f"Result: {'allowed' if action.action_success else 'not attempted'}",
+                    f"Reason: {action.error or action.trigger_reason}",
+                ]
+            ),
+        )
+        self.refresh_emergency_lockdown_policy()
 
     def _monitor_protection_state(self) -> dict[str, object]:
         mode = self.db.get_background_monitor_state("monitor_install_mode", "user")
@@ -1108,10 +1339,14 @@ class BackgroundMonitorPanel(QWidget):
             self.notification_mode_combo.setCurrentIndex(mode_index)
         self.rate_limit_input.setText(str(settings["duplicate_rate_limit_seconds"]))
         self.notification_sound_input.setText(str(settings["notification_sound"]))
-        self.start_button.setEnabled(installed)
-        self.stop_button.setEnabled(installed)
-        self.uninstall_button.setEnabled(installed)
-        self.restart_button.setEnabled(bool(installed))
+        installed_state = ActionState(
+            bool(installed),
+            True,
+            "Install the background monitor before using this action.",
+            ["installed background monitor"],
+        )
+        for button in [self.start_button, self.stop_button, self.uninstall_button, self.restart_button]:
+            apply_action_state(button, installed_state)
         self.refresh_events()
 
     def refresh_events(self) -> None:
@@ -1138,12 +1373,20 @@ class BackgroundMonitorPanel(QWidget):
                     event.source,
                     event.process_name,
                     event.confidence,
+                    self._event_occurrence_label(event),
                     event.evidence,
                 ]
             ):
                 self.events_table.setItem(row, column, QTableWidgetItem(str(value)))
         self.events_table.resizeRowsToContents()
         self._update_selected_event_context_state()
+
+    def _event_occurrence_label(self, event: BackgroundMonitorEvent) -> str:
+        count = max(1, int(getattr(event, "occurrence_count", 1) or 1))
+        duplicate_category = str(getattr(event, "duplicate_category", "single") or "single")
+        if count <= 1:
+            return "1"
+        return f"{count} ({duplicate_category.replace('_', ' ')})"
 
     def _selected_event(self):
         if not hasattr(self, "events_table"):
@@ -1160,11 +1403,12 @@ class BackgroundMonitorPanel(QWidget):
         if not hasattr(self, "show_context_button"):
             return
         enabled = self._selected_event() is not None
-        self.show_context_button.setEnabled(enabled)
+        state = ActionState(enabled, enabled, "Select a monitor event first.", ["selected monitor event"])
+        apply_action_state(self.show_context_button, state)
         if hasattr(self, "show_provenance_button"):
-            self.show_provenance_button.setEnabled(enabled)
+            apply_action_state(self.show_provenance_button, state)
         if hasattr(self, "show_alert_trace_button"):
-            self.show_alert_trace_button.setEnabled(enabled)
+            apply_action_state(self.show_alert_trace_button, state)
 
     def show_selected_event_context(self) -> None:
         event = self._selected_event()

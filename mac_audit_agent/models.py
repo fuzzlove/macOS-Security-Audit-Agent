@@ -752,6 +752,10 @@ class BackgroundMonitorEvent:
     false_positive_hints: list[str] = field(default_factory=list)
     recommended_verification_steps: list[str] = field(default_factory=list)
     source_trace: str = ""
+    occurrence_count: int = 1
+    duplicate_count: int = 0
+    duplicate_group_key: str = ""
+    duplicate_category: str = "single"
 
     def __post_init__(self) -> None:
         try:

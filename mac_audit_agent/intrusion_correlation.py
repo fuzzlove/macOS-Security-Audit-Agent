@@ -63,6 +63,41 @@ EXECUTION_EVENTS = {
     "capture_capable_process_observed",
     "suspicious_process_observed",
 }
+MITRE_ATTACK_APT_FINGERPRINTS = [
+    {
+        "fingerprint_id": "attack_launchd_scripted_c2",
+        "title": "ATT&CK fingerprint: launchd persistence with scripted download or C2 behavior",
+        "techniques": ["T1543.001", "T1543.004", "T1059", "T1105", "T1071"],
+        "event_types": {"launchagent_added", "launchdaemon_added", "persistence_item_created_high_risk"},
+        "required_terms": {"launchd", "curl|osascript|bash -c|sh -c|python -c|python3 -c|base64|chmod +x"},
+        "supporting_terms": {"http|https|dns|beacon|c2|command and control|outbound|network"},
+        "severity": "critical",
+        "confidence": "high",
+        "why": "Launchd persistence combined with scripted execution and network transfer indicators matches a common ATT&CK technique chain used by long-lived macOS intrusion activity.",
+    },
+    {
+        "fingerprint_id": "attack_credential_access_persistence",
+        "title": "ATT&CK fingerprint: credential access paired with persistence",
+        "techniques": ["T1555.001", "T1543.001", "T1543.004", "T1059"],
+        "event_types": {"launchagent_added", "launchdaemon_added", "persistence_item_created_high_risk", "execution_evidence_detected"},
+        "required_terms": {"keychain|security dump-keychain|security find-generic-password|credential|password", "launchagent|launchdaemon|persistence|runatload"},
+        "supporting_terms": {"osascript|bash|python|curl|exfil|archive|zip"},
+        "severity": "critical",
+        "confidence": "high",
+        "why": "Credential-access indicators combined with a persistence mechanism are stronger than either signal alone and map to ATT&CK credential access plus persistence techniques.",
+    },
+    {
+        "fingerprint_id": "attack_defense_evasion_blindness",
+        "title": "ATT&CK fingerprint: monitor impairment during suspicious activity",
+        "techniques": ["T1562", "T1562.001", "T1543.004", "T1059"],
+        "event_types": {"protected_monitor_tamper_detected", "monitor_blindness_detected", "detector_stopped", "heartbeat_stale", "db_not_updating"},
+        "required_terms": {"tamper|blind|stopped|disabled|heartbeat|not updating", "persistence|launchdaemon|execution|unsigned|temp|shell"},
+        "supporting_terms": {"root|admin|sudo|kill|unload|bootout"},
+        "severity": "critical",
+        "confidence": "high",
+        "why": "Attempts to reduce monitoring visibility during execution or persistence activity match ATT&CK defense-evasion behavior and require evidence preservation before remediation.",
+    },
+]
 
 
 def _parse_timestamp(value: str) -> datetime:
@@ -243,6 +278,7 @@ class IntrusionCorrelationEngine:
         patterns.extend(self._pattern_launchd_trust(events, findings))
         patterns.extend(self._pattern_vpn_network_process(events, findings))
         patterns.extend(self._pattern_storm_tamper(events))
+        patterns.extend(self._pattern_mitre_attack_fingerprints(events, findings))
         return self._dedupe_patterns(patterns)
 
     def _pattern_physical_usb(self, events: list[dict[str, Any]]) -> list[IntrusionPattern]:
@@ -393,6 +429,56 @@ class IntrusionCorrelationEngine:
             )
         ]
 
+    def _pattern_mitre_attack_fingerprints(self, events: list[dict[str, Any]], findings: list[dict[str, Any]]) -> list[IntrusionPattern]:
+        patterns: list[IntrusionPattern] = []
+        evidence_items = [*events, *findings]
+        for fingerprint in MITRE_ATTACK_APT_FINGERPRINTS:
+            related = [
+                item
+                for item in events
+                if str(item.get("event_type", "")) in fingerprint["event_types"]
+                or self._item_matches_terms(item, set(fingerprint["required_terms"]) | set(fingerprint["supporting_terms"]))
+            ]
+            matched_required = [term for term in fingerprint["required_terms"] if any(self._term_group_matches(item, term) for item in evidence_items)]
+            matched_supporting = [term for term in fingerprint["supporting_terms"] if any(self._term_group_matches(item, term) for item in evidence_items)]
+            if len(matched_required) < len(fingerprint["required_terms"]) or not matched_supporting:
+                continue
+            if not related:
+                related = [
+                    {
+                        "timestamp": utc_now_iso(),
+                        "event_type": "mitre_attack_fingerprint",
+                        "severity": str(fingerprint["severity"]),
+                        "evidence": "; ".join(matched_required + matched_supporting),
+                    }
+                ]
+            technique_text = ", ".join(str(item) for item in fingerprint["techniques"])
+            pattern = self._build_pattern(
+                str(fingerprint["fingerprint_id"]),
+                str(fingerprint["title"]),
+                str(fingerprint["severity"]),
+                str(fingerprint["confidence"]),
+                related,
+                why=f"{fingerprint['why']} Techniques: {technique_text}.",
+                next_steps=[
+                    "Preserve evidence before cleanup or account changes.",
+                    "Review the exact launch item, script contents, parent process, and network destination.",
+                    "Validate whether each ATT&CK technique mapping is supported by local evidence before declaring compromise.",
+                ],
+                preserve=[
+                    "LaunchAgent/LaunchDaemon plist and target binary",
+                    "Process tree and command-line evidence",
+                    "Network destination metadata",
+                    "Monitor integrity and audit logs",
+                ],
+                false_positive=[
+                    "Endpoint management tools, installers, and developer scripts can use launchd, scripting, and network transfer legitimately.",
+                ],
+            )
+            pattern.source_trace = f"mitre_attack_fingerprint:{fingerprint['fingerprint_id']} techniques={technique_text} required={matched_required} supporting={matched_supporting}"
+            patterns.append(pattern)
+        return patterns
+
     def _build_pattern(
         self,
         pattern_id: str,
@@ -473,6 +559,40 @@ class IntrusionCorrelationEngine:
         if "low trust" in evidence:
             return 50
         return None
+
+    def _item_text(self, item: dict[str, Any]) -> str:
+        fields = [
+            "event_type",
+            "title",
+            "category",
+            "evidence",
+            "evidence_summary",
+            "description",
+            "command_used",
+            "command_or_source",
+            "process_name",
+            "related_process",
+            "related_path",
+            "source_trace",
+            "mitre",
+            "rule_id",
+            "rule_name",
+        ]
+        values = [str(item.get(field, "")) for field in fields]
+        for key in ("reasons", "cve_ids", "references", "remediation_steps", "recommended_verification_steps"):
+            value = item.get(key, [])
+            if isinstance(value, list):
+                values.extend(str(part) for part in value)
+            else:
+                values.append(str(value))
+        return " ".join(values).lower()
+
+    def _term_group_matches(self, item: dict[str, Any], term_group: str) -> bool:
+        text = self._item_text(item)
+        return any(term.strip().lower() in text for term in str(term_group).split("|") if term.strip())
+
+    def _item_matches_terms(self, item: dict[str, Any], term_groups: set[str]) -> bool:
+        return any(self._term_group_matches(item, group) for group in term_groups)
 
     def _summary_text(self, patterns: list[IntrusionPattern], presence: UserPresenceConfidence, coverage: MonitoringCoverageScore) -> str:
         if not patterns:

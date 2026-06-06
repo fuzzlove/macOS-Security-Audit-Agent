@@ -44,6 +44,7 @@ from mac_audit_agent.launch_agent import (
     runtime_monitor_script_path,
     runtime_root,
 )
+from mac_audit_agent.emergency_lockdown import enable_lockdown_with_user_policy
 from mac_audit_agent.hardware_monitor import HardwareMonitor, USBReconnectObserver
 from mac_audit_agent.models import BackgroundMonitorEvent, EventAlertTrace, utc_now_iso
 from mac_audit_agent.rules import canonical_event_type, correlation_id_for, evidence_hash, normalized_signal, rule_for_event
@@ -1045,7 +1046,56 @@ class BackgroundMonitorService:
             f"notification_returncode={event.notification_returncode} "
             f"notification_error={event.notification_error} evidence={event.evidence}"
         )
+        self._evaluate_emergency_lockdown_policy(event)
         return event.event_id
+
+    def _evaluate_emergency_lockdown_policy(self, event: BackgroundMonitorEvent) -> None:
+        try:
+            action = enable_lockdown_with_user_policy(
+                self.db,
+                event,
+                notice_callback=lambda reason: self.notifications.show_visible_security_alert(
+                    event,
+                    reason=f"Emergency Lockdown policy: {reason}",
+                ),
+            )
+            ignored = "Event did not meet critical/high-confidence lockdown trigger policy."
+            if action.action_attempted != "none" or action.error != ignored:
+                self._write_log_line(
+                    f"emergency_lockdown: event_id={event.event_id} mode={action.policy_mode} "
+                    f"attempted={action.action_attempted} success={action.action_success} error={action.error}"
+                )
+            if action.action_attempted not in {"none", "recommend_only", "dry_run"} and not action.action_success:
+                requires_user_action = bool(getattr(action, "requires_user_action", False))
+                failure_event = BackgroundMonitorEvent(
+                    event_id=f"lockdown-failed-{event.event_id}",
+                    timestamp=utc_now_iso(),
+                    event_type="lockdown_mode_requires_user_action" if requires_user_action else "emergency_lockdown_failed",
+                    severity="critical",
+                    source="emergency_lockdown",
+                    evidence=(
+                        "A critical security event triggered Emergency Lockdown policy, but macOS requires user confirmation to enable Lockdown Mode. "
+                        "The settings panel has been opened. Complete Turn On & Restart to enable Lockdown Mode."
+                        if requires_user_action
+                        else "Automatic Lockdown Mode activation was requested but could not be verified. "
+                        f"Reason: {action.error}"
+                    ),
+                    confidence="high",
+                    recommendation=(
+                        "Complete Turn On & Restart in Lockdown Mode settings, then re-check Lockdown Diagnostics."
+                        if requires_user_action
+                        else "View Lockdown Diagnostics, open the hardening center, and create or review the emergency evidence snapshot."
+                    ),
+                    metadata_json=json.dumps(action.to_dict(), sort_keys=True),
+                )
+                self.notifications.show_visible_security_alert(
+                    failure_event,
+                    reason="Lockdown Mode Requires User Action" if requires_user_action else "Emergency Lockdown Failed",
+                    force=True,
+                )
+        except Exception as exc:
+            self.db.set_background_monitor_state("emergency_lockdown_last_failure", str(exc))
+            self._write_log_line(f"emergency_lockdown policy failed: event_id={event.event_id} error={exc}")
 
     def _storm_group_key(self, event: BackgroundMonitorEvent) -> str:
         return "|".join(

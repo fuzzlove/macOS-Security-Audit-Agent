@@ -7,7 +7,7 @@ from mac_audit_agent.reporting import export_scan_result_html, export_scan_resul
 from mac_audit_agent.runner import RunnerConfig, SafeCommandRunner
 from mac_audit_agent.storage import AuditDatabase
 from mac_audit_agent.debug_collectors import collect_debug_snapshot
-from mac_audit_agent.ui.main_window import MainWindow, NetworkDiscoveryWorker, finding_to_dict, normalize_findings, normalize_finding
+from mac_audit_agent.ui.main_window import MainWindow, NetworkDiscoveryWorker, deduplicate_findings_for_display, finding_to_dict, normalize_findings, normalize_finding
 
 
 def make_suite() -> CollectorSuite:
@@ -751,6 +751,36 @@ def test_populate_findings_accepts_mixed_finding_dict_list(monkeypatch) -> None:
     assert len(window.findings_table.rows) == 2
     assert window.findings_table.rows[0][0].text() == "critical"
     assert window.findings_table.rows[1][0].text() == "medium"
+
+
+def test_scan_duplicate_findings_are_grouped_with_occurrence_count(monkeypatch) -> None:
+    window = MainWindow.__new__(MainWindow)
+    window.findings_table = FakeTable()
+    window._apply_severity_style = lambda items, severity: None
+    window._clear_selected_finding_panel = lambda: None
+    monkeypatch.setattr("mac_audit_agent.ui.main_window.QTableWidgetItem", FakeTableItem)
+    first = make_finding("high").to_dict()
+    second = {**first, "id": "duplicate-finding-2"}
+
+    window._populate_findings([first, second])
+
+    assert len(window.findings_table.rows) == 1
+    assert window.current_visible_findings[0]["occurrence_count"] == 2
+    assert window.current_visible_findings[0]["duplicate_count"] == 1
+    assert window.current_visible_findings[0]["duplicate_category"] == "duplicate_burst"
+    assert "Repeated 2 times (duplicate burst)" in window.findings_table.rows[0][3].text()
+
+
+def test_high_volume_scan_duplicate_findings_are_categorized() -> None:
+    base = make_finding("medium").to_dict()
+    findings = [{**base, "id": f"finding-{index}"} for index in range(12)]
+
+    grouped = deduplicate_findings_for_display(findings)
+
+    assert len(grouped) == 1
+    assert grouped[0]["occurrence_count"] == 12
+    assert grouped[0]["duplicate_count"] == 11
+    assert grouped[0]["duplicate_category"] == "high_volume_duplicate"
 
 
 def test_populate_findings_missing_severity_defaults_to_info(monkeypatch) -> None:

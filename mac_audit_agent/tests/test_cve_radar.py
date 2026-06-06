@@ -89,7 +89,8 @@ def test_kev_apple_cve_ranks_highest(tmp_path: Path) -> None:
     alerts = engine._build_cards(catalog, make_inventory(("macOS", "14.0"), ("Safari", "17.0")), None)
     cards = _forecast_cards([item.to_dict() for item in alerts])
     assert cards[0]["kev_cves"]
-    assert cards[0]["forecast_level"] == "urgent"
+    assert cards[0]["forecast_level"] == "critical"
+    assert cards[0]["risk_factors"]["known_exploitation"] == "Yes"
 
 
 def test_high_epss_ranks_higher_than_low_epss(tmp_path: Path) -> None:
@@ -116,10 +117,15 @@ def test_exact_product_version_match_gives_high_confidence(tmp_path: Path) -> No
     alerts = engine._build_cards(catalog, make_inventory(("macOS", "14.0")), None)
     assert alerts[0].confidence == "high"
     assert alerts[0].applicability == "confirmed_applicable"
+    assert alerts[0].false_positive_review["result"] == "Low false-positive risk"
+    assert alerts[0].false_positive_review["checks"]["private_data_inspected"] is False
+    assert alerts[0].forecast_phrase == "Check Software Update today"
+    assert "maintenance window" in alerts[0].planning_guidance
 
 
 def test_product_match_without_version_is_review_needed(tmp_path: Path) -> None:
     engine = make_engine(tmp_path)
+    engine.config.show_review_needed_apple_cves = True
     catalog = {"kev": {}, "epss": {}, "cves": [make_apple_cve("CVE-APPLE-1", "Safari", cvss=7.0, fixed_version="17.1")]}
     inventory = make_inventory(("Safari", ""))
     inventory["products"][0]["version"] = ""
@@ -127,6 +133,20 @@ def test_product_match_without_version_is_review_needed(tmp_path: Path) -> None:
     inventory["webkit_version"] = ""
     alerts = engine._build_cards(catalog, inventory, None)
     assert alerts[0].applicability == "review_needed"
+
+
+def test_review_needed_items_are_not_active_by_default(tmp_path: Path) -> None:
+    engine = make_engine(tmp_path)
+    catalog = {"kev": {}, "epss": {}, "cves": [make_apple_cve("CVE-APPLE-1", "Safari", cvss=7.0, fixed_version="17.1")]}
+    inventory = make_inventory(("Safari", ""))
+    inventory["products"][0]["version"] = ""
+    inventory["safari_version"] = ""
+    inventory["webkit_version"] = ""
+
+    alerts = engine._build_cards(catalog, inventory, None)
+
+    assert alerts == []
+    assert engine._last_diagnostics["review_needed_hidden"] == 1
 
 
 def test_unrelated_cve_is_not_alerted(tmp_path: Path) -> None:
@@ -315,6 +335,49 @@ def test_corrupt_forecast_payload_does_not_crash(tmp_path: Path) -> None:
     assert cached["last_error"] == ""
 
 
+def test_generate_forecast_does_not_reuse_simulated_cache(tmp_path: Path, monkeypatch) -> None:
+    engine = make_engine(tmp_path)
+    engine.db.record_apple_security_forecast(
+        {
+            "forecast_id": "demo-old",
+            "generated_at": "2026-06-01T00:00:00+00:00",
+            "level": "urgent",
+            "summary": "",
+            "source_mode": "demo",
+            "simulated": True,
+            "affected_products": [],
+            "cve_count": 1,
+            "kev_count": 1,
+            "highest_severity": "critical",
+            "recommended_action": "",
+            "previous_level": "watch",
+            "next_check_at": "",
+            "payload_json": {"simulated": True, "source_mode": "demo", "cards": [{"title": "Demo", "simulated": True}]},
+        }
+    )
+    monkeypatch.setattr(
+        engine.updater,
+        "update_catalog",
+        lambda: {
+            "timestamp": "2026-06-01T00:00:00+00:00",
+            "data_sources_used": ["Apple security releases"],
+            "kev": {},
+            "epss": {},
+            "cves": [],
+            "apple_security_releases": [],
+            "catalog_update_status": "updated",
+            "errors": [],
+        },
+    )
+    monkeypatch.setattr("mac_audit_agent.cve_radar.collect_apple_security_inventory", lambda: make_inventory(("macOS", "14.0")))
+
+    forecast = engine.generate_forecast()
+
+    assert forecast.simulated is False
+    assert forecast.source_mode == "live"
+    assert not engine.db.latest_apple_security_forecast()
+
+
 def test_apple_security_inventory_never_accesses_safari_private_state_or_history(monkeypatch) -> None:
     commands: list[list[str]] = []
     forbidden = ["History", "Cookies", "Cache", "WebKit/WebsiteData", "Private", "Safari/Databases", "pgrep"]
@@ -423,13 +486,76 @@ def test_no_forecast_state_renders_explanation(tmp_path: Path) -> None:
     assert cached["why_no_cards"] == "No Apple Security Forecast has been checked yet."
 
 
-def test_safari_webkit_demo_forecast_renders(tmp_path: Path) -> None:
+def test_historical_apple_advisories_are_hidden_by_default(tmp_path: Path) -> None:
     engine = make_engine(tmp_path)
+    old_item = make_apple_cve("CVE-2020-OLD", "macOS", cvss=9.8, fixed_version="14.1")
+    old_item["published_date"] = "2020-01-01T00:00:00Z"
 
-    forecast = engine.generate_safari_webkit_demo_forecast()
+    alerts = engine._build_cards({"kev": {}, "epss": {}, "cves": [old_item]}, make_inventory(("macOS", "14.0")), None)
 
-    assert forecast.simulated is True
-    assert forecast.source_mode == "demo-safari-webkit"
-    assert len(forecast.cards) == 1
-    assert forecast.cards[0].category == "Safari/WebKit"
-    assert "Private Browsing state is not inspected" in forecast.cards[0].why_shown
+    assert alerts == []
+    assert engine._last_diagnostics["historical_advisories"] == 1
+
+
+def test_1999_apple_records_are_rejected_from_active_forecast(tmp_path: Path) -> None:
+    engine = make_engine(tmp_path)
+    item = make_apple_cve("CVE-1999-0001", "macOS", cvss=9.8, fixed_version="14.1")
+    item["published_date"] = "1999-01-01T00:00:00Z"
+
+    alerts = engine._build_cards({"kev": {}, "epss": {}, "cves": [item]}, make_inventory(("macOS", "14.0")), None)
+
+    assert alerts == []
+    assert engine._last_diagnostics["invalid_advisories"] == 1
+
+
+def test_future_apple_records_are_rejected_from_active_forecast(tmp_path: Path) -> None:
+    engine = make_engine(tmp_path)
+    item = make_apple_cve("CVE-2099-0001", "macOS", cvss=9.8, fixed_version="14.1")
+    item["published_date"] = "2099-01-01T00:00:00Z"
+
+    alerts = engine._build_cards({"kev": {}, "epss": {}, "cves": [item]}, make_inventory(("macOS", "14.0")), None)
+
+    assert alerts == []
+    assert engine._last_diagnostics["invalid_advisories"] == 1
+
+
+def test_iphone_only_advisories_are_filtered_from_mac_forecast(tmp_path: Path) -> None:
+    engine = make_engine(tmp_path)
+    item = make_apple_cve("CVE-2026-IOS", "iPhone OS", cvss=9.8, fixed_version="18.1")
+
+    alerts = engine._build_cards({"kev": {"CVE-2026-IOS": {}}, "epss": {}, "cves": [item]}, make_inventory(("macOS", "14.0")), None)
+
+    assert alerts == []
+    assert engine._last_diagnostics["ecosystem_advisories"] == 1
+
+
+def test_watchos_only_advisories_are_filtered_from_mac_forecast(tmp_path: Path) -> None:
+    engine = make_engine(tmp_path)
+    item = make_apple_cve("CVE-2026-WATCH", "watchOS", cvss=8.0, fixed_version="12.1")
+
+    alerts = engine._build_cards({"kev": {}, "epss": {}, "cves": [item]}, make_inventory(("macOS", "14.0")), None)
+
+    assert alerts == []
+    assert engine._last_diagnostics["ecosystem_advisories"] == 1
+
+
+def test_nvd_only_apple_record_does_not_create_active_card(tmp_path: Path) -> None:
+    engine = make_engine(tmp_path)
+    item = make_apple_cve("CVE-2026-NVDONLY", "macOS", cvss=9.8, fixed_version="14.1", references=["https://nvd.nist.gov/vuln/detail/CVE-2026-NVDONLY"])
+
+    alerts = engine._build_cards({"kev": {}, "epss": {}, "cves": [item]}, make_inventory(("macOS", "14.0")), None)
+
+    assert alerts == []
+    assert engine._last_diagnostics["filtered_advisories"] == 1
+
+
+def test_missing_advisory_dates_are_rejected(tmp_path: Path) -> None:
+    engine = make_engine(tmp_path)
+    item = make_apple_cve("CVE-APPLE-NODATE", "Safari", cvss=8.0, fixed_version="17.1")
+    item["published_date"] = ""
+    item["last_modified_date"] = ""
+
+    alerts = engine._build_cards({"kev": {}, "epss": {}, "cves": [item]}, make_inventory(("Safari", "17.0")), None)
+
+    assert alerts == []
+    assert engine._last_diagnostics["invalid_advisories"] == 1

@@ -11,6 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from mac_audit_agent.emergency_lockdown import CONFIRMATION_TEXT, LockdownModeCapability, POLICY_ATTEMPT_ACTIVATION, save_policy
 from mac_audit_agent.launch_agent import (
     LAUNCH_AGENT_LABEL,
     LAUNCHCTL_BIN,
@@ -1385,6 +1386,167 @@ def test_visible_alert_decision_and_overlay_payload_restore_bottom_right_styles(
         assert payload["buttons"]
 
 
+def test_high_critical_overlay_does_not_require_rule_id_and_points_to_logs(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    manager = NotificationManager(db)
+    event = BackgroundMonitorEvent(
+        event_id="critical-no-rule",
+        timestamp="2026-04-24T12:00:00+00:00",
+        event_type="major_security_event",
+        severity="critical",
+        source="test",
+        evidence="Critical compromise indicator detected.",
+        confidence="high",
+    )
+
+    decision = manager.should_show_visible_alert(event)
+    details = manager._overlay_details_for(event, decision)
+
+    assert decision.show is True
+    assert decision.style == "critical_red"
+    assert "Review Monitor Logs" in details
+
+
+def test_emergency_lockdown_failed_overlay_has_diagnostics_actions(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    manager = NotificationManager(db)
+    event = BackgroundMonitorEvent(
+        event_id="lockdown-failed-1",
+        timestamp="2026-06-06T12:00:00+00:00",
+        event_type="emergency_lockdown_failed",
+        severity="critical",
+        source="emergency_lockdown",
+        evidence="Reason: activation_unknown",
+        confidence="high",
+    )
+    decision = manager.should_show_visible_alert(event, force=True)
+
+    assert manager._overlay_title_for(event, decision) == "Emergency Lockdown Failed"
+    assert "could not be verified" in manager._overlay_details_for(event, decision)
+    assert manager._overlay_buttons_for(event) == ["View Diagnostics", "Open Hardening Center", "Create Evidence Snapshot"]
+
+
+def test_lockdown_requires_user_action_overlay_opens_settings_guidance(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    manager = NotificationManager(db)
+    event = BackgroundMonitorEvent(
+        event_id="lockdown-user-action-1",
+        timestamp="2026-06-06T12:00:00+00:00",
+        event_type="lockdown_mode_requires_user_action",
+        severity="critical",
+        source="emergency_lockdown",
+        evidence="Automatic activation unsupported.",
+        confidence="high",
+    )
+    decision = manager.should_show_visible_alert(event, force=True)
+
+    assert manager._overlay_title_for(event, decision) == "Lockdown Mode Requires User Action"
+    assert "Complete Turn On & Restart" in manager._overlay_details_for(event, decision)
+    assert manager._overlay_buttons_for(event) == ["Open Lockdown Settings", "View Evidence Snapshot", "Acknowledge"]
+
+
+def test_unsupported_lockdown_auto_activation_shows_user_action_alert(tmp_path: Path, monkeypatch) -> None:
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite")
+    save_policy(service.db, mode=POLICY_ATTEMPT_ACTIVATION, understood=True, confirmation=CONFIRMATION_TEXT)
+    shown: list[tuple[str, str, str]] = []
+
+    class FakeRecoveryCenter:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def incident_awareness_check(self):
+            return None
+
+        def create_evidence_snapshot(self, *_args, **_kwargs):
+            return {"snapshot_path": str(tmp_path / "snapshot.zip")}
+
+    monkeypatch.setattr(
+        "mac_audit_agent.emergency_lockdown.lockdown_mode_capability",
+        lambda _runner=None: LockdownModeCapability(
+            macos_version="14.0",
+            lockdown_available=True,
+            status_detection_supported=False,
+            automatic_activation_supported=False,
+            assisted_activation_supported=True,
+            managed_activation_supported=False,
+            reason="macOS requires user confirmation/restart for Lockdown Mode activation.",
+        ),
+    )
+    monkeypatch.setattr("mac_audit_agent.emergency_lockdown.SystemRecoveryCenter", FakeRecoveryCenter)
+    monkeypatch.setattr(
+        "mac_audit_agent.emergency_lockdown.get_lockdown_status",
+        lambda _runner=None: {
+            "status": "unknown",
+            "confidence": "low",
+            "evidence": "Lockdown Mode status could not be confirmed.",
+            "public_status_api": False,
+            "probes": [],
+        },
+    )
+    monkeypatch.setattr(
+        "mac_audit_agent.emergency_lockdown.open_lockdown_settings_fallback",
+        lambda _runner=None: {
+            "opened": True,
+            "command": ["/usr/bin/open", "x-apple.systempreferences:test"],
+            "return_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "exception": "",
+        },
+    )
+    monkeypatch.setattr(
+        service.notifications,
+        "show_visible_security_alert",
+        lambda event, reason="", force=False: shown.append((event.event_type, reason, event.evidence)) or True,
+    )
+    event = service._build_event(
+        "protected_monitor_tamper_detected",
+        "Protected monitor tamper detected.",
+        severity="critical",
+        confidence="high",
+        source="test",
+    )
+
+    service._evaluate_emergency_lockdown_policy(event)
+
+    assert any(item[0] == "lockdown_mode_requires_user_action" for item in shown)
+    assert any("Lockdown Mode Requires User Action" in item[1] for item in shown)
+
+
+def test_visible_overlay_plays_configured_sound_for_high_critical(tmp_path: Path, monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_popen(command, **_kwargs):
+        calls.append(command)
+
+        class _Process:
+            pid = 123
+
+        return _Process()
+
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    db.set_background_monitor_state("notification_sound", "Submarine")
+    manager = NotificationManager(db, popen_factory=fake_popen)
+    state_path = tmp_path / "state" / "security_overlay.json"
+    pid_path = tmp_path / "state" / "security_overlay.pid"
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", state_path)
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_PID_PATH", pid_path)
+    monkeypatch.setattr(manager, "_ensure_security_overlay_process", lambda: True)
+    event = BackgroundMonitorEvent(
+        event_id="critical-sound",
+        timestamp="2026-04-24T12:00:00+00:00",
+        event_type="major_security_event",
+        severity="critical",
+        source="test",
+        evidence="Critical compromise indicator detected.",
+        confidence="high",
+    )
+
+    assert manager.update_security_overlay(event) is True
+    assert calls
+    assert db.get_background_monitor_state("last_visible_alert_sound") == "Submarine"
+
+
 def test_visible_alert_cooldown_suppresses_repeat_overlay(tmp_path: Path, monkeypatch) -> None:
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
     manager = NotificationManager(db)
@@ -2535,7 +2697,11 @@ def test_duplicate_critical_event_updates_overlay_counter_even_when_db_dedupes(t
     service = BackgroundMonitorService(tmp_path / "audit.sqlite")
     overlay_calls = []
     monkeypatch.setattr(service.notifications, "should_notify", lambda _event: False)
-    monkeypatch.setattr(service.notifications, "update_security_overlay", lambda event: overlay_calls.append(event.event_type) or True)
+    monkeypatch.setattr(
+        service.notifications,
+        "update_security_overlay",
+        lambda event: overlay_calls.append((event.event_type, event.occurrence_count, event.duplicate_category)) or True,
+    )
     first = service._build_event(
         "system_moisture_detected",
         "Liquid detected in USB-C port.",
@@ -2546,7 +2712,37 @@ def test_duplicate_critical_event_updates_overlay_counter_even_when_db_dedupes(t
     second = BackgroundMonitorEvent(**{**first.to_dict(), "event_id": "moisture-repeat"})
     assert service.record_monitor_event(first) == first.event_id
     assert service.record_monitor_event(second) is None
-    assert overlay_calls == ["system_moisture_detected"]
+    assert overlay_calls == [("system_moisture_detected", 2, "duplicate_burst")]
+    saved = service.db.latest_monitor_events(limit=1)[0]
+    assert saved.occurrence_count == 2
+    assert saved.duplicate_count == 1
+
+
+def test_background_monitor_panel_shows_duplicate_occurrence_count(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    event = BackgroundMonitorEvent(
+        event_id="event-1",
+        timestamp="2026-06-06T00:00:00+00:00",
+        event_type="remote_login_enabled",
+        severity="high",
+        source="test",
+        process_name="sshd",
+        evidence="Remote login enabled.",
+        confidence="high",
+        occurrence_count=4,
+        duplicate_count=3,
+        duplicate_category="duplicate_burst",
+    )
+    db.record_monitor_event(event, dedupe_window_seconds=60)
+    panel = BackgroundMonitorPanel(db, FakeLaunchAgent(installed=True, running=True))
+
+    panel.refresh_events()
+
+    assert panel.events_table.horizontalHeaderItem(6).text() == "Occurrences"
+    assert panel.events_table.item(0, 6).text() == "4 (duplicate burst)"
+    panel.close()
+    app.processEvents()
 
 
 def test_cfaa_findings_digest_groups_findings_and_suppresses_unchanged_repeat(tmp_path: Path) -> None:

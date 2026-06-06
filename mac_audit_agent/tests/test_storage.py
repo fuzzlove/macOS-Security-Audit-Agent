@@ -5,7 +5,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-from mac_audit_agent.models import Finding, InvestigationNote, ScanSummary
+from mac_audit_agent.models import BackgroundMonitorEvent, Finding, InvestigationNote, ScanSummary
 from mac_audit_agent.storage import AuditDatabase, json_safe, normalize_finding_for_db, normalize_finding_payload
 
 
@@ -411,6 +411,57 @@ def test_record_finding_with_remediation_fields(tmp_path: Path) -> None:
     assert json.loads(row["remediation_steps"]) == ["Review process", "Disable only if unexpected"]
     assert json.loads(row["remediation_commands"]) == ["launchctl print system/example"]
     assert json.loads(row["verification_steps"]) == ["Re-run the scan"]
+
+
+def test_duplicate_monitor_events_increment_occurrence_count(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    first = BackgroundMonitorEvent(
+        event_id="event-1",
+        timestamp="2026-06-06T00:00:00+00:00",
+        event_type="remote_login_enabled",
+        severity="high",
+        source="test",
+        process_name="sshd",
+        evidence="Remote login enabled.",
+        confidence="high",
+    )
+    second = BackgroundMonitorEvent(**{**first.to_dict(), "event_id": "event-2", "timestamp": "2026-06-06T00:00:05+00:00"})
+
+    assert db.record_monitor_event(first, dedupe_window_seconds=60) is True
+    assert db.record_monitor_event(second, dedupe_window_seconds=60) is False
+    saved = db.latest_monitor_events(limit=1)[0]
+
+    assert saved.event_id == "event-1"
+    assert saved.occurrence_count == 2
+    assert saved.duplicate_count == 1
+    assert saved.duplicate_category == "duplicate_burst"
+    assert saved.first_seen == "2026-06-06T00:00:00+00:00"
+    assert saved.last_seen == "2026-06-06T00:00:05+00:00"
+    assert saved.timestamp == "2026-06-06T00:00:05+00:00"
+
+
+def test_high_volume_duplicate_monitor_events_are_categorized(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    base = BackgroundMonitorEvent(
+        event_id="event-0",
+        timestamp="2026-06-06T00:00:00+00:00",
+        event_type="usb_device_connected",
+        severity="medium",
+        source="test",
+        process_name="IOUSBHost",
+        evidence="USB device connected.",
+        confidence="high",
+    )
+
+    assert db.record_monitor_event(base, dedupe_window_seconds=60) is True
+    for index in range(1, 12):
+        event = BackgroundMonitorEvent(**{**base.to_dict(), "event_id": f"event-{index}", "timestamp": f"2026-06-06T00:00:{index:02d}+00:00"})
+        assert db.record_monitor_event(event, dedupe_window_seconds=60) is False
+    saved = db.latest_monitor_events(limit=1)[0]
+
+    assert saved.occurrence_count == 12
+    assert saved.duplicate_count == 11
+    assert saved.duplicate_category == "high_volume_duplicate"
 
 
 def test_record_finding_with_legacy_finding(tmp_path: Path) -> None:

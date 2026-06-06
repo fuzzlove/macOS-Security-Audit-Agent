@@ -742,7 +742,13 @@ class AuditDatabase:
                 cooldown_suppressed INTEGER NOT NULL DEFAULT 0,
                 last_suppression_reason TEXT NOT NULL DEFAULT '',
                 metadata_json TEXT NOT NULL DEFAULT '{}',
-                provenance_json TEXT NOT NULL DEFAULT '{}'
+                provenance_json TEXT NOT NULL DEFAULT '{}',
+                occurrence_count INTEGER NOT NULL DEFAULT 1,
+                duplicate_count INTEGER NOT NULL DEFAULT 0,
+                duplicate_group_key TEXT NOT NULL DEFAULT '',
+                duplicate_category TEXT NOT NULL DEFAULT 'single',
+                first_seen TEXT NOT NULL DEFAULT '',
+                last_seen TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS background_monitor_state (
                 key TEXT PRIMARY KEY,
@@ -948,6 +954,12 @@ class AuditDatabase:
         self._ensure_column("background_monitor_events", "last_suppression_reason", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("background_monitor_events", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_column("background_monitor_events", "provenance_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("background_monitor_events", "occurrence_count", "INTEGER NOT NULL DEFAULT 1")
+        self._ensure_column("background_monitor_events", "duplicate_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("background_monitor_events", "duplicate_group_key", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("background_monitor_events", "duplicate_category", "TEXT NOT NULL DEFAULT 'single'")
+        self._ensure_column("background_monitor_events", "first_seen", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("background_monitor_events", "last_seen", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("event_alert_traces", "original_event_type", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("event_alert_traces", "normalized_event_type", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("event_alert_traces", "detector_source", "TEXT NOT NULL DEFAULT ''")
@@ -1885,6 +1897,13 @@ class AuditDatabase:
         return results
 
     def record_background_monitor_event(self, event: BackgroundMonitorEvent, dedupe_window_seconds: int = 60) -> bool:
+        duplicate_group_key = self._background_event_duplicate_group_key(event)
+        event.duplicate_group_key = event.duplicate_group_key or duplicate_group_key
+        event.duplicate_category = event.duplicate_category or "single"
+        event.occurrence_count = max(1, int(getattr(event, "occurrence_count", 1) or 1))
+        event.duplicate_count = max(0, int(getattr(event, "duplicate_count", 0) or 0))
+        event.first_seen = event.first_seen or event.timestamp
+        event.last_seen = event.last_seen or event.timestamp
         row = self.conn.execute(
             """
             SELECT *
@@ -1906,14 +1925,16 @@ class AuditDatabase:
                 event_ts = None
                 last_ts = None
             if event_ts and last_ts and (event_ts - last_ts).total_seconds() < dedupe_window_seconds:
+                self._record_background_event_duplicate(row, event, duplicate_group_key)
                 return False
         if row and not dedupe_window_seconds:
+            self._record_background_event_duplicate(row, event, duplicate_group_key)
             return False
         self.conn.execute(
             """
             INSERT OR REPLACE INTO background_monitor_events
-            (event_id, timestamp, event_type, severity, source, process_name, pid, evidence, confidence, recommendation, simulated, notification_sent, notification_error, notification_returncode, notification_decision, notification_reason, cooldown_remaining_seconds, popup_allowed, visible_alert_shown, alert_style, cooldown_suppressed, last_suppression_reason, metadata_json, provenance_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (event_id, timestamp, event_type, severity, source, process_name, pid, evidence, confidence, recommendation, simulated, notification_sent, notification_error, notification_returncode, notification_decision, notification_reason, cooldown_remaining_seconds, popup_allowed, visible_alert_shown, alert_style, cooldown_suppressed, last_suppression_reason, metadata_json, provenance_json, occurrence_count, duplicate_count, duplicate_group_key, duplicate_category, first_seen, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event.event_id,
@@ -1940,11 +1961,88 @@ class AuditDatabase:
                 str(getattr(event, "last_suppression_reason", "")),
                 event.metadata_json,
                 json.dumps(normalize_event_provenance(event), sort_keys=True),
+                event.occurrence_count,
+                event.duplicate_count,
+                event.duplicate_group_key,
+                event.duplicate_category,
+                event.first_seen,
+                event.last_seen,
             ),
         )
         self.set_background_monitor_state("last_event_timestamp", event.timestamp)
         self.conn.commit()
         return True
+
+    def _background_event_duplicate_group_key(self, event: BackgroundMonitorEvent) -> str:
+        parts = [
+            str(event.event_type),
+            str(event.source),
+            str(event.process_name or ""),
+            str(event.pid if event.pid is not None else ""),
+            str(event.evidence),
+        ]
+        return "|".join(parts)
+
+    def _record_background_event_duplicate(self, row: sqlite3.Row, event: BackgroundMonitorEvent, duplicate_group_key: str) -> None:
+        occurrence_count = max(1, safe_int(row["occurrence_count"]) or 1) + 1
+        duplicate_count = max(0, safe_int(row["duplicate_count"]) or 0) + 1
+        first_seen = str(row["first_seen"] or row["timestamp"] or event.timestamp)
+        last_seen = event.timestamp
+        duplicate_category = "duplicate_burst" if duplicate_count < 10 else "high_volume_duplicate"
+        metadata = {}
+        try:
+            metadata = json.loads(str(row["metadata_json"] or "{}"))
+        except json.JSONDecodeError:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata.update(
+            {
+                "occurrence_count": occurrence_count,
+                "duplicate_count": duplicate_count,
+                "duplicate_category": duplicate_category,
+                "duplicate_group_key": duplicate_group_key,
+                "first_seen": first_seen,
+                "last_seen": last_seen,
+                "last_duplicate_event_id": event.event_id,
+                "last_duplicate_timestamp": event.timestamp,
+            }
+        )
+        event.occurrence_count = occurrence_count
+        event.duplicate_count = duplicate_count
+        event.duplicate_group_key = duplicate_group_key
+        event.duplicate_category = duplicate_category
+        event.first_seen = first_seen
+        event.last_seen = last_seen
+        event.metadata_json = json.dumps(metadata, sort_keys=True)
+        self.conn.execute(
+            """
+            UPDATE background_monitor_events
+            SET timestamp = ?,
+                occurrence_count = ?,
+                duplicate_count = ?,
+                duplicate_group_key = ?,
+                duplicate_category = ?,
+                first_seen = ?,
+                last_seen = ?,
+                metadata_json = ?
+            WHERE event_id = ?
+            """,
+            (
+                event.timestamp,
+                occurrence_count,
+                duplicate_count,
+                duplicate_group_key,
+                duplicate_category,
+                first_seen,
+                last_seen,
+                event.metadata_json,
+                str(row["event_id"]),
+            ),
+        )
+        self.set_background_monitor_state("last_event_timestamp", event.timestamp)
+        self.set_background_monitor_state(f"duplicate_event_count:{event.event_type}", str(duplicate_count))
+        self.conn.commit()
 
     def record_monitor_event(self, event: BackgroundMonitorEvent, dedupe_window_seconds: int = 300) -> bool:
         return self.record_background_monitor_event(event, dedupe_window_seconds=dedupe_window_seconds)
@@ -1959,6 +2057,14 @@ class AuditDatabase:
                     provenance = parsed
             except json.JSONDecodeError:
                 provenance = {}
+        explicit_fields = {
+            "first_seen",
+            "last_seen",
+            "occurrence_count",
+            "duplicate_count",
+            "duplicate_group_key",
+            "duplicate_category",
+        }
         return BackgroundMonitorEvent(
             event_id=str(row["event_id"]),
             timestamp=str(row["timestamp"]),
@@ -1983,7 +2089,13 @@ class AuditDatabase:
             cooldown_suppressed=bool(row["cooldown_suppressed"]),
             last_suppression_reason=str(row["last_suppression_reason"] or ""),
             metadata_json=str(row["metadata_json"] or "{}"),
-            **{key: value for key, value in provenance.items() if key in EVENT_PROVENANCE_FIELDS},
+            occurrence_count=max(1, safe_int(row["occurrence_count"]) or 1),
+            duplicate_count=max(0, safe_int(row["duplicate_count"]) or 0),
+            duplicate_group_key=str(row["duplicate_group_key"] or ""),
+            duplicate_category=str(row["duplicate_category"] or "single"),
+            first_seen=str(row["first_seen"] or ""),
+            last_seen=str(row["last_seen"] or ""),
+            **{key: value for key, value in provenance.items() if key in EVENT_PROVENANCE_FIELDS and key not in explicit_fields},
         )
 
     def update_monitor_event_notification(
@@ -2083,6 +2195,20 @@ class AuditDatabase:
         self.conn.execute("VACUUM")
         self.conn.commit()
         self.set_background_monitor_state("last_event_timestamp", "")
+        return removed
+
+    def clear_command_logs(self) -> int:
+        row = self.conn.execute("SELECT COUNT(*) AS count FROM command_logs").fetchone()
+        removed = int(row["count"]) if row and row["count"] is not None else 0
+        self.conn.execute("DELETE FROM command_logs")
+        self.conn.commit()
+        return removed
+
+    def clear_remediation_actions(self) -> int:
+        row = self.conn.execute("SELECT COUNT(*) AS count FROM remediation_actions").fetchone()
+        removed = int(row["count"]) if row and row["count"] is not None else 0
+        self.conn.execute("DELETE FROM remediation_actions")
+        self.conn.commit()
         return removed
 
     def count_monitor_events_since(self, since_timestamp: str) -> int:

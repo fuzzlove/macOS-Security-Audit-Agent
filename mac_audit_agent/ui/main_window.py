@@ -8,8 +8,9 @@ import shlex
 from datetime import datetime
 from pathlib import Path
 import sys
-from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QBrush, QDesktopServices, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from typing import Callable
+from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QAction, QColor, QBrush, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -85,6 +86,7 @@ from mac_audit_agent.execution_evidence import ExecutionEvidenceEngine
 from mac_audit_agent.family_safety import FamilySafetyAuditor, export_family_safety_html, export_family_safety_json
 from mac_audit_agent.intrusion_correlation import IntrusionCorrelationEngine
 from mac_audit_agent.operational_health import OperationalHealthEngine
+from mac_audit_agent.ui.action_state import ActionState, apply_action_state
 from mac_audit_agent.ui.family_safety_panel import FamilySafetyPanel
 from mac_audit_agent.ui.investigation_priority_panel import InvestigationPriorityPanel
 from mac_audit_agent.ui.context_dialog import ContextDialog
@@ -111,6 +113,80 @@ USAGE_GUIDE_TITLE = f"How to Use {APP_TITLE}"
 RISK_COLORS = {"safe": "#238b45", "sensitive": "#d4a017", "dangerous": "#c0392b"}
 SEVERITY_PRIORITY = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 REVIEW_STATES = ["not reviewed", "reviewed", "needs follow-up", "false positive", "confirmed concern"]
+DEFAULT_REMEDIATION_BY_CATEGORY = {
+    "network": {
+        "steps": [
+            "Identify the owning process, listening address, and whether the connection is expected for this Mac.",
+            "Preserve the event timeline and command output before blocking, quitting, or changing network settings.",
+            "If unexpected, disconnect from untrusted networks and review firewall, proxy, VPN, and sharing settings.",
+        ],
+        "verification": ["Refresh logs, re-run the scan, and confirm the listener or connection no longer appears unexpectedly."],
+    },
+    "persistence": {
+        "steps": [
+            "Inspect the launch item, schedule, owner, signature, and referenced executable before removing anything.",
+            "Create or confirm an evidence snapshot so the original plist/script/path can be recovered if needed.",
+            "Disable or remove the item only after confirming it is not legitimate management, security, backup, or developer tooling.",
+        ],
+        "verification": ["Restart or reload the session as appropriate, refresh logs, and confirm the item does not recreate itself."],
+    },
+    "accounts": {
+        "steps": [
+            "Confirm whether the account, group membership, login event, or privilege change was authorized.",
+            "Preserve login history and related monitor events before changing passwords or removing privileges.",
+            "If unauthorized, rotate affected credentials and remove only the unexpected privilege or account after review.",
+        ],
+        "verification": ["Refresh account logs and re-run the scan to confirm user and admin membership match expectations."],
+    },
+    "files": {
+        "steps": [
+            "Review the file path, owner, modification time, quarantine metadata, and whether an expected application created it.",
+            "Do not delete evidence until a snapshot or report has been created.",
+            "If suspicious, isolate the file by moving it through the app's recovery workflow or manual quarantine process.",
+        ],
+        "verification": ["Refresh file/process logs and confirm the path is absent or no longer executable from an unsafe location."],
+    },
+    "process": {
+        "steps": [
+            "Review process path, parent process, signature, command line, and network activity together.",
+            "Preserve process and network evidence before terminating the process.",
+            "If malicious or unauthorized, stop it through normal app controls first, then remove the associated persistence path.",
+        ],
+        "verification": ["Refresh process logs and re-run the scan to confirm the process and related listener are gone."],
+    },
+    "vulnerability": {
+        "steps": [
+            "Confirm the detected local product and version match the advisory before remediation.",
+            "Use the vendor or Apple-supported update path rather than downloading random installers.",
+            "Prioritize known exploited, locally applicable, high-confidence items first.",
+        ],
+        "verification": ["Refresh the forecast or vulnerability scan and confirm the fixed version is detected locally."],
+    },
+    "baseline": {
+        "steps": [
+            "Compare the change against expected maintenance, updates, installs, and administrative activity.",
+            "Record whether the change is expected, suspicious, or needs follow-up.",
+            "If suspicious, preserve logs and investigate the related process, user, network, and persistence evidence before cleanup.",
+        ],
+        "verification": ["Refresh baseline comparison after review and confirm expected changes are accepted or unexpected changes are resolved."],
+    },
+    "monitor": {
+        "steps": [
+            "Review monitor health, event flow, and recent tamper or blindness events before remediation.",
+            "Preserve monitor logs and evidence snapshots before reinstalling or repairing the monitor.",
+            "Repair deployment only through the app's monitor repair controls or documented system service process.",
+        ],
+        "verification": ["Refresh monitor logs and run the event-flow verification to confirm alerts and persistence are working."],
+    },
+    "default": {
+        "steps": [
+            "Read the evidence, category, severity, and false-positive notes before taking action.",
+            "Create or export an evidence snapshot if the finding may be security relevant.",
+            "Apply the least disruptive fix first, then document what changed in the review notes.",
+        ],
+        "verification": ["Refresh logs, re-run the relevant scan category, and confirm the finding is resolved or correctly marked reviewed."],
+    },
+}
 STARTUP_STRATEGY_QUOTES = [
     {"source": "Sun Tzu", "text": "The supreme art of war is to subdue the enemy without fighting."},
     {"source": "Sun Tzu", "text": "In the midst of chaos, there is also opportunity."},
@@ -284,6 +360,105 @@ class PacketCaptureProgressDialog(QDialog):
         self.result = self.session.cancel()
         self.status_label.setText("Status: cancelled")
         self.reject()
+
+
+class LongActionWorker(QObject):
+    progress = Signal(dict)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, action: Callable[[Callable[[dict], None]], object]) -> None:
+        super().__init__()
+        self.action = action
+
+    def run(self) -> None:
+        try:
+            self.completed.emit(self.action(lambda payload: self.progress.emit(dict(payload))))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class GuidedLongActionDialog(QDialog):
+    def __init__(self, title: str, phases: list[str], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.result_data: object = None
+        self.error = ""
+        self._phases = phases or ["Working in the background."]
+        self._phase_index = 0
+        self.worker_thread: QThread | None = None
+        self.worker: LongActionWorker | None = None
+        layout = QVBoxLayout(self)
+        title_label = QLabel(title)
+        title_label.setStyleSheet("font-weight: 700;")
+        layout.addWidget(title_label)
+        self.status_label = QLabel(self._phases[0])
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+        self.detail_label = QLabel("The app is keeping this work off the main interface so it can continue responding.")
+        self.detail_label.setWordWrap(True)
+        layout.addWidget(self.detail_label)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, max(1, len(self._phases)))
+        self.progress_bar.setValue(0)
+        layout.addWidget(self.progress_bar)
+        self.close_button = QPushButton("Running...")
+        self.close_button.setEnabled(False)
+        layout.addWidget(self.close_button)
+        self.timer = QTimer(self)
+        self.timer.setInterval(1200)
+        self.timer.timeout.connect(self._advance_phase)
+
+    def start_action(self, action: Callable[[Callable[[dict], None]], object]) -> None:
+        self.worker_thread = QThread(self)
+        self.worker = LongActionWorker(action)
+        self.worker.moveToThread(self.worker_thread)
+        self.worker.progress.connect(self._update_progress)
+        self.worker.completed.connect(self._complete)
+        self.worker.failed.connect(self._fail)
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker.completed.connect(self.worker_thread.quit)
+        self.worker.failed.connect(self.worker_thread.quit)
+        self.worker_thread.finished.connect(self.worker.deleteLater)
+        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+        self.timer.start()
+        self.worker_thread.start()
+
+    def _advance_phase(self) -> None:
+        self._phase_index = min(self._phase_index + 1, len(self._phases) - 1)
+        self.status_label.setText(self._phases[self._phase_index])
+        self.progress_bar.setValue(self._phase_index)
+
+    def _update_progress(self, payload: dict) -> None:
+        message = str(payload.get("message", "")).strip()
+        if message:
+            self.status_label.setText(message)
+        completed = payload.get("completed")
+        total = payload.get("total")
+        if completed is not None and total is not None:
+            maximum = max(1, int(total))
+            self.progress_bar.setRange(0, maximum)
+            self.progress_bar.setValue(min(int(completed), maximum))
+
+    def _complete(self, result: object) -> None:
+        self.timer.stop()
+        self.result_data = result
+        self.progress_bar.setValue(self.progress_bar.maximum())
+        self.status_label.setText("Completed. Preparing results for display.")
+        self.accept()
+
+    def _fail(self, error: str) -> None:
+        self.timer.stop()
+        self.error = error
+        self.status_label.setText(f"Failed: {error}")
+        super().reject()
+
+    def reject(self) -> None:
+        if self.worker_thread is not None and self.worker_thread.isRunning():
+            self.status_label.setText("This action is still finishing. Please wait.")
+            return
+        super().reject()
 
 
 class NetworkDiscoveryOptionsDialog(QDialog):
@@ -573,6 +748,54 @@ def normalize_findings(findings):
     return [normalize_finding(finding) for finding in (findings or [])]
 
 
+def finding_duplicate_group_key(finding: dict) -> str:
+    return "|".join(
+        [
+            str(finding.get("category", "")),
+            str(finding.get("title", "")),
+            str(finding.get("severity", "info")),
+            str(finding.get("rule_id", "")),
+            str(finding.get("event_type", "")),
+            str(finding.get("command_used", "")),
+            str(finding.get("evidence_summary", finding.get("evidence", ""))),
+        ]
+    )
+
+
+def duplicate_category_for_count(count: int) -> str:
+    if count <= 1:
+        return "single"
+    if count < 10:
+        return "duplicate_burst"
+    return "high_volume_duplicate"
+
+
+def deduplicate_findings_for_display(findings: list[dict]) -> list[dict]:
+    grouped: dict[str, dict] = {}
+    order: list[str] = []
+    for finding in findings:
+        item = dict(finding)
+        key = finding_duplicate_group_key(item)
+        if key not in grouped:
+            item["occurrence_count"] = 1
+            item["duplicate_count"] = 0
+            item["duplicate_category"] = "single"
+            item["duplicate_group_key"] = key
+            item["duplicate_ids"] = [str(item.get("id", ""))]
+            grouped[key] = item
+            order.append(key)
+            continue
+        representative = grouped[key]
+        occurrence_count = int(representative.get("occurrence_count", 1) or 1) + 1
+        representative["occurrence_count"] = occurrence_count
+        representative["duplicate_count"] = occurrence_count - 1
+        representative["duplicate_category"] = duplicate_category_for_count(occurrence_count)
+        duplicate_ids = list(representative.get("duplicate_ids", []))
+        duplicate_ids.append(str(item.get("id", "")))
+        representative["duplicate_ids"] = duplicate_ids
+    return [grouped[key] for key in order]
+
+
 def create_security_tray_icon(size: int = 64) -> QIcon:
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.transparent)
@@ -668,6 +891,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._build_menus()
+        self._set_developer_mode(self._developer_mode_enabled(), persist=False)
         self._setup_tray_icon()
         self._load_registry()
         self._refresh_command_preview_page()
@@ -708,7 +932,6 @@ class MainWindow(QMainWindow):
             "Investigation Priorities",
             "Flight Recorder",
             "Evidence Snapshots",
-            "Apple Security Forecast",
             "Logs",
             "Settings",
             "Skins",
@@ -724,9 +947,6 @@ class MainWindow(QMainWindow):
         self.cve_radar_panel = CveRadarPanel(self)
         self.cve_radar_panel.update_requested.connect(lambda: self.refresh_apple_security_forecast(manual=True))
         self.cve_radar_panel.diagnostics_requested.connect(self.show_apple_security_forecast_diagnostics)
-        self.cve_radar_panel.demo_requested.connect(self.generate_demo_apple_security_forecast)
-        self.cve_radar_panel.safari_demo_requested.connect(self.generate_safari_webkit_demo_apple_security_forecast)
-        self.cve_radar_panel.clear_demo_requested.connect(self.clear_demo_apple_security_forecast)
         self.cve_radar_panel.export_requested.connect(self.export_html)
         self.cve_radar_panel.review_requested.connect(self._review_cve_radar_card)
         self.cve_radar_panel.snooze_requested.connect(self._snooze_cve_radar_card)
@@ -750,6 +970,7 @@ class MainWindow(QMainWindow):
         self.investigation_priority_nav_panel = InvestigationPriorityPanel()
         self.logs_panel = LogsPanel(self)
         self.logs_panel.refresh_requested.connect(self.refresh_logs_page)
+        self.logs_panel.clear_requested.connect(self.clear_logs_category)
         self.logs_panel.open_reports_requested.connect(self.open_reports_folder)
         self.theme_panel = ThemeSettingsPanel(self)
         self.theme_panel.theme_changed.connect(self.apply_theme_choice)
@@ -772,8 +993,6 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_investigation_priorities_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_flight_recorder_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_system_recovery_page(), resizable=True))
-        self.forecast_page_widget = self._build_forecast_page()
-        self.pages.addWidget(self._wrap_in_scroll_area(self.forecast_page_widget, resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_logs_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_settings_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_skins_page(), resizable=True))
@@ -790,12 +1009,7 @@ class MainWindow(QMainWindow):
         self.main_splitter.addWidget(self.details_panel)
         self.main_splitter.setSizes([1000, 360])
 
-        left_column = QVBoxLayout()
-        left_column.setContentsMargins(0, 0, 0, 0)
-        left_column.setSpacing(8)
-        left_column.addWidget(self.sidebar, 1)
-        left_column.addWidget(self._build_left_demo_ad_card())
-        outer.addLayout(left_column)
+        outer.addWidget(self.sidebar)
         outer.addWidget(self.main_splitter)
         self._update_responsive_layout()
         self.cve_radar_timer = QTimer(self)
@@ -810,94 +1024,44 @@ class MainWindow(QMainWindow):
         scroll.setWidget(widget)
         return scroll
 
-    def _build_left_demo_ad_card(self) -> QFrame:
-        card = QFrame()
-        card.setObjectName("leftDemoAdCard")
-        card.setProperty("themeCard", True)
-        card.setCursor(Qt.PointingHandCursor)
-        card.setToolTip("Open Patreon support page")
-        card.setMaximumWidth(240)
-        card.setMaximumHeight(116)
-        card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        card.setStyleSheet(
-            """
-            QFrame#leftDemoAdCard {
-                background: rgba(34, 197, 94, 28);
-                border: 1px solid rgba(134, 239, 172, 120);
-                border-radius: 8px;
-            }
-            QFrame#leftDemoAdCard QLabel {
-                background: transparent;
-            }
-            """
-        )
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(4)
-        badge_row = QHBoxLayout()
-        badge_row.setContentsMargins(0, 0, 0, 0)
-        badge_row.setSpacing(6)
-        label = QLabel("KEEP IT FREE")
-        label.setStyleSheet("font-size: 11px; font-weight: 700; color: #86EFAC;")
-        badge_row.addWidget(label)
-        badge_row.addWidget(self._build_verified_badge(16))
-        badge_row.addStretch(1)
-        title = QLabel("Support the author")
-        title.setStyleSheet("font-size: 14px; font-weight: 700; color: #F0F6FC;")
-        body = QLabel("Optional support helps this free tool keep improving.")
-        body.setWordWrap(True)
-        body.setStyleSheet("color: #D6E4FF;")
-        layout.addLayout(badge_row)
-        layout.addWidget(title)
-        layout.addWidget(body)
-        card.mousePressEvent = lambda event: self.open_support_author_link() if event.button() == Qt.LeftButton else None
-        return card
+    def _developer_mode_enabled(self) -> bool:
+        stored = self.db.get_background_monitor_state("developer_mode", "")
+        if stored:
+            return stored == "1"
+        return bool(getattr(self.config, "developer_mode", False))
 
-    def _build_verified_badge(self, size: int) -> QLabel:
-        pixmap = QPixmap(size, size)
-        pixmap.fill(Qt.transparent)
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setBrush(QBrush(QColor("#1D9BF0")))
-        painter.setPen(Qt.NoPen)
-        points = [
-            QPointF(size * 0.50, size * 0.02),
-            QPointF(size * 0.62, size * 0.15),
-            QPointF(size * 0.80, size * 0.10),
-            QPointF(size * 0.85, size * 0.28),
-            QPointF(size * 0.98, size * 0.40),
-            QPointF(size * 0.88, size * 0.56),
-            QPointF(size * 0.94, size * 0.75),
-            QPointF(size * 0.75, size * 0.80),
-            QPointF(size * 0.62, size * 0.98),
-            QPointF(size * 0.50, size * 0.85),
-            QPointF(size * 0.38, size * 0.98),
-            QPointF(size * 0.25, size * 0.80),
-            QPointF(size * 0.06, size * 0.75),
-            QPointF(size * 0.12, size * 0.56),
-            QPointF(size * 0.02, size * 0.40),
-            QPointF(size * 0.15, size * 0.28),
-            QPointF(size * 0.20, size * 0.10),
-            QPointF(size * 0.38, size * 0.15),
-        ]
-        badge = QPainterPath()
-        badge.moveTo(points[0])
-        for point in points[1:]:
-            badge.lineTo(point)
-        badge.closeSubpath()
-        painter.drawPath(badge)
-        painter.setPen(QPen(QColor("#FFFFFF"), max(2, size // 8), Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-        painter.drawLine(QPointF(size * 0.30, size * 0.52), QPointF(size * 0.44, size * 0.66))
-        painter.drawLine(QPointF(size * 0.44, size * 0.66), QPointF(size * 0.72, size * 0.34))
-        painter.end()
-        label = QLabel()
-        label.setFixedSize(size, size)
-        label.setPixmap(pixmap)
-        label.setToolTip("Verified support link")
-        return label
+    def _set_developer_mode(self, enabled: bool, *, persist: bool) -> None:
+        self.config.developer_mode = enabled
+        if persist:
+            self.db.set_background_monitor_state("developer_mode", "1" if enabled else "0")
+        if hasattr(self, "developer_mode_action"):
+            self.developer_mode_action.blockSignals(True)
+            self.developer_mode_action.setChecked(enabled)
+            self.developer_mode_action.blockSignals(False)
+        for action in getattr(self, "developer_monitor_actions", []):
+            action.setVisible(enabled)
+            action.setToolTip(
+                "Developer Mode only: creates synthetic monitor/notifier events."
+                if enabled
+                else "Hidden unless Settings > Developer Mode is enabled."
+            )
+        if hasattr(self, "background_monitor_panel"):
+            self.background_monitor_panel.set_developer_mode(enabled)
+        if hasattr(self, "operational_health_panel") and hasattr(self.operational_health_panel, "set_developer_mode"):
+            self.operational_health_panel.set_developer_mode(enabled)
 
-    def open_support_author_link(self) -> None:
-        QDesktopServices.openUrl(QUrl("https://www.patreon.com/16166750/join"))
+    def _build_dashboard_action_group(self, title: str, widgets: list[QWidget]) -> QFrame:
+        frame = QFrame()
+        frame.setProperty("themeCard", True)
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(6)
+        title_label = QLabel(title)
+        title_label.setStyleSheet("font-weight: 700; color: #D6E4FF;")
+        layout.addWidget(title_label)
+        for widget in widgets:
+            layout.addWidget(widget)
+        return frame
 
     def _build_menus(self) -> None:
         diagnostics_menu = self.menuBar().addMenu("Diagnostics")
@@ -918,21 +1082,27 @@ class MainWindow(QMainWindow):
         network_discovery_action.triggered.connect(self.run_network_discovery)
         advanced_evidence_menu.addAction(network_discovery_action)
         background_monitor_menu = self.menuBar().addMenu("Background Monitor")
-        generate_test_event_action = QAction("Generate Test Event", self)
+        self.developer_monitor_actions: list[QAction] = []
+        generate_test_event_action = QAction("Developer: Generate Test Event", self)
         generate_test_event_action.triggered.connect(self.trigger_background_monitor_test_event)
         background_monitor_menu.addAction(generate_test_event_action)
-        test_notification_action = QAction("Test Notification", self)
+        self.developer_monitor_actions.append(generate_test_event_action)
+        test_notification_action = QAction("Developer: Test Notification", self)
         test_notification_action.triggered.connect(self.trigger_background_monitor_test_notification)
         background_monitor_menu.addAction(test_notification_action)
-        test_dialog_action = QAction("Test High Priority Dialog", self)
+        self.developer_monitor_actions.append(test_notification_action)
+        test_dialog_action = QAction("Developer: Test High Priority Dialog", self)
         test_dialog_action.triggered.connect(self.trigger_background_monitor_test_dialog)
         background_monitor_menu.addAction(test_dialog_action)
-        test_overlay_action = QAction("Test Bottom-Right Alert", self)
+        self.developer_monitor_actions.append(test_dialog_action)
+        test_overlay_action = QAction("Developer: Test Bottom-Right Alert", self)
         test_overlay_action.triggered.connect(self.trigger_background_monitor_test_overlay)
         background_monitor_menu.addAction(test_overlay_action)
-        test_idle_warning_action = QAction("Test Idle Activity Warning", self)
+        self.developer_monitor_actions.append(test_overlay_action)
+        test_idle_warning_action = QAction("Developer: Test Idle Activity Warning", self)
         test_idle_warning_action.triggered.connect(self.trigger_background_monitor_test_idle_warning)
         background_monitor_menu.addAction(test_idle_warning_action)
+        self.developer_monitor_actions.append(test_idle_warning_action)
         settings_menu = self.menuBar().addMenu("Settings")
         family_safety_action = QAction("Family & Safety", self)
         family_safety_action.triggered.connect(self.show_family_safety_page)
@@ -949,6 +1119,11 @@ class MainWindow(QMainWindow):
         monitor_mode_action = QAction("Monitor Mode", self)
         monitor_mode_action.triggered.connect(lambda: self.background_monitor_panel.show_monitor_mode_dialog())
         settings_menu.addAction(monitor_mode_action)
+        self.developer_mode_action = QAction("Developer Mode", self)
+        self.developer_mode_action.setCheckable(True)
+        self.developer_mode_action.setToolTip("Show synthetic monitor test controls. Disabled by default.")
+        self.developer_mode_action.toggled.connect(lambda enabled: self._set_developer_mode(enabled, persist=True))
+        settings_menu.addAction(self.developer_mode_action)
         help_menu = self.menuBar().addMenu("Help")
         about_action = QAction("About Mac Audit Agent", self)
         about_action.triggered.connect(self.show_about_dialog)
@@ -1096,6 +1271,7 @@ class MainWindow(QMainWindow):
         self.localhost_protocol_combo.addItem("UDP Only", "udp")
         self.localhost_protocol_combo.addItem("TCP + UDP", "both")
         self.run_scan_button = QPushButton("Run Scan")
+        self.run_scan_button.setToolTip("Run the selected local audit scan.")
         self.run_scan_button.clicked.connect(self.run_scan)
         self.vulnerability_review_button = QPushButton("Aggressive Local Vulnerability Review")
         self.vulnerability_review_button.clicked.connect(self.run_aggressive_local_vulnerability_review)
@@ -1104,27 +1280,41 @@ class MainWindow(QMainWindow):
         self.network_discovery_button = QPushButton("Local Network Device Discovery")
         self.network_discovery_button.clicked.connect(self.run_network_discovery)
         self.reset_scan_button = QPushButton("Reset / New Scan")
+        self.reset_scan_button.setToolTip("Clear the current scan view and start a fresh review.")
         self.reset_scan_button.clicked.connect(self.reset_scan_state)
         self.export_json_button = QPushButton("Export JSON")
         self.export_json_button.clicked.connect(self.export_json)
         self.export_html_button = QPushButton("Export HTML")
         self.export_html_button.clicked.connect(self.export_html)
         self.open_reports_folder_button = QPushButton("Open Reports Folder")
+        self.open_reports_folder_button.setToolTip("Open the local reports folder.")
         self.open_reports_folder_button.clicked.connect(self.open_reports_folder)
+        self.dashboard_primary_actions = self._build_dashboard_action_group(
+            "Primary Actions",
+            [self.scan_mode_combo, self.run_scan_button, self.reset_scan_button],
+        )
+        self.dashboard_report_actions = self._build_dashboard_action_group(
+            "Reports",
+            [self.export_json_button, self.export_html_button, self.open_reports_folder_button],
+        )
+        self.dashboard_advanced_note = QFrame()
+        advanced_note_layout = QVBoxLayout(self.dashboard_advanced_note)
+        advanced_note_layout.setContentsMargins(8, 6, 8, 6)
+        advanced_note_layout.setSpacing(4)
+        advanced_note_title = QLabel("Advanced Actions")
+        advanced_note_title.setStyleSheet("font-weight: 700; color: #D6E4FF;")
+        advanced_note_body = QLabel("Localhost port scans, vulnerability review, packet capture, and network discovery are available from the Diagnostics and Advanced Evidence menus.")
+        advanced_note_body.setWordWrap(True)
+        advanced_note_body.setStyleSheet("color: #9DB0C9;")
+        advanced_note_layout.addWidget(advanced_note_title)
+        advanced_note_layout.addWidget(advanced_note_body)
         self.dashboard_header_widgets = [
             self.header_logo_label,
             self.score_label,
             self.summary_label,
-            self.scan_mode_combo,
-            self.localhost_protocol_combo,
-            self.run_scan_button,
-            self.vulnerability_review_button,
-            self.full_localhost_scan_button,
-            self.network_discovery_button,
-            self.reset_scan_button,
-            self.export_json_button,
-            self.export_html_button,
-            self.open_reports_folder_button,
+            self.dashboard_primary_actions,
+            self.dashboard_report_actions,
+            self.dashboard_advanced_note,
         ]
         self._arrange_dashboard_header()
         self.dashboard_logo_label = ClickableLabel()
@@ -1163,7 +1353,7 @@ class MainWindow(QMainWindow):
             self.dashboard_forecast_kev_label,
         ]:
             label.setStyleSheet("color: #D6E4FF;")
-        self.open_forecast_button = make_forecast_button("Open Forecast", "Open the dedicated Apple Security Forecast tab.", "primary")
+        self.open_forecast_button = make_forecast_button("Show Forecast", "Keep the Dashboard selected and focus the Apple Security Forecast section below.", "primary")
         self.open_forecast_button.clicked.connect(self.show_forecast_page)
         forecast_layout.addWidget(forecast_title)
         forecast_layout.addWidget(self.dashboard_forecast_level_label)
@@ -1213,6 +1403,7 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self.dashboard_forecast_frame)
         layout.addWidget(self.dashboard_health_frame)
+        layout.addWidget(self.cve_radar_panel)
         self.dashboard_cards = {}
         self.severity_cards = {}
         self.dashboard_card_widgets: list[QFrame] = []
@@ -1314,6 +1505,23 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(8, 8, 8, 8)
+        self.results_empty_state = QFrame()
+        self.results_empty_state.setProperty("themeCard", True)
+        empty_layout = QVBoxLayout(self.results_empty_state)
+        empty_layout.setContentsMargins(14, 14, 14, 14)
+        empty_layout.setSpacing(8)
+        empty_title = QLabel("No results available yet.")
+        empty_title.setStyleSheet("font-size: 18px; font-weight: 700; color: #F0F6FC;")
+        empty_body = QLabel("Run Safe Scan from the Dashboard to populate findings, ports, users, evidence, workflow details, and report exports.")
+        empty_body.setWordWrap(True)
+        empty_body.setStyleSheet("color: #D6E4FF;")
+        empty_action = QPushButton("Go to Dashboard")
+        empty_action.setProperty("role", "primary")
+        empty_action.clicked.connect(lambda: self._show_sidebar_page("Dashboard"))
+        empty_layout.addWidget(empty_title)
+        empty_layout.addWidget(empty_body)
+        empty_layout.addWidget(empty_action)
+        empty_layout.addStretch(1)
         self.results_tabs = QTabWidget()
         findings_page = QWidget()
         findings_layout = QVBoxLayout(findings_page)
@@ -1429,7 +1637,9 @@ class MainWindow(QMainWindow):
             ("Raw Logs", self.logs_table),
         ]:
             self.results_tabs.addTab(widget, name)
+        layout.addWidget(self.results_empty_state)
         layout.addWidget(self.results_tabs)
+        self._set_results_available(self.current_scan_result is not None)
         return page
 
     def _build_logs_page(self) -> QWidget:
@@ -1479,6 +1689,17 @@ class MainWindow(QMainWindow):
     def _build_preview_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+        heading = QLabel("Audit Command Preview")
+        heading.setStyleSheet("font-size: 18px; font-weight: 700;")
+        heading.setWordWrap(True)
+        layout.addWidget(heading)
+        explainer = QLabel(
+            "This tab previews read-only audit and evidence-collection commands registered in Mac Audit Agent. "
+            "It is not a complete list of possible remediation commands, and it does not mean every listed command ran during the last scan."
+        )
+        explainer.setWordWrap(True)
+        layout.addWidget(explainer)
         self.command_preview = QTextEdit()
         self.command_preview.setReadOnly(True)
         self.command_preview.setLineWrapMode(QTextEdit.WidgetWidth)
@@ -1548,28 +1769,48 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
-        layout.addWidget(QLabel("Details"))
+        details_heading = QLabel("Selected Item Details")
+        details_heading.setStyleSheet("font-weight: 700;")
+        details_heading.setWordWrap(True)
+        layout.addWidget(details_heading)
+        details_hint = QLabel("Shows either the selected audit command metadata or the selected finding evidence. Finding details are separate from the Command Preview tab.")
+        details_hint.setWordWrap(True)
+        layout.addWidget(details_hint)
         self.selected_command_panel = QTextEdit()
         self.selected_command_panel.setReadOnly(True)
         self.selected_command_panel.setLineWrapMode(QTextEdit.WidgetWidth)
         layout.addWidget(self.selected_command_panel)
-        layout.addWidget(QLabel("Remediation"))
+        remediation_heading = QLabel("Finding Remediation Guidance")
+        remediation_heading.setStyleSheet("font-weight: 700;")
+        remediation_heading.setWordWrap(True)
+        layout.addWidget(remediation_heading)
+        remediation_hint = QLabel(
+            "Appears only for selected findings. Copyable commands are optional helper commands, not the only remediation path. Review the steps, impact, and verification guidance before acting."
+        )
+        remediation_hint.setWordWrap(True)
+        layout.addWidget(remediation_hint)
         self.remediation_panel = QTextEdit()
         self.remediation_panel.setReadOnly(True)
         self.remediation_panel.setLineWrapMode(QTextEdit.WidgetWidth)
         layout.addWidget(self.remediation_panel)
-        command_row = QHBoxLayout()
+        self.remediation_actions_frame = QFrame()
+        command_row = QHBoxLayout(self.remediation_actions_frame)
+        command_row.setContentsMargins(0, 0, 0, 0)
         self.remediation_command_selector = QComboBox()
         self.remediation_command_selector.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.copy_command_button = QPushButton("Copy Command")
+        self.copy_command_button.setToolTip("Copy the selected remediation command.")
         self.copy_command_button.clicked.connect(self.copy_remediation_command)
         self.run_command_button = QPushButton("Run Command")
+        self.run_command_button.setToolTip("Run the selected remediation command after confirmation.")
         self.run_command_button.clicked.connect(self.run_remediation_command)
         command_row.addWidget(self.remediation_command_selector)
         command_row.addWidget(self.copy_command_button)
         command_row.addWidget(self.run_command_button)
-        layout.addLayout(command_row)
-        review_actions = QGridLayout()
+        layout.addWidget(self.remediation_actions_frame)
+        self.review_actions_frame = QFrame()
+        review_actions = QGridLayout(self.review_actions_frame)
+        review_actions.setContentsMargins(0, 0, 0, 0)
         self.add_finding_note_button = QPushButton("Add Note")
         self.add_finding_note_button.clicked.connect(self.add_note_for_selected_finding)
         self.mark_reviewed_button = QPushButton("Mark Reviewed")
@@ -1596,99 +1837,14 @@ class MainWindow(QMainWindow):
             ]
         ):
             review_actions.addWidget(widget, index // 2, index % 2)
-        layout.addLayout(review_actions)
+        self.selected_finding_hint_label = QLabel("Select a finding in Results to review details, remediation, notes, and context actions.")
+        self.selected_finding_hint_label.setWordWrap(True)
+        self.selected_finding_hint_label.setStyleSheet("color: #9DB0C9;")
+        layout.addWidget(self.selected_finding_hint_label)
+        layout.addWidget(self.review_actions_frame)
         layout.addStretch(1)
-        layout.addWidget(self._build_demo_test_ad_card())
         self._clear_selected_finding_panel()
         return panel
-
-    def _build_demo_test_ad_card(self) -> QFrame:
-        card = QFrame()
-        card.setObjectName("demoTestAdCard")
-        card.setProperty("themeCard", True)
-        card.setCursor(Qt.PointingHandCursor)
-        card.setToolTip("Open Patreon support page")
-        card.setMaximumHeight(142)
-        card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        card.setStyleSheet(
-            """
-            QFrame#demoTestAdCard {
-                background: rgba(14, 165, 233, 32);
-                border: 1px solid rgba(125, 211, 252, 130);
-                border-radius: 8px;
-            }
-            QFrame#demoTestAdCard QLabel {
-                background: transparent;
-            }
-            """
-        )
-        outer = QHBoxLayout(card)
-        outer.setContentsMargins(10, 8, 10, 8)
-        outer.setSpacing(10)
-        qr_label = self._build_demo_qr_label(104)
-        if qr_label is not None:
-            outer.addWidget(qr_label)
-        layout = QVBoxLayout()
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(4)
-        label = QLabel("SUPPORT THE AUTHOR")
-        label.setStyleSheet("font-size: 11px; font-weight: 700; color: #7DD3FC;")
-        message = QLabel("Mac Audit Agent is free")
-        message.setStyleSheet("font-size: 15px; font-weight: 700; color: #F0F6FC;")
-        body = QLabel("If this helped you, a small thank-you supports future work.")
-        body.setWordWrap(True)
-        body.setStyleSheet("color: #D6E4FF;")
-        layout.addWidget(label)
-        layout.addWidget(message)
-        layout.addWidget(body)
-        layout.addStretch(1)
-        outer.addLayout(layout, 1)
-        card.mousePressEvent = lambda event: self.open_support_author_link() if event.button() == Qt.LeftButton else None
-        return card
-
-    def _build_demo_qr_label(self, size: int) -> QLabel | None:
-        for name in ["demo_qr.png", "ad_qr.png", "qr.png", "demo_qr.jpg", "ad_qr.jpg", "qr.jpg"]:
-            for path in [get_asset_path(name), Path.cwd() / name]:
-                if not path.exists():
-                    continue
-                pixmap = QPixmap(str(path))
-                if pixmap.isNull():
-                    continue
-                label = QLabel()
-                label.setFixedSize(size, size)
-                label.setAlignment(Qt.AlignCenter)
-                label.setToolTip("Demo QR code")
-                quiet_zone = max(8, size // 10)
-                qr_size = max(1, size - (quiet_zone * 2))
-                padded = QPixmap(size, size)
-                padded.fill(QColor("#FFFFFF"))
-                painter = QPainter(padded)
-                painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-                painter.drawPixmap(
-                    quiet_zone,
-                    quiet_zone,
-                    pixmap.scaled(qr_size, qr_size, Qt.KeepAspectRatio, Qt.FastTransformation),
-                )
-                painter.end()
-                label.setPixmap(padded)
-                label.setStyleSheet("background: #FFFFFF; border: 1px solid rgba(255, 255, 255, 150); border-radius: 6px;")
-                return label
-        label = QLabel("QR\nCODE")
-        label.setFixedSize(size, size)
-        label.setAlignment(Qt.AlignCenter)
-        label.setToolTip("Place demo_qr.png in mac_audit_agent/assets or the repo root.")
-        label.setStyleSheet(
-            """
-            background: #FFFFFF;
-            color: #0B1220;
-            border: 1px dashed rgba(11, 18, 32, 150);
-            border-radius: 6px;
-            font-size: 12px;
-            font-weight: 700;
-            padding: 4px;
-            """
-        )
-        return label
 
     def _make_table(self, headers: list[str]) -> QTableWidget:
         table = QTableWidget(0, len(headers))
@@ -1696,6 +1852,12 @@ class MainWindow(QMainWindow):
         table.horizontalHeader().setStretchLastSection(True)
         table.setWordWrap(True)
         return table
+
+    def _set_results_available(self, available: bool) -> None:
+        if hasattr(self, "results_empty_state"):
+            self.results_empty_state.setVisible(not available)
+        if hasattr(self, "results_tabs"):
+            self.results_tabs.setVisible(available)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -2208,12 +2370,16 @@ class MainWindow(QMainWindow):
 
     def _default_command_preview_text(self) -> str:
         lines = [
-            "Command Preview shows the exact collection commands and safety metadata used by the app.",
+            "Scope: audit and evidence-collection command previews only.",
+            "",
+            "This section answers: what commands can the audit engine run, what do they collect, what risk do they carry, and what failure modes should you expect?",
+            "It does not list every possible remediation command. Remediation guidance appears in the side panel only after selecting a finding in Results.",
             "",
             "How to use it:",
             "1. Select a row in Scan Categories to inspect a specific command.",
             "2. Run a scan to generate real command/log activity.",
             "3. Review Raw Logs to compare planned commands with what actually ran.",
+            "4. Select a finding in Results to review evidence, remediation steps, optional copyable commands, and verification steps.",
         ]
         if self.current_scan_result is not None and self.current_scan_result.raw_logs:
             lines.extend(["", "Recent command/log activity:"])
@@ -2251,8 +2417,17 @@ class MainWindow(QMainWindow):
             self.remediation_command_selector.addItem(command)
             self.remediation_command_selector.setItemData(self.remediation_command_selector.count() - 1, command, Qt.ToolTipRole)
         has_commands = self.remediation_command_selector.count() > 0
-        self.copy_command_button.setEnabled(has_commands)
-        self.run_command_button.setEnabled(has_commands)
+        self.selected_finding_hint_label.setVisible(False)
+        self.review_actions_frame.setVisible(True)
+        self.remediation_actions_frame.setVisible(True)
+        command_state = ActionState(
+            enabled=has_commands,
+            visible=True,
+            reason="This finding does not include a copyable remediation command.",
+            requirements=["finding with remediation command"],
+        )
+        apply_action_state(self.copy_command_button, command_state)
+        apply_action_state(self.run_command_button, command_state)
         for name in [
             "add_finding_note_button",
             "mark_reviewed_button",
@@ -2264,7 +2439,7 @@ class MainWindow(QMainWindow):
         ]:
             widget = getattr(self, name, None)
             if widget is not None:
-                widget.setEnabled(True)
+                apply_action_state(widget, ActionState(enabled=True, visible=True))
 
     def _change_findings_sort_order(self) -> None:
         if not hasattr(self, "findings_sort_combo"):
@@ -2293,15 +2468,33 @@ class MainWindow(QMainWindow):
     def _clear_selected_finding_panel(self) -> None:
         self.current_selected_finding = None
         if hasattr(self, "selected_command_panel"):
-            self.selected_command_panel.setPlainText("Select a finding to review details.")
+            self.selected_command_panel.setPlainText(
+                "No finding selected.\n\nSelect a finding in Results to see evidence, impact, false-positive notes, and references here. "
+                "Select a Scan Categories row to see audit command metadata instead."
+            )
         if hasattr(self, "remediation_panel"):
-            self.remediation_panel.setPlainText("Remediation steps and copyable commands will appear here.")
+            self.remediation_panel.setPlainText(
+                "No remediation item selected.\n\nRemediation guidance appears only for selected findings. "
+                "Copyable commands are optional helper actions and may not be the full fix."
+            )
         if hasattr(self, "remediation_command_selector"):
             self.remediation_command_selector.clear()
+        if hasattr(self, "selected_finding_hint_label"):
+            self.selected_finding_hint_label.setVisible(True)
+        if hasattr(self, "review_actions_frame"):
+            self.review_actions_frame.setVisible(False)
+        if hasattr(self, "remediation_actions_frame"):
+            self.remediation_actions_frame.setVisible(False)
         if hasattr(self, "copy_command_button"):
-            self.copy_command_button.setEnabled(False)
+            apply_action_state(
+                self.copy_command_button,
+                ActionState(False, visible=True, reason="Select a finding with a remediation command first.", requirements=["selected finding"]),
+            )
         if hasattr(self, "run_command_button"):
-            self.run_command_button.setEnabled(False)
+            apply_action_state(
+                self.run_command_button,
+                ActionState(False, visible=True, reason="Select a finding with a remediation command first.", requirements=["selected finding"]),
+            )
         for name in [
             "add_finding_note_button",
             "mark_reviewed_button",
@@ -2313,10 +2506,15 @@ class MainWindow(QMainWindow):
         ]:
             widget = getattr(self, name, None)
             if widget is not None:
-                widget.setEnabled(False)
+                apply_action_state(
+                    widget,
+                    ActionState(False, visible=False, reason="Select a finding first.", requirements=["selected finding"]),
+                )
 
     def _render_command_details(self, command) -> str:
         return (
+            "Audit Command Metadata\n"
+            "This is a preview of a registered collection command. It is not remediation guidance.\n\n"
             f"Name: {command.name}\n"
             f"ID: {command.id}\n"
             f"Category: {command.category}\n"
@@ -2333,13 +2531,16 @@ class MainWindow(QMainWindow):
         )
 
     def _render_finding_details(self, finding: dict) -> str:
+        guidance = self._remediation_guidance_for_finding(finding)
         text = (
+            "Finding Evidence Details\n"
+            "Use this section to understand what was observed before choosing any remediation.\n\n"
             f"Title: {finding.get('title', '')}\n"
             f"Severity: {finding.get('severity', 'info')}\n"
             f"Category: {finding.get('category', '')}\n"
             f"Evidence: {finding.get('evidence_summary', finding.get('evidence', ''))}\n\n"
-            f"Why This Matters:\n{finding.get('why_this_matters', '')}\n\n"
-            f"False Positive Notes:\n{finding.get('false_positive_notes', '')}\n"
+            f"Why This Matters:\n{finding.get('why_this_matters') or guidance['why']}\n\n"
+            f"False Positive Notes:\n{finding.get('false_positive_notes') or guidance['false_positive_notes']}\n"
         )
         if finding.get("privilege_escalation_context"):
             text += f"\nPrivilege Escalation:\n{finding.get('privilege_escalation_context', '')}\n"
@@ -2353,25 +2554,68 @@ class MainWindow(QMainWindow):
         return text
 
     def _render_remediation_details(self, finding: dict) -> str:
-        steps = finding.get("remediation_steps", []) or [finding.get("recommended_next_steps", "Review the finding carefully before acting.")]
-        verification = finding.get("verification_steps", []) or ["Re-run the scan and compare against baseline."]
+        guidance = self._remediation_guidance_for_finding(finding)
+        steps = finding.get("remediation_steps", []) or guidance["steps"]
+        verification = finding.get("verification_steps", []) or guidance["verification"]
         references = finding.get("remediation_references", []) or []
         reversibility = "Reversible" if finding.get("reversible", True) else "Potentially hard to reverse"
         requires_admin = "Yes" if finding.get("requires_admin", False) else "No"
         text = (
+            "Remediation Guidance\n"
+            "These steps are selected-finding guidance. Any copyable commands below are optional helpers, not the only possible remediation path.\n\n"
             "What to do:\n- " + "\n- ".join(str(step) for step in steps) + "\n\n"
             f"Risk Level: {finding.get('remediation_risk', 'safe')}\n"
             f"Estimated Impact: {finding.get('estimated_impact', 'low')}\n"
             f"Requires Admin: {requires_admin}\n"
             f"Reversibility: {reversibility}\n\n"
-            f"What Can Go Wrong:\n{finding.get('what_can_go_wrong', '')}\n\n"
-            f"Business Impact:\n{finding.get('business_impact', 'Review the local and organizational impact before changing anything.')}\n\n"
-            f"Local Network Impact:\n{finding.get('local_network_impact', 'Review whether related services or credentials affect nearby systems or shared services.')}\n\n"
+            f"What Can Go Wrong:\n{finding.get('what_can_go_wrong') or guidance['what_can_go_wrong']}\n\n"
+            f"Business Impact:\n{finding.get('business_impact') or guidance['business_impact']}\n\n"
+            f"Local Network Impact:\n{finding.get('local_network_impact') or guidance['local_network_impact']}\n\n"
+            f"Log Handling:\n{guidance['log_guidance']}\n\n"
             "Verification:\n- " + "\n- ".join(str(step) for step in verification)
         )
         if references:
             text += "\n\nReferences:\n- " + "\n- ".join(str(reference) for reference in references)
         return text
+
+    def _remediation_guidance_for_finding(self, finding: dict) -> dict[str, object]:
+        category = str(finding.get("category", "")).lower()
+        title = str(finding.get("title", "")).lower()
+        combined = f"{category} {title}"
+        key = "default"
+        for candidate in ["network", "persistence", "accounts", "files", "process", "vulnerability", "baseline", "monitor"]:
+            if candidate in combined:
+                key = candidate
+                break
+        if "user" in combined or "admin" in combined or "privilege" in combined:
+            key = "accounts"
+        if "cve" in combined or "apple security" in combined or "forecast" in combined:
+            key = "vulnerability"
+        template = DEFAULT_REMEDIATION_BY_CATEGORY[key]
+        category_name = str(finding.get("category", "this category") or "this category")
+        return {
+            "steps": list(template["steps"]),
+            "verification": list(template["verification"]),
+            "why": f"This finding belongs to {category_name}; review the evidence in context before changing system state.",
+            "false_positive_notes": "Confirm expected software, management tooling, updates, developer workflows, and user activity before treating this as malicious.",
+            "what_can_go_wrong": "Acting too quickly can remove legitimate software, destroy evidence, interrupt services, or hide the sequence of events needed for remediation.",
+            "business_impact": "Review whether the affected account, service, app, or network path supports normal work before changing it.",
+            "local_network_impact": "Consider nearby shared services, credentials, VPNs, proxies, and remote access paths before blocking or removing components.",
+            "log_guidance": self._log_guidance_for_finding_category(key),
+        }
+
+    def _log_guidance_for_finding_category(self, category_key: str) -> str:
+        category_map = {
+            "network": "Use Logs > Monitor Events and Scan Command Logs. Refresh before and after remediation; clear only the reviewed category after exporting evidence.",
+            "persistence": "Use Logs > Scan Command Logs and Remediation Actions. Refresh after disabling or removing an item; preserve logs until persistence is verified gone.",
+            "accounts": "Use Logs > Monitor Events and Remediation Actions. Refresh after account changes; clear only after exporting investigation records.",
+            "files": "Use Logs > Scan Command Logs and Remediation Actions. Refresh file/process evidence before cleanup and keep logs until recovery is confirmed.",
+            "process": "Use Logs > Monitor Events and Scan Command Logs. Refresh after stopping a process; preserve the process timeline first.",
+            "vulnerability": "Use Logs > Scan Command Logs and Apple Security Forecast details. Refresh after updating; clear stale scan logs only after the fixed version is verified.",
+            "baseline": "Use Logs > Scan Command Logs. Refresh baseline comparison after marking expected changes; clear only old scan logs after export.",
+            "monitor": "Use Logs > Monitor Events and Application File Logs. Refresh after monitor repair; do not clear monitor events until alert flow is verified.",
+        }
+        return category_map.get(category_key, "Use Logs to refresh the relevant category before and after remediation; export evidence before clearing any category.")
 
     def _selected_remediation_command(self) -> str:
         if not hasattr(self, "remediation_command_selector") or self.remediation_command_selector.count() == 0:
@@ -2519,8 +2763,10 @@ class MainWindow(QMainWindow):
         )
 
     def _refresh_dashboard(self) -> None:
-        self.export_json_button.setEnabled(self.current_scan_active and self.current_scan_result is not None)
-        self.export_html_button.setEnabled(self.current_scan_active and self.current_scan_result is not None)
+        has_scan_result = self.current_scan_active and self.current_scan_result is not None
+        export_state = ActionState(has_scan_result, True, "Run a scan first to generate an exportable report.", ["completed scan"])
+        apply_action_state(self.export_json_button, export_state)
+        apply_action_state(self.export_html_button, export_state)
         latest_scan = None
         findings = []
         if self.current_scan_active:
@@ -2567,6 +2813,7 @@ class MainWindow(QMainWindow):
     def _load_scan_result(self, scan_result: ScanResult) -> None:
         self.current_scan_result = scan_result
         self.current_scan_active = True
+        self._set_results_available(True)
         baseline = scan_result.baseline_diff
         ports = scan_result.artifacts.get("ports", {"listening": [], "active_connections": [], "suspicious_review_needed": [], "errors": []})
         localhost_scan = scan_result.artifacts.get("localhost_scan", {"target": "127.0.0.1", "mode": "safe", "protocol": "tcp", "open_ports": [], "missing_from_enumeration": [], "errors": [], "scanned_port_count": 0})
@@ -2761,13 +3008,80 @@ class MainWindow(QMainWindow):
             return
         scan_logs = [entry.to_dict() for entry in self.current_scan_result.raw_logs[-200:]] if self.current_scan_result is not None else []
         events = [event.to_dict() for event in self.db.recent_background_monitor_events(limit=200)]
+        snapshot = self.db.export_snapshot()
+        command_logs = list(snapshot.get("command_logs", []))[:200]
+        remediation_actions = list(snapshot.get("remediation_actions", []))[:200]
+        app_file_logs = self._read_app_file_logs(limit=200)
         self.logs_panel.set_logs(
             {
-                "summary": f"{len(events)} background events and {len(scan_logs)} scan log entries loaded locally.",
+                "summary": (
+                    f"{len(events)} monitor events, {len(scan_logs) + len(command_logs)} scan command logs, "
+                    f"{len(remediation_actions)} remediation actions, and {len(app_file_logs)} app log lines loaded locally."
+                ),
                 "events": events,
                 "scan_logs": scan_logs,
+                "command_logs": command_logs,
+                "remediation_actions": remediation_actions,
+                "app_file_logs": app_file_logs,
             }
         )
+
+    def _read_app_file_logs(self, limit: int = 200) -> list[dict[str, str]]:
+        path = self.db.logs_dir / "app.log"
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()[-limit:]
+        except OSError:
+            return []
+        rows = []
+        for line in lines:
+            timestamp, _, message = line.partition(" ")
+            rows.append({"timestamp": timestamp, "event_type": "app_log", "severity": "info", "message": message or line})
+        return rows
+
+    def clear_logs_category(self, category: str) -> None:
+        if category == "all":
+            QMessageBox.information(self, "Choose Log Category", "Choose a specific log category before clearing.")
+            return
+        if not self._confirm_clear_logs_category(category):
+            return
+        removed = 0
+        try:
+            if category == "monitor_events":
+                removed = self.db.clear_monitor_events()
+            elif category == "scan_command_logs":
+                removed = self.db.clear_command_logs()
+            elif category == "remediation_actions":
+                removed = self.db.clear_remediation_actions()
+            elif category == "app_file_logs":
+                removed = self._clear_app_file_logs()
+            else:
+                QMessageBox.warning(self, "Unknown Log Category", f"Unknown log category: {category}")
+                return
+            self.statusBar().showMessage(f"cleared {removed} {category.replace('_', ' ')}", 5000)
+            self.refresh_logs_page()
+        except Exception as exc:
+            QMessageBox.warning(self, "Clear Logs Failed", str(exc))
+
+    def _confirm_clear_logs_category(self, category: str) -> bool:
+        labels = {
+            "monitor_events": "monitor events",
+            "scan_command_logs": "scan command logs",
+            "remediation_actions": "remediation action logs",
+            "app_file_logs": "application file logs",
+        }
+        label = labels.get(category, category)
+        message = (
+            f"Clear {label}?\n\n"
+            "This only clears the selected category. Export reports first if these logs are needed for investigation."
+        )
+        return QMessageBox.question(self, "Clear Log Category", message) == QMessageBox.StandardButton.Yes
+
+    def _clear_app_file_logs(self) -> int:
+        path = self.db.logs_dir / "app.log"
+        existing = self._read_app_file_logs(limit=100000)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+        return len(existing)
 
     def refresh_operational_health(self) -> None:
         if not hasattr(self, "operational_health_panel"):
@@ -2915,17 +3229,16 @@ class MainWindow(QMainWindow):
         force: bool = False,
         *,
         initial_load: bool = False,
-        demo: bool = False,
     ) -> None:
         if not hasattr(self, "cve_radar_panel"):
             return
-        if initial_load and not manual and not force and not demo and not self.config.auto_update_apple_security_forecast:
+        if initial_load and not manual and not force and not self.config.auto_update_apple_security_forecast:
             LOGGER.info("Apple Security Forecast initial load from cache only")
             cached = self.cve_radar_engine.load_cached_state()
             self._apply_cve_radar_payload(cached)
             self.statusBar().showMessage("Apple Security Forecast loaded from cache", 3000)
             return
-        if not manual and not force and not demo and not self.config.auto_update_apple_security_forecast:
+        if not manual and not force and not self.config.auto_update_apple_security_forecast:
             cached = self.cve_radar_engine.load_cached_state()
             self._apply_cve_radar_payload(cached)
             self.cve_radar_panel.set_status(str(cached.get("state_text", "Forecast not checked yet")))
@@ -2936,7 +3249,6 @@ class MainWindow(QMainWindow):
                 current_scan_result=self.current_scan_result,
                 manual=manual,
                 force=force,
-                demo=demo,
             )
         except Exception as exc:
             LOGGER.exception("Failed to refresh Apple Security Forecast: %s", exc)
@@ -3125,6 +3437,7 @@ class MainWindow(QMainWindow):
             f"Cache age: {diagnostics.get('cache_age', 'unknown')}",
             f"Apple source status: {diagnostics.get('apple_source_status', 'cache')}",
             f"KEV source status: {diagnostics.get('kev_source_status', 'cache')}",
+            f"NVD enrichment status: {diagnostics.get('nvd_source_status', 'cache')}",
             f"EPSS source status: {diagnostics.get('epss_source_status', 'cache')}",
             f"macOS version/build: {diagnostics.get('inventory', {}).get('macos_version', '')} {diagnostics.get('inventory', {}).get('macos_build', '')}".strip(),
             f"Safari version: {diagnostics.get('inventory', {}).get('safari_version', '')}",
@@ -3136,6 +3449,16 @@ class MainWindow(QMainWindow):
             f"Architecture: {diagnostics.get('inventory', {}).get('architecture', '')}",
             f"Model identifier: {diagnostics.get('inventory', {}).get('device_model', '')}",
             f"Software update check status: {diagnostics.get('inventory', {}).get('software_update_check_status', '')}",
+            f"Advisories downloaded: {diagnostics.get('advisories_downloaded', 0)}",
+            f"Advisories parsed: {diagnostics.get('advisories_parsed', 0)}",
+            f"Advisories within 90 days: {diagnostics.get('advisories_within_90_days', 0)}",
+            f"Invalid advisories: {diagnostics.get('invalid_advisories', 0)}",
+            f"Filtered advisories: {diagnostics.get('filtered_advisories', 0)}",
+            f"Historical advisories: {diagnostics.get('historical_advisories', 0)}",
+            f"Stale advisories hidden: {diagnostics.get('stale_advisories', 0)}",
+            f"Non-Mac advisories hidden: {diagnostics.get('non_mac_advisories_hidden', 0)}",
+            f"Review-needed hidden: {diagnostics.get('review_needed_hidden', 0)}",
+            f"Applicable advisories: {diagnostics.get('applicable_advisories', 0)}",
             f"Cards generated: {diagnostics.get('cards_generated_count', 0)}",
             f"Filtered non-Apple CVEs: {diagnostics.get('filtered_non_apple_cves_count', 0)}",
             f"Hidden review-needed: {diagnostics.get('hidden_review_needed_count', 0)}",
@@ -3149,27 +3472,6 @@ class MainWindow(QMainWindow):
         ]
         dialog = CveRadarDetailsDialog("Forecast Diagnostics", "\n".join(lines), self)
         dialog.exec()
-
-    def generate_demo_apple_security_forecast(self) -> None:
-        LOGGER.info("Generating demo Apple Security Forecast")
-        self.refresh_apple_security_forecast(manual=True, force=True, demo=True)
-
-    def generate_safari_webkit_demo_apple_security_forecast(self) -> None:
-        LOGGER.info("Generating Safari/WebKit demo Apple Security Forecast")
-        forecast = self.cve_radar_engine.generate_safari_webkit_demo_forecast()
-        self.cve_radar_engine.db.record_apple_security_forecast(forecast.to_dict())
-        self.cve_radar_engine.db.record_apple_security_forecast_cards([
-            card.to_dict() if hasattr(card, "to_dict") else dict(card)
-            for card in forecast.cards
-        ])
-        self._apply_cve_radar_payload(forecast.to_dict())
-        self.statusBar().showMessage("Safari/WebKit demo Apple Security Forecast generated", 3000)
-
-    def clear_demo_apple_security_forecast(self) -> None:
-        LOGGER.info("Clearing demo Apple Security Forecast rows")
-        self.cve_radar_engine.clear_demo_forecast()
-        cached = self.cve_radar_engine.load_cached_state()
-        self._apply_cve_radar_payload(cached)
 
     def _review_cve_radar_card(self, card: dict[str, object]) -> None:
         alert_ids = [str(item.get("alert_id", "")) for item in card.get("alerts", [card]) if isinstance(item, dict) and item.get("alert_id")]
@@ -3214,7 +3516,10 @@ class MainWindow(QMainWindow):
             self.sidebar.setCurrentItem(matches[0])
 
     def show_forecast_page(self) -> None:
-        self._show_sidebar_page("Apple Security Forecast")
+        self._show_sidebar_page("Dashboard")
+        if hasattr(self, "cve_radar_panel"):
+            self.cve_radar_panel.setFocus(Qt.OtherFocusReason)
+        self.statusBar().showMessage("Apple Security Forecast is available on the Dashboard", 3000)
 
     def show_intrusion_detection_page(self) -> None:
         self._show_sidebar_page("Intrusion Detection")
@@ -3295,14 +3600,44 @@ class MainWindow(QMainWindow):
 
         self.db.prune_old_logs()
         previous_scan_result = self.db.latest_scan_result()
-
         started_at = utc_now_iso()
+
+        phases = [
+            "Preparing the read-only scan plan and loading the previous baseline.",
+            "Collecting process, network, account, permission, and persistence evidence.",
+            "Running local-only command previews and bounded artifact checks.",
+            "Comparing current evidence with the stored baseline.",
+            "Scoring findings and preparing the report view.",
+        ]
+        progress_dialog = GuidedLongActionDialog("Scan Running", phases, self)
+
+        def _scan_action(progress: Callable[[dict], None]) -> ScanResult:
+            progress({"message": phases[0], "completed": 0, "total": len(phases)})
+            progress({"message": phases[1], "completed": 1, "total": len(phases)})
+            result = self.collectors.run_scan(
+                previous_result=previous_scan_result,
+                scan_mode=scan_mode,
+                localhost_scan_protocol=localhost_protocol,
+            )
+            progress({"message": phases[4], "completed": len(phases) - 1, "total": len(phases)})
+            return result
+
         self.statusBar().showMessage("collector running")
-        scan_result = self.collectors.run_scan(
-            previous_result=previous_scan_result,
-            scan_mode=scan_mode,
-            localhost_scan_protocol=localhost_protocol,
+        progress_dialog.start_action(_scan_action)
+        if progress_dialog.exec() != QDialog.Accepted or not isinstance(progress_dialog.result_data, ScanResult):
+            self.statusBar().showMessage("scan failed", 5000)
+            if progress_dialog.error:
+                QMessageBox.warning(self, "Scan Failed", progress_dialog.error)
+            return
+        scan_result = progress_dialog.result_data
+        self._persist_completed_scan(
+            scan_result=scan_result,
+            started_at=started_at,
+            scan_mode=str(scan_mode),
+            localhost_protocol=str(localhost_protocol),
         )
+
+    def _persist_completed_scan(self, *, scan_result: ScanResult, started_at: str, scan_mode: str, localhost_protocol: str) -> None:
         self.statusBar().showMessage("collector completed")
         completed_at = utc_now_iso()
         score = self.collectors.compute_security_score(scan_result.findings)
@@ -3368,14 +3703,37 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("aggressive local vulnerability review cancelled", 3000)
             return
         self.statusBar().showMessage("aggressive local vulnerability review running")
-        supporting_scan = self.current_scan_result
-        if supporting_scan is None:
-            supporting_scan = self.collectors.run_scan(scan_mode="safe", localhost_scan_protocol="both")
-        localhost_full_scan = supporting_scan.artifacts.get("localhost_full_port_scan")
-        review = self.vulnerability_reviewer.review(
-            current_findings=supporting_scan.findings,
-            localhost_full_scan=localhost_full_scan,
-        )
+        phases = [
+            "Preparing local vulnerability catalogs and scan context.",
+            "Collecting a supporting safe scan if no scan is loaded.",
+            "Reviewing local software, localhost evidence, and best-practice posture.",
+            "Separating confirmed findings from review-needed items.",
+            "Preparing vulnerability results for display.",
+        ]
+        progress_dialog = GuidedLongActionDialog("Aggressive Local Vulnerability Review", phases, self)
+
+        def _review_action(progress: Callable[[dict], None]) -> tuple[ScanResult, dict]:
+            progress({"message": phases[0], "completed": 0, "total": len(phases)})
+            supporting_scan = self.current_scan_result
+            if supporting_scan is None:
+                progress({"message": phases[1], "completed": 1, "total": len(phases)})
+                supporting_scan = self.collectors.run_scan(scan_mode="safe", localhost_scan_protocol="both")
+            localhost_full_scan = supporting_scan.artifacts.get("localhost_full_port_scan")
+            progress({"message": phases[2], "completed": 2, "total": len(phases)})
+            review = self.vulnerability_reviewer.review(
+                current_findings=supporting_scan.findings,
+                localhost_full_scan=localhost_full_scan,
+            )
+            progress({"message": phases[4], "completed": len(phases) - 1, "total": len(phases)})
+            return supporting_scan, review
+
+        progress_dialog.start_action(_review_action)
+        if progress_dialog.exec() != QDialog.Accepted or not isinstance(progress_dialog.result_data, tuple):
+            self.statusBar().showMessage("aggressive local vulnerability review failed", 5000)
+            if progress_dialog.error:
+                QMessageBox.warning(self, "Aggressive Review Failed", progress_dialog.error)
+            return
+        supporting_scan, review = progress_dialog.result_data
         self.current_scan_result = supporting_scan
         self.current_scan_active = True
         supporting_scan.collected_artifacts["catalog_status"] = review["catalog_update_status"]
@@ -3425,7 +3783,29 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("full localhost port scan cancelled", 3000)
             return
         self.statusBar().showMessage("full localhost port scan running")
-        artifact = self.collectors.collect_full_localhost_port_scan()
+        phases = [
+            "Preparing local-only TCP and UDP localhost scan.",
+            "Scanning 127.0.0.1 ports without touching remote network hosts.",
+            "Collecting passive TCP banners where available.",
+            "Summarizing responsive and unknown UDP results.",
+            "Preparing localhost scan results for display.",
+        ]
+        progress_dialog = GuidedLongActionDialog("Full Localhost Port Scan", phases, self)
+
+        def _localhost_action(progress: Callable[[dict], None]) -> dict:
+            progress({"message": phases[0], "completed": 0, "total": len(phases)})
+            progress({"message": phases[1], "completed": 1, "total": len(phases)})
+            artifact = self.collectors.collect_full_localhost_port_scan()
+            progress({"message": phases[4], "completed": len(phases) - 1, "total": len(phases)})
+            return artifact
+
+        progress_dialog.start_action(_localhost_action)
+        if progress_dialog.exec() != QDialog.Accepted or not isinstance(progress_dialog.result_data, dict):
+            self.statusBar().showMessage("full localhost port scan failed", 5000)
+            if progress_dialog.error:
+                QMessageBox.warning(self, "Full Localhost Port Scan Failed", progress_dialog.error)
+            return
+        artifact = progress_dialog.result_data
         if self.current_payload is None:
             self.current_payload = {
                 "findings": [],
@@ -3746,17 +4126,22 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("packet capture failed", 5000)
 
     def _populate_findings(self, findings: list[dict | object]) -> None:
-        findings = self._sort_findings(normalize_findings(findings))
+        findings = self._sort_findings(deduplicate_findings_for_display(normalize_findings(findings)))
         self.current_visible_findings = findings
         self.findings_table.setRowCount(0)
         for finding in findings:
+            evidence_summary = finding.get("evidence_summary", finding.get("evidence", ""))
+            occurrence_count = int(finding.get("occurrence_count", 1) or 1)
+            if occurrence_count > 1:
+                duplicate_category = str(finding.get("duplicate_category", "duplicate_burst") or "duplicate_burst").replace("_", " ")
+                evidence_summary = f"{evidence_summary} | Repeated {occurrence_count} times ({duplicate_category})"
             row = self.findings_table.rowCount()
             self.findings_table.insertRow(row)
             items = [
                 QTableWidgetItem(finding.get("severity", "info")),
                 QTableWidgetItem(finding.get("category", "")),
                 QTableWidgetItem(finding.get("title", "")),
-                QTableWidgetItem(finding.get("evidence_summary", finding.get("evidence", ""))),
+                QTableWidgetItem(evidence_summary),
             ]
             for column, item in enumerate(items):
                 self.findings_table.setItem(row, column, item)
@@ -3765,6 +4150,7 @@ class MainWindow(QMainWindow):
         self._clear_selected_finding_panel()
 
     def _populate_scan_results(self, payload: dict) -> None:
+        self._set_results_available(True)
         self._populate_findings(normalize_findings(payload.get("findings", [])))
         ports = payload["ports"]
         port_rows = [[item.process_name, str(item.pid) if item.pid is not None else "", item.local_address, str(item.port) if item.port is not None else "", item.concern or "Review needed"] for item in ports.get("listening", [])]
@@ -4003,6 +4389,7 @@ class MainWindow(QMainWindow):
         self.current_scan_active = False
         self.last_ui_debug = {}
         self.execution_evidence_findings = []
+        self._set_results_available(False)
         self._populate_findings([])
         self._clear_selected_finding_panel()
         for table_name in [

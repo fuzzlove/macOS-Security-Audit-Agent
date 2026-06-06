@@ -56,6 +56,8 @@ class AuditConfig:
     auto_update_apple_security_forecast: bool = False
     update_interval_hours: int = 6
     show_review_needed_apple_cves: bool = False
+    include_apple_ecosystem_advisories: bool = False
+    developer_mode: bool = False
     include_history_context: bool = False
     recovery_snapshot_dir: Path = field(default_factory=lambda: Path.home() / "Library" / "Application Support" / "MacAuditAgent" / "snapshots")
     cleanup_crash_log_age_days: int = 30

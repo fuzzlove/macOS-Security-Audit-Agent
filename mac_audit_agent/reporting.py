@@ -26,6 +26,33 @@ SCORE_WEIGHTS = {"critical": 25, "high": 15, "medium": 7, "low": 2, "info": 0}
 LOGGER = logging.getLogger(__name__)
 
 
+def _production_forecast_cards(apple_security_forecast: dict) -> list[dict]:
+    cards = apple_security_forecast.get("display_cards", [])
+    if not cards and apple_security_forecast.get("cards"):
+        cards = group_forecast_cards_for_display(apple_security_forecast.get("cards", []))
+    filtered: list[dict] = []
+    for card in cards or []:
+        if not isinstance(card, dict):
+            continue
+        if card.get("simulated") or str(card.get("source_mode", "")).startswith("demo"):
+            continue
+        if str(card.get("applicability", card.get("applicability_confidence", ""))) == "review_needed":
+            continue
+        if str(card.get("forecast_level", "clear")) == "clear":
+            continue
+        family_text = " ".join(
+            [
+                str(card.get("category", "")),
+                str(card.get("affected_local_product", "")),
+                " ".join(str(item) for item in card.get("affected_products", [])),
+            ]
+        ).lower()
+        if any(platform in family_text for platform in ["ios", "iphone", "ipados", "watchos", "tvos", "visionos"]):
+            continue
+        filtered.append(card)
+    return filtered
+
+
 def get_reports_dir() -> Path:
     base = Path.home() / "Library" / "Application Support" / "MacAuditAgent" / "reports"
     base.mkdir(parents=True, exist_ok=True)
@@ -227,6 +254,15 @@ def export_scan_result_json(
     packet_captures = payload.get("collected_artifacts", {}).get("packet_captures", [])
     network_discovery = payload.get("collected_artifacts", {}).get("network_discovery", {})
     apple_security_forecast = payload.get("collected_artifacts", {}).get("apple_security_forecast", payload.get("collected_artifacts", {}).get("cve_radar", {}))
+    if apple_security_forecast:
+        production_cards = _production_forecast_cards(apple_security_forecast)
+        apple_security_forecast = dict(apple_security_forecast)
+        apple_security_forecast["display_cards"] = production_cards
+        apple_security_forecast["cards"] = production_cards
+        apple_security_forecast["alerts"] = production_cards
+        apple_security_forecast["simulated"] = False
+        payload.setdefault("collected_artifacts", {})["apple_security_forecast"] = apple_security_forecast
+        payload.setdefault("collected_artifacts", {})["cve_radar"] = apple_security_forecast
     intrusion_correlation = payload.get("collected_artifacts", {}).get("intrusion_correlation", payload.get("intrusion_correlation", {}))
     execution_evidence = execution_evidence_from_scan(scan_result)
     investigation_priorities = investigation_priorities or build_investigation_priority_report_from_scan(scan_result).to_dict()
@@ -276,14 +312,15 @@ def export_scan_result_json(
         "top_10_count": len(investigation_priorities.get("top_10", [])),
         "full_queue_count": len(investigation_priorities.get("full_queue", [])),
     }
+    production_forecast_cards = _production_forecast_cards(apple_security_forecast) if apple_security_forecast else []
     payload["report_summary"]["apple_security_forecast_summary"] = {
         "generated_at": apple_security_forecast.get("generated_at", apple_security_forecast.get("timestamp", "")) if apple_security_forecast else "",
         "level": apple_security_forecast.get("level", apple_security_forecast.get("forecast_level", "")) if apple_security_forecast else "clear",
         "sources_used": apple_security_forecast.get("sources_used", []) if apple_security_forecast else [],
         "cve_count": apple_security_forecast.get("cve_count", apple_security_forecast.get("cves_evaluated", 0)) if apple_security_forecast else 0,
         "kev_count": apple_security_forecast.get("kev_count", apple_security_forecast.get("kev_matches", 0)) if apple_security_forecast else 0,
-        "cards": apple_security_forecast.get("display_cards", apple_security_forecast.get("cards", [])) if apple_security_forecast else [],
-        "simulated": bool(apple_security_forecast.get("simulated", False)) if apple_security_forecast else False,
+        "cards": production_forecast_cards,
+        "simulated": False,
         "cache_age": apple_security_forecast.get("cache_age_text", "unknown") if apple_security_forecast else "unknown",
         "apple_source_status": apple_security_forecast.get("apple_source_status", "") if apple_security_forecast else "",
         "kev_source_status": apple_security_forecast.get("kev_source_status", "") if apple_security_forecast else "",
@@ -467,6 +504,13 @@ def export_scan_result_html(
     packet_captures = artifacts.get("packet_captures", [])
     network_discovery = artifacts.get("network_discovery", {})
     apple_security_forecast = artifacts.get("apple_security_forecast", artifacts.get("cve_radar", {}))
+    if apple_security_forecast:
+        production_cards = _production_forecast_cards(apple_security_forecast)
+        apple_security_forecast = dict(apple_security_forecast)
+        apple_security_forecast["display_cards"] = production_cards
+        apple_security_forecast["cards"] = production_cards
+        apple_security_forecast["alerts"] = production_cards
+        apple_security_forecast["simulated"] = False
     intrusion_correlation = artifacts.get("intrusion_correlation", {})
     execution_evidence = execution_evidence_from_scan(scan_result)
     investigation_priorities = investigation_priorities or build_investigation_priority_report_from_scan(scan_result).to_dict()
@@ -675,9 +719,7 @@ def export_scan_result_html(
         """
         for item in network_devices
     ) or '<tr><td colspan="11">No devices discovered. Check WiFi interface, subnet detection, and permissions.</td></tr>'
-    forecast_cards = apple_security_forecast.get("display_cards", [])
-    if not forecast_cards and apple_security_forecast.get("cards"):
-        forecast_cards = group_forecast_cards_for_display(apple_security_forecast.get("cards", []))
+    forecast_cards = _production_forecast_cards(apple_security_forecast) if apple_security_forecast else []
     forecast_summary_rows = "".join(
         f"<tr><td>{html.escape(str(label))}</td><td>{html.escape(str(value))}</td></tr>"
         for label, value in [
@@ -692,7 +734,7 @@ def export_scan_result_html(
             ("Apple Source Status", str(apple_security_forecast.get("apple_source_status", "unknown")) or "unknown"),
             ("KEV Source Status", str(apple_security_forecast.get("kev_source_status", "unknown")) or "unknown"),
             ("EPSS Source Status", str(apple_security_forecast.get("epss_source_status", "unknown")) or "unknown"),
-            ("Simulated", "yes" if apple_security_forecast.get("simulated") else "no"),
+            ("Production Cards Only", "yes"),
         ]
     )
     if not apple_security_forecast or not forecast_cards:

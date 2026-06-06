@@ -865,7 +865,7 @@ class NotificationManager:
             return AlertDecision(True, style, "forced_visible_alert", 0, bool(event.severity == "critical"))
         if not bool(settings.get("show_visible_alerts", True)):
             return AlertDecision(False, "neutral_grey", "visible alerts disabled", 0, False)
-        if not (getattr(event, "rule_id", "") or getattr(event, "trigger_rule_id", "")):
+        if not (getattr(event, "rule_id", "") or getattr(event, "trigger_rule_id", "")) and event.severity not in {"high", "critical"}:
             return AlertDecision(False, "neutral_grey", "missing rule_id", 0, False)
         if self._is_browser_helper_process(event) and not settings.get("browser_capture_process_popup", False):
             return AlertDecision(False, "neutral_grey", "browser helper event is log-only by default", 0, False)
@@ -1637,6 +1637,7 @@ class NotificationManager:
             self.db.set_background_monitor_state("last_overlay_error", "")
             self.db.set_background_monitor_state("last_alert_displayed_at", event.timestamp)
             self.db.set_background_monitor_state(self._visible_alert_last_key(event), event.timestamp)
+            self._play_visible_alert_sound(event)
         self._record_alert_delivery(
             event,
             overlay_attempted=True,
@@ -1768,6 +1769,20 @@ class NotificationManager:
             return self.db.get_background_monitor_state("moisture_detection_sound", "Basso") or "Basso"
         return str(settings["notification_sound"])
 
+    def _play_visible_alert_sound(self, event: BackgroundMonitorEvent) -> None:
+        if event.severity not in {"high", "critical"}:
+            return
+        sound = self._sound_for(event, self.settings()).strip()
+        if not sound:
+            return
+        sound_path = Path("/System/Library/Sounds") / f"{sound}.aiff"
+        command = ["/usr/bin/afplay", str(sound_path)] if sound_path.exists() else [OSASCRIPT_BIN, "-e", f'beep 1']
+        try:
+            self.popen_factory(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.db.set_background_monitor_state("last_visible_alert_sound", sound)
+        except Exception as exc:
+            self.db.set_background_monitor_state("last_visible_alert_sound_error", str(exc))
+
     def _write_fallback_log(self, message: str) -> None:
         try:
             FALLBACK_MONITOR_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -1891,6 +1906,10 @@ class NotificationManager:
             return
 
     def _overlay_title_for(self, event: BackgroundMonitorEvent, decision: AlertDecision) -> str:
+        if event.event_type == "lockdown_mode_requires_user_action":
+            return "Lockdown Mode Requires User Action"
+        if event.event_type == "emergency_lockdown_failed":
+            return "Emergency Lockdown Failed"
         if event.event_type in {"input_activity_resumed_after_idle", "idle_resume_detected", "mouse_or_keyboard_activity_after_idle"}:
             return "Authorized Use Notice"
         if event.event_type in {"apple_security_forecast_elevated", "cve_forecast_level_increased"}:
@@ -1899,6 +1918,16 @@ class NotificationManager:
         return readable or "Security Alert"
 
     def _overlay_details_for(self, event: BackgroundMonitorEvent, decision: AlertDecision) -> str:
+        if event.event_type == "lockdown_mode_requires_user_action":
+            return (
+                "A critical security event triggered Emergency Lockdown policy, but macOS requires user confirmation to enable Lockdown Mode. "
+                "The settings panel has been opened. Complete Turn On & Restart to enable Lockdown Mode."
+            )
+        if event.event_type == "emergency_lockdown_failed":
+            return (
+                "Automatic Lockdown Mode activation was requested but could not be verified. "
+                f"{event.evidence} Use Lockdown Diagnostics before assuming the Mac is protected."
+            )
         if event.event_type in {"input_activity_resumed_after_idle", "idle_resume_detected", "mouse_or_keyboard_activity_after_idle"}:
             return (
                 "Activity was detected after a period of inactivity. "
@@ -1906,11 +1935,18 @@ class NotificationManager:
             )
         if event.event_type in {"apple_security_forecast_elevated", "apple_security_forecast_urgent", "cve_forecast_level_increased"}:
             return "Apple-related security advisory or forecast changed. Review update guidance."
-        return event.evidence or event.recommendation or "Review the event timeline."
+        base = event.evidence or event.recommendation or "Review the event timeline."
+        if event.severity in {"high", "critical"}:
+            return f"{base} Review Monitor Logs and the event timeline before remediation."
+        return base
 
     def _overlay_buttons_for(self, event: BackgroundMonitorEvent) -> list[str]:
         buttons = ["Acknowledge"]
-        if event.event_type in {"input_activity_resumed_after_idle", "idle_resume_detected", "mouse_or_keyboard_activity_after_idle"}:
+        if event.event_type == "lockdown_mode_requires_user_action":
+            buttons = ["Open Lockdown Settings", "View Evidence Snapshot", "Acknowledge"]
+        elif event.event_type == "emergency_lockdown_failed":
+            buttons = ["View Diagnostics", "Open Hardening Center", "Create Evidence Snapshot"]
+        elif event.event_type in {"input_activity_resumed_after_idle", "idle_resume_detected", "mouse_or_keyboard_activity_after_idle"}:
             buttons = ["Open Timeline", "Preserve Evidence Snapshot", "Acknowledge"]
         elif event.event_type in {"apple_security_forecast_elevated", "apple_security_forecast_urgent", "cve_forecast_level_increased"}:
             buttons = ["Open Timeline", "Acknowledge"]

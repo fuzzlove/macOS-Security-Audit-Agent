@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from mac_audit_agent.intrusion_correlation import IntrusionCorrelationReport
+from mac_audit_agent.ui.action_state import ActionState, apply_action_state
 
 
 def _make_table(headers: list[str]) -> QTableWidget:
@@ -150,6 +151,16 @@ class IntrusionDetectionPanel(QFrame):
         self._set_patterns(list(payload.get("patterns", [])))
         self._set_timeline(list(payload.get("recent_events", [])))
         self.ai_summary_view.setPlainText(self._format_ai_summary(payload.get("ai_summary", {})))
+        has_summary = bool(payload.get("ai_summary"))
+        apply_action_state(
+            self.ai_summary_button,
+            ActionState(
+                enabled=has_summary,
+                visible=True,
+                reason="No local AI-ready summary is available yet. Refresh after scan or monitor events are available.",
+                requirements=["scan result or monitor events"],
+            ),
+        )
         self._refresh_details()
 
     def _set_patterns(self, patterns: list[dict[str, Any]]) -> None:
@@ -208,6 +219,7 @@ class IntrusionDetectionPanel(QFrame):
             lines.append("False positive notes:")
             lines.extend(f"- {item}" for item in pattern.get("false_positive_notes", []))
             self.details.setPlainText("\n".join(lines))
+            apply_action_state(self.context_button, ActionState(enabled=True, visible=True))
             return
         if event:
             lines = [
@@ -218,8 +230,13 @@ class IntrusionDetectionPanel(QFrame):
                 f"Correlation: {event.get('correlation_id', '')}",
             ]
             self.details.setPlainText("\n".join(lines))
+            apply_action_state(self.context_button, ActionState(enabled=True, visible=True))
             return
         self.details.setPlainText("No pattern or event selected.")
+        apply_action_state(
+            self.context_button,
+            ActionState(False, visible=False, reason="Select a pattern or timeline event to show context.", requirements=["selected pattern or event"]),
+        )
 
     def _current_item(self, table: QTableWidget) -> dict[str, Any] | None:
         selected = table.currentItem()
@@ -251,4 +268,3 @@ class IntrusionDetectionPanel(QFrame):
         lines.append("Evidence gaps:")
         lines.extend(f"- {item}" for item in summary.get("evidence_gaps", []))
         return "\n".join(lines)
-

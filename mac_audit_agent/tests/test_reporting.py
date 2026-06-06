@@ -484,6 +484,62 @@ def test_reports_include_apple_security_forecast_section(tmp_path: Path) -> None
     assert "Sources Used" in html_content
 
 
+def test_reports_exclude_demo_stale_and_unrelated_forecast_cards(tmp_path: Path) -> None:
+    scan_result = make_scan_result()
+    scan_result.collected_artifacts["apple_security_forecast"] = {
+        "generated_at": "2026-06-01T00:00:00+00:00",
+        "level": "elevated",
+        "display_cards": [
+            {
+                "card_id": "prod",
+                "title": "macOS Security Update Available",
+                "forecast_level": "elevated",
+                "source": "apple",
+                "affected_local_product": "macOS",
+                "cves": ["CVE-2026-0001"],
+                "recommended_action": "Review Software Update.",
+            },
+            {
+                "card_id": "demo",
+                "title": "Demo Forecast",
+                "forecast_level": "urgent",
+                "source": "apple",
+                "simulated": True,
+                "cves": ["DEMO-CVE"],
+            },
+            {
+                "card_id": "ios",
+                "title": "iOS Security Update",
+                "forecast_level": "urgent",
+                "source": "apple",
+                "affected_local_product": "iOS",
+                "affected_products": ["iOS"],
+                "cves": ["CVE-2026-IOS"],
+            },
+            {
+                "card_id": "review",
+                "title": "Review Needed",
+                "forecast_level": "watch",
+                "source": "apple",
+                "applicability": "review_needed",
+                "cves": ["CVE-2026-REVIEW"],
+            },
+        ],
+    }
+
+    json_path = export_scan_result_json(scan_result, tmp_path / "scan.json")
+    html_path = export_scan_result_html(scan_result, tmp_path / "scan.html")
+    json_content = json_path.read_text(encoding="utf-8")
+    html_content = html_path.read_text(encoding="utf-8")
+
+    assert "macOS Security Update Available" in html_content
+    assert "Demo Forecast" not in html_content
+    assert "iOS Security Update" not in html_content
+    assert "CVE-2026-REVIEW" not in html_content
+    assert "Demo Forecast" not in json_content
+    assert "CVE-2026-IOS" not in json_content
+
+
 def test_reports_include_investigation_priorities_section(tmp_path: Path) -> None:
     scan_result = make_scan_result()
     json_path = export_scan_result_json(scan_result, tmp_path / "scan.json")

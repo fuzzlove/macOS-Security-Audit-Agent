@@ -95,6 +95,6 @@ def test_operational_health_report_includes_core_components(tmp_path: Path) -> N
     )
     report = engine.build_report()
     components = {check.component for check in report.checks}
-    assert {"App", "SQLite", "Rule Registry", "System Monitor", "Notifier", "User LaunchAgent", "System LaunchDaemon", "Detector", "Apple Security Forecast", "Report Export"} <= components
+    assert {"App", "Source Integrity", "SQLite", "Rule Registry", "System Monitor", "Notifier", "User LaunchAgent", "System LaunchDaemon", "Detector", "Apple Security Forecast", "Report Export"} <= components
     assert report.health_score > 0
     assert report.overall_status in {"healthy", "repair recommended", "degraded", "broken"}

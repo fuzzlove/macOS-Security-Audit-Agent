@@ -35,6 +35,16 @@ SURFACE_SEVERITIES = {"critical", "high"}
 LOGGER = logging.getLogger(__name__)
 
 
+def _is_simulated_forecast_payload(payload: dict[str, Any]) -> bool:
+    nested_payload = payload.get("payload_json", {}) if isinstance(payload.get("payload_json", {}), dict) else {}
+    return bool(
+        payload.get("simulated")
+        or str(payload.get("source_mode", "")).startswith("demo")
+        or nested_payload.get("simulated")
+        or str(nested_payload.get("source_mode", "")).startswith("demo")
+    )
+
+
 def _run_command(command: list[str], timeout: int = 5) -> str:
     executable = command[0] if Path(command[0]).exists() else shutil.which(command[0])
     if not executable:
@@ -737,9 +747,14 @@ def _source_trace(self, item: dict[str, Any], matches: list[dict[str, Any]], kev
 
 
 APPLE_SECURITY_FAMILY_KEYS = {"macos", "safari", "webkit", "xcode", "commandlinetools", "apple"}
-APPLE_FORECAST_LEVELS = {"clear": 0, "watch": 1, "elevated": 2, "urgent": 3}
+APPLE_MAC_FOCUSED_FAMILY_KEYS = {"macos", "osx", "safari", "webkit", "xcode", "commandlinetools", "commandlinetool"}
+APPLE_ECOSYSTEM_ONLY_KEYS = {"iphone", "iphoneos", "ios", "ipad", "ipados", "watchos", "tvos", "visionos"}
+APPLE_FORECAST_LEVELS = {"clear": 0, "watch": 1, "elevated": 2, "urgent": 3, "critical": 4}
 APPLE_FORECAST_LEVEL_FOR_SEVERITY = {"critical": "urgent", "high": "elevated", "medium": "watch", "low": "watch", "info": "clear"}
 SEVERITY_RANKS = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+APPLE_FORECAST_DEFAULT_ACTIVE_DAYS = 90
+APPLE_FORECAST_MAX_ACTIVE_DAYS = 180
+APPLE_FORECAST_MIN_YEAR = 2020
 
 
 def _forecast_level_rank(level: str) -> int:
@@ -761,6 +776,14 @@ def _version_is_older(installed: str, fixed: str) -> bool | None:
         return compare_versions(installed, fixed) < 0
     except Exception:
         return None
+
+
+def _advisory_dt(item: dict[str, Any]) -> datetime | None:
+    for key in ("advisory_date", "published_date", "published", "last_modified_date", "lastModified"):
+        parsed = _utc_to_dt(str(item.get(key, "")))
+        if parsed:
+            return parsed
+    return None
 
 
 def collect_apple_security_inventory() -> dict[str, Any]:
@@ -950,6 +973,9 @@ class AppleSecurityForecastCard:
         self.detected_product = self.affected_local_product
         self.source_trace = str(kwargs.get("source_trace", ""))
         self.card_type = str(kwargs.get("card_type", "forecast"))
+        self.false_positive_review = kwargs.get("false_positive_review", {})
+        self.planning_guidance = str(kwargs.get("planning_guidance", ""))
+        self.forecast_phrase = str(kwargs.get("forecast_phrase", ""))
 
     def to_dict(self) -> dict[str, Any]:
         payload = json_safe(self.__dict__)
@@ -998,11 +1024,13 @@ class AppleSecurityForecast:
         self.source_mode = str(kwargs.get("source_mode", "live"))
         self.apple_source_status = str(kwargs.get("apple_source_status", ""))
         self.kev_source_status = str(kwargs.get("kev_source_status", ""))
+        self.nvd_source_status = str(kwargs.get("nvd_source_status", ""))
         self.epss_source_status = str(kwargs.get("epss_source_status", ""))
         self.filtered_non_apple_cves_count = int(kwargs.get("filtered_non_apple_cves_count", 0))
         self.hidden_review_needed_count = int(kwargs.get("hidden_review_needed_count", 0))
         self.last_successful_update_at = str(kwargs.get("last_successful_update_at", ""))
         self.card_count = int(kwargs.get("card_count", len(self.cards)))
+        self.diagnostics = kwargs.get("diagnostics", {})
 
     def to_dict(self) -> dict[str, Any]:
         payload = json_safe(self.__dict__)
@@ -1013,7 +1041,7 @@ class AppleSecurityForecast:
         payload.setdefault("timestamp", self.generated_at)
         payload.setdefault("applicable_cves", len(payload["display_cards"]))
         payload.setdefault("kev_matches", self.kev_count)
-        payload.setdefault("apple_updates_available", self.level in {"elevated", "urgent"})
+        payload.setdefault("apple_updates_available", self.level in {"elevated", "urgent", "critical"})
         payload.setdefault("state_text", self.state_text)
         payload.setdefault("why_no_cards", self.why_no_cards)
         payload.setdefault("last_error", self.last_error)
@@ -1028,11 +1056,13 @@ class AppleSecurityForecast:
         payload.setdefault("source_mode", self.source_mode)
         payload.setdefault("apple_source_status", self.apple_source_status)
         payload.setdefault("kev_source_status", self.kev_source_status)
+        payload.setdefault("nvd_source_status", self.nvd_source_status)
         payload.setdefault("epss_source_status", self.epss_source_status)
         payload.setdefault("filtered_non_apple_cves_count", self.filtered_non_apple_cves_count)
         payload.setdefault("hidden_review_needed_count", self.hidden_review_needed_count)
         payload.setdefault("last_successful_update_at", self.last_successful_update_at)
         payload.setdefault("card_count", self.card_count)
+        payload.setdefault("diagnostics", self.diagnostics)
         return payload
 
 
@@ -1044,13 +1074,21 @@ class AppleSecurityForecastEngine:
         self.updater = VulnerabilityCatalogUpdater(self.cache_path)
         self.update_interval_seconds = max(60, int(getattr(self.config, "update_interval_hours", 6) or 6) * 3600)
         self.auto_update_enabled = bool(getattr(self.config, "auto_update_apple_security_forecast", False))
+        self._last_diagnostics: dict[str, int] = {}
 
     def load_cached_state(self, *, limit: int = 200) -> dict[str, Any]:
         forecast = self.db.latest_apple_security_forecast()
         cards = _normalize_card_list(self.db.list_apple_security_forecast_cards(limit=limit))
         forecast_payload = forecast.get("payload_json", {}) if forecast else {}
+        nested_payload = forecast_payload.get("payload_json", {}) if isinstance(forecast_payload.get("payload_json", {}), dict) else {}
+        if _is_simulated_forecast_payload(forecast_payload):
+            forecast = None
+            forecast_payload = {}
+            cards = []
+        cards = [card for card in cards if not card.get("simulated") and not str(card.get("source_mode", "")).startswith("demo")]
         if forecast_payload and not cards:
             cards = _normalize_card_list(forecast_payload.get("cards", [])) or _normalize_card_list(forecast_payload.get("display_cards", []))
+            cards = [card for card in cards if not card.get("simulated") and not str(card.get("source_mode", "")).startswith("demo")]
         inventory = forecast_payload.get("inventory", {})
         if not inventory:
             cached_inventory = self.db.latest_apple_security_cve_cache()
@@ -1076,7 +1114,7 @@ class AppleSecurityForecastEngine:
             "cves_evaluated": forecast_payload.get("cve_count", legacy_payload.get("cves_evaluated", 0)) if forecast else legacy_payload.get("cves_evaluated", 0),
             "applicable_cves": len(display_cards),
             "kev_matches": sum(1 for card in cards if card.get("kev_cves") or card.get("kev")),
-            "apple_updates_available": any(card.get("forecast_level") in {"elevated", "urgent"} for card in cards) or bool(forecast_payload.get("catalog_update_status") == "updated" and inventory.get("software_update_available")),
+            "apple_updates_available": any(card.get("forecast_level") in {"elevated", "urgent", "critical"} for card in cards) or bool(forecast_payload.get("catalog_update_status") == "updated" and inventory.get("software_update_available")),
             "alerts": cards,
             "display_cards": display_cards,
             "inventory": inventory,
@@ -1085,11 +1123,13 @@ class AppleSecurityForecastEngine:
             "why_no_cards": why_no_cards,
             "hidden_review_needed_count": hidden_review_needed,
             "filtered_non_apple_cves_count": max(0, int(legacy_payload.get("cves_evaluated", 0)) - len(cards)) if legacy_payload else 0,
+            "diagnostics": forecast_payload.get("diagnostics", {}),
             "last_error": ", ".join(forecast.get("errors", [])) if forecast else ", ".join(legacy_payload.get("errors", [])) if legacy_payload else "",
-            "simulated": bool(forecast_payload.get("simulated", False)),
-            "source_mode": str(forecast_payload.get("source_mode", legacy_payload.get("source_mode", "live"))),
+            "simulated": False,
+            "source_mode": "live",
             "apple_source_status": str(forecast_payload.get("apple_source_status", legacy.get("source", "") if legacy else "")),
             "kev_source_status": str(forecast_payload.get("kev_source_status", "")),
+            "nvd_source_status": str(forecast_payload.get("nvd_source_status", "")),
             "epss_source_status": str(forecast_payload.get("epss_source_status", "")),
             "last_successful_update_at": str(forecast.get("generated_at", "") if forecast else legacy.get("updated_at", "") if legacy else ""),
             "card_count": len(cards),
@@ -1116,12 +1156,14 @@ class AppleSecurityForecastEngine:
                 return str(payload.get("state_text", "Clear")), str(payload.get("why_no_cards", ""))
             return "Clear — no applicable Apple security updates found", "No applicable Apple security advisories matched this Mac."
         level = str(payload.get("level") or payload.get("forecast_level") or "watch")
+        if level == "critical":
+            return "Update Today", "A known-exploited Apple issue appears to match this Mac, and an Apple update path is available."
         if level == "urgent":
-            return "Urgent", "Known-exploited or critical Apple security items likely apply to this Mac."
+            return "Plan Update", "A known-exploited or high-impact Apple item may apply. Verify Software Update and plan a timely update."
         if level == "elevated":
-            return "Elevated", "Apple security update may apply to this Mac."
+            return "Check Today", "Apple security update guidance may apply. Check Software Update when convenient today."
         if level == "watch":
-            return "Watch", "Only review-needed or incomplete-mapping Apple items were found."
+            return "Watch", "Apple advisory data exists, but the local match is not strong enough to recommend immediate action."
         return "Clear — no applicable Apple security updates found", "No applicable Apple security forecast cards were found."
 
     def _source_status(self, catalog: dict[str, Any]) -> dict[str, str]:
@@ -1130,6 +1172,7 @@ class AppleSecurityForecastEngine:
         return {
             "apple": "updated" if "Apple security releases" in sources else "degraded" if any(str(item).startswith("apple:") for item in errors) else "cache",
             "kev": "updated" if "CISA KEV" in sources else "degraded" if any(str(item).startswith("kev:") for item in errors) else "cache",
+            "nvd": "updated" if "NVD CVE API" in sources else "degraded" if any(str(item).startswith("nvd:") for item in errors) else "cache",
             "epss": "updated" if "FIRST EPSS" in sources else "degraded" if any(str(item).startswith("epss:") for item in errors) else "cache",
         }
 
@@ -1139,13 +1182,9 @@ class AppleSecurityForecastEngine:
         current_scan_result: ScanResult | None = None,
         manual: bool = False,
         force: bool = False,
-        demo: bool = False,
     ) -> dict[str, Any]:
-        LOGGER.info("Apple Security Forecast update requested manual=%s force=%s demo=%s", manual, force, demo)
-        if demo:
-            forecast = self.generate_demo_forecast()
-        else:
-            forecast = self.generate_forecast(current_scan_result=current_scan_result, manual=manual, force=force)
+        LOGGER.info("Apple Security Forecast update requested manual=%s force=%s", manual, force)
+        forecast = self.generate_forecast(current_scan_result=current_scan_result, manual=manual, force=force)
         self.db.record_apple_security_forecast(forecast.to_dict())
         self.db.record_apple_security_forecast_cards([_card_payload(card) for card in forecast.cards])
         LOGGER.info("Apple Security Forecast stored forecast_id=%s cards=%d level=%s simulated=%s", forecast.forecast_id, len(forecast.cards), forecast.level, forecast.simulated)
@@ -1160,6 +1199,10 @@ class AppleSecurityForecastEngine:
     ) -> AppleSecurityForecast:
         cached = self.db.latest_apple_security_forecast()
         previous_level = str(cached.get("level", "clear")) if cached else "clear"
+        if cached and (_is_simulated_forecast_payload(cached) or _is_simulated_forecast_payload(cached.get("payload_json", {}) if isinstance(cached.get("payload_json", {}), dict) else {})):
+            self.purge_simulated_forecasts()
+            cached = None
+            previous_level = "clear"
         if cached and not force and not manual and not self.auto_update_enabled:
             payload = dict(cached.get("payload_json", {}))
             payload.setdefault("cards", self.db.list_apple_security_forecast_cards(limit=200))
@@ -1209,12 +1252,12 @@ class AppleSecurityForecastEngine:
         cards = group_forecast_cards_for_display([card.to_dict() for card in cards])
         forecast_level = self._forecast_level(cards, inventory)
         current_level = forecast_level
-        should_announce = _forecast_level_rank(current_level) > _forecast_level_rank(previous_level) and current_level in {"elevated", "urgent"}
+        should_announce = _forecast_level_rank(current_level) > _forecast_level_rank(previous_level) and current_level in {"elevated", "urgent", "critical"}
         summary = self._summary_text(current_level, cards, inventory)
         affected_products = sorted({str(card.get("affected_local_product", "")) for card in cards if card.get("affected_local_product")})
         highest_severity = "info"
         for card in cards:
-            highest_severity = _forecast_level_max(highest_severity, str(card.get("highest_severity", "info")))
+            highest_severity = _severity_max(highest_severity, str(card.get("highest_severity", "info")))
         state_text, why_no_cards = self._state_and_explanation(
             {
                 "level": current_level,
@@ -1252,166 +1295,18 @@ class AppleSecurityForecastEngine:
             source_mode="live",
             apple_source_status=self._source_status(catalog).get("apple", ""),
             kev_source_status=self._source_status(catalog).get("kev", ""),
+            nvd_source_status=self._source_status(catalog).get("nvd", ""),
             epss_source_status=self._source_status(catalog).get("epss", ""),
             filtered_non_apple_cves_count=int(catalog.get("cves_evaluated", len(catalog.get("cves", [])))) - len(cards),
             hidden_review_needed_count=sum(1 for card in cards if str(card.get("applicability", "")) == "review_needed"),
             last_successful_update_at=utc_now_iso() if not catalog.get("errors") else "",
             card_count=len(cards),
+            diagnostics=self._last_diagnostics,
         )
         LOGGER.info("Apple Security Forecast built forecast_id=%s level=%s cards=%d announce=%s", forecast.forecast_id, forecast.level, len(cards), forecast.should_announce)
         return forecast
 
-    def generate_demo_forecast(self) -> AppleSecurityForecast:
-        inventory = collect_apple_security_inventory()
-        demo_cards = [
-            AppleSecurityForecastCard(
-                card_id="demo-safari-webkit",
-                forecast_id="demo-apple-security",
-                title="Safari/WebKit Security Update",
-                category="Safari/WebKit",
-                forecast_level="elevated",
-                simulated=True,
-                affected_local_product="Safari",
-                detected_version=inventory.get("safari_version", "") or "17.0",
-                fixed_version="17.1",
-                cves=["DEMO-CVE-APPLE-SAFARI-1"],
-                kev_cves=[],
-                epss_high_cves=[],
-                applicability="confirmed_applicable",
-                confidence="high",
-                why_shown="Demo Safari/WebKit forecast card for UI verification.",
-                what_to_do="Review Software Update and install the Safari/WebKit security update.",
-                update_path="System Settings > General > Software Update",
-                references=[APPLE_SECURITY_RELEASES_URL],
-                status="new",
-                summary="Demo Safari/WebKit forecast card",
-                affected_products=["Safari"],
-                highest_severity="high",
-                source="apple",
-            ),
-            AppleSecurityForecastCard(
-                card_id="demo-kev-macos",
-                forecast_id="demo-apple-security",
-                title="Known Exploited Apple Vulnerability",
-                category="Known Exploited",
-                forecast_level="urgent",
-                simulated=True,
-                affected_local_product="macOS",
-                detected_version=inventory.get("macos_version", "") or "14.0",
-                fixed_version="14.1",
-                cves=["DEMO-CVE-APPLE-KEV-1"],
-                kev_cves=["DEMO-CVE-APPLE-KEV-1"],
-                epss_high_cves=["DEMO-CVE-APPLE-KEV-1"],
-                applicability="confirmed_applicable",
-                confidence="high",
-                why_shown="Demo KEV Apple forecast card for UI verification.",
-                what_to_do="Review Software Update and prioritize the Apple release notes.",
-                update_path="System Settings > General > Software Update",
-                references=[APPLE_SECURITY_RELEASES_URL, CISA_KEV_URL],
-                status="new",
-                summary="Demo known exploited Apple forecast card",
-                affected_products=["macOS"],
-                highest_severity="critical",
-                source="apple",
-            ),
-        ]
-        forecast = AppleSecurityForecast(
-            forecast_id="demo-apple-security",
-            generated_at=utc_now_iso(),
-            level="urgent",
-            summary="Demo Apple Security Forecast for UI verification.",
-            state_text="Urgent",
-            why_no_cards="Demo forecast contains visible cards.",
-            last_error="",
-            affected_products=["Safari", "macOS"],
-            cve_count=2,
-            kev_count=1,
-            highest_severity="critical",
-            recommended_action="Review Software Update and the Apple security release notes.",
-            cards=demo_cards,
-            previous_level="watch",
-            next_check_at=(datetime.now(timezone.utc) + timedelta(seconds=self.update_interval_seconds)).isoformat(),
-            source_age_hours=0,
-            cache_age_text="demo",
-            should_announce=False,
-            sources_used=["demo"],
-            inventory=inventory,
-            catalog_update_status="demo",
-            errors=[],
-            simulated=True,
-            source_mode="demo",
-            apple_source_status="demo",
-            kev_source_status="demo",
-            epss_source_status="demo",
-            filtered_non_apple_cves_count=0,
-            hidden_review_needed_count=0,
-            last_successful_update_at=utc_now_iso(),
-            card_count=2,
-        )
-        return forecast
-
-    def generate_safari_webkit_demo_forecast(self) -> AppleSecurityForecast:
-        inventory = collect_apple_security_inventory()
-        demo_card = AppleSecurityForecastCard(
-            card_id="demo-safari-webkit-only",
-            forecast_id="demo-safari-webkit-forecast",
-            title="Safari/WebKit Security Update",
-            category="Safari/WebKit",
-            forecast_level="elevated",
-            simulated=True,
-            affected_local_product="Safari",
-            detected_version=inventory.get("safari_version", "") or "not detected",
-            fixed_version="demo-fixed-version",
-            cves=["DEMO-CVE-APPLE-SAFARI-WEBKIT"],
-            kev_cves=[],
-            epss_high_cves=[],
-            applicability="likely_applicable",
-            confidence="medium",
-            why_shown="Demo Safari/WebKit forecast card generated from installed Safari/macOS inventory only. Safari does not need to be open and Private Browsing state is not inspected.",
-            what_to_do="Review Software Update and Apple Safari/WebKit security guidance.",
-            update_path="System Settings > General > Software Update",
-            references=[APPLE_SECURITY_RELEASES_URL],
-            status="new",
-            summary="Demo Safari/WebKit forecast card",
-            affected_products=["Safari", "WebKit"],
-            highest_severity="high",
-            source="apple",
-        )
-        return AppleSecurityForecast(
-            forecast_id="demo-safari-webkit-forecast",
-            generated_at=utc_now_iso(),
-            level="elevated",
-            summary="Demo Safari/WebKit Apple Security Forecast for UI verification.",
-            state_text="Elevated",
-            why_no_cards="Demo forecast contains a visible Safari/WebKit card.",
-            last_error="",
-            affected_products=["Safari", "WebKit"],
-            cve_count=1,
-            kev_count=0,
-            highest_severity="high",
-            recommended_action="Review Software Update for Safari/WebKit security updates.",
-            cards=[demo_card],
-            previous_level="watch",
-            next_check_at=(datetime.now(timezone.utc) + timedelta(seconds=self.update_interval_seconds)).isoformat(),
-            source_age_hours=0,
-            cache_age_text="demo",
-            should_announce=False,
-            sources_used=["demo"],
-            inventory=inventory,
-            catalog_update_status="demo",
-            errors=[],
-            simulated=True,
-            source_mode="demo-safari-webkit",
-            apple_source_status="demo",
-            kev_source_status="demo",
-            epss_source_status="demo",
-            filtered_non_apple_cves_count=0,
-            hidden_review_needed_count=0,
-            last_successful_update_at=utc_now_iso(),
-            card_count=1,
-        )
-
-    def clear_demo_forecast(self) -> None:
+    def purge_simulated_forecasts(self) -> None:
         rows = self.db.list_apple_security_forecast_cards(limit=500)
         demo_forecast_ids = {str(item.get("forecast_id", "")) for item in rows if bool(item.get("simulated", False))}
         demo_forecast_ids.update(
@@ -1438,12 +1333,14 @@ class AppleSecurityForecastEngine:
         apple_status = "updated" if "Apple security releases" in latest_payload.get("sources_used", []) else "cache"
         kev_status = "updated" if "CISA KEV" in latest_payload.get("sources_used", []) else "cache"
         epss_status = "updated" if "FIRST EPSS" in latest_payload.get("sources_used", []) else "cache"
+        nvd_status = "updated" if "NVD CVE API" in latest_payload.get("sources_used", []) else "cache"
         return {
             "last_update_time": latest_forecast.get("generated_at", "") or legacy_cache.get("updated_at", ""),
             "last_successful_update_time": latest_payload.get("last_successful_update_at", latest_forecast.get("generated_at", "")),
             "cache_age": latest_payload.get("cache_age_text", "unknown"),
             "apple_source_status": latest_payload.get("apple_source_status", apple_status),
             "kev_source_status": latest_payload.get("kev_source_status", kev_status),
+            "nvd_source_status": latest_payload.get("nvd_source_status", nvd_status),
             "epss_source_status": latest_payload.get("epss_source_status", epss_status),
             "inventory": {
                 "macos_version": inventory.get("macos_version", ""),
@@ -1461,6 +1358,16 @@ class AppleSecurityForecastEngine:
                 "privacy_guarantee": inventory.get("privacy_guarantee", ""),
             },
             "cards_generated_count": len(latest_cards),
+            "advisories_downloaded": int(latest_payload.get("diagnostics", {}).get("advisories_downloaded", 0)),
+            "advisories_parsed": int(latest_payload.get("diagnostics", {}).get("advisories_parsed", 0)),
+            "advisories_within_90_days": int(latest_payload.get("diagnostics", {}).get("advisories_within_90_days", 0)),
+            "invalid_advisories": int(latest_payload.get("diagnostics", {}).get("invalid_advisories", 0)),
+            "filtered_advisories": int(latest_payload.get("diagnostics", {}).get("filtered_advisories", 0)),
+            "historical_advisories": int(latest_payload.get("diagnostics", {}).get("historical_advisories", 0)),
+            "stale_advisories": int(latest_payload.get("diagnostics", {}).get("stale_advisories", 0)),
+            "non_mac_advisories_hidden": int(latest_payload.get("diagnostics", {}).get("non_mac_advisories_hidden", 0)),
+            "review_needed_hidden": int(latest_payload.get("diagnostics", {}).get("review_needed_hidden", 0)),
+            "applicable_advisories": int(latest_payload.get("diagnostics", {}).get("applicable_advisories", 0)),
             "filtered_non_apple_cves_count": int(latest_payload.get("filtered_non_apple_cves_count", 0)),
             "hidden_review_needed_count": int(latest_payload.get("hidden_review_needed_count", 0)),
             "last_error": latest_payload.get("last_error", ""),
@@ -1531,12 +1438,48 @@ class AppleSecurityForecastEngine:
     def _build_cards(self, catalog: dict[str, Any], inventory: dict[str, Any], current_scan_result: ScanResult | None) -> list[AppleSecurityForecastCard]:
         cards: dict[str, AppleSecurityForecastCard] = {}
         products = inventory.get("products", [])
+        diagnostics = {
+            "advisories_downloaded": len(catalog.get("cves", [])),
+            "advisories_parsed": 0,
+            "advisories_within_90_days": 0,
+            "invalid_advisories": 0,
+            "filtered_advisories": 0,
+            "historical_advisories": 0,
+            "stale_advisories": 0,
+            "ecosystem_advisories": 0,
+            "non_mac_advisories_hidden": 0,
+            "review_needed_hidden": 0,
+            "applicable_advisories": 0,
+            "active_forecast_cards": 0,
+        }
         for item in catalog.get("cves", []):
-            if not self._apple_related(item):
+            filter_reason = self._active_apple_advisory_filter_reason(item)
+            if filter_reason:
+                if filter_reason in {"invalid-date", "future-date", "pre-2020", "missing-date"}:
+                    diagnostics["invalid_advisories"] += 1
+                elif filter_reason == "historical":
+                    diagnostics["historical_advisories"] += 1
+                    diagnostics["stale_advisories"] += 1
+                elif filter_reason == "ecosystem-only":
+                    diagnostics["ecosystem_advisories"] += 1
+                    diagnostics["non_mac_advisories_hidden"] += 1
+                elif filter_reason == "unsupported-family":
+                    diagnostics["non_mac_advisories_hidden"] += 1
+                else:
+                    diagnostics["filtered_advisories"] += 1
                 continue
+            diagnostics["advisories_parsed"] += 1
+            advisory_dt = _advisory_dt(item)
+            if advisory_dt and (datetime.now(timezone.utc) - advisory_dt).days <= APPLE_FORECAST_DEFAULT_ACTIVE_DAYS:
+                diagnostics["advisories_within_90_days"] += 1
             match = self._match_apple_item(item, products, inventory, catalog.get("kev", {}))
             if match["applicability"] == "not_applicable":
+                diagnostics["filtered_advisories"] += 1
                 continue
+            if match["applicability"] == "review_needed" and not getattr(self.config, "show_review_needed_apple_cves", False):
+                diagnostics["review_needed_hidden"] += 1
+                continue
+            diagnostics["applicable_advisories"] += 1
             card_key = match["category"]
             card = cards.get(card_key)
             if card is None:
@@ -1565,6 +1508,8 @@ class AppleSecurityForecastEngine:
                     highest_severity="info",
                     source="apple",
                 )
+                self._apply_risk_context(card, known_exploited=False, patch_available=bool(match.get("fixed_version")), confidence_reason=match.get("confidence_reason", ""))
+                self._apply_false_positive_review(card, item, match, catalog)
                 cards[card_key] = card
             cve_id = str(item.get("cve_id", ""))
             card.cves.append(cve_id)
@@ -1579,11 +1524,21 @@ class AppleSecurityForecastEngine:
             card.kev_count = len(set(card.kev_cves))
             card.highest_severity = _severity_max(card.highest_severity, _severity_from_cvss(item.get("cvss_score")))
             if cve_id in catalog.get("kev", {}):
-                card.forecast_level = _forecast_level_max(card.forecast_level, "urgent")
+                if card.applicability == "confirmed_applicable" and match.get("fixed_version"):
+                    card.forecast_level = _forecast_level_max(card.forecast_level, "critical")
+                else:
+                    card.forecast_level = _forecast_level_max(card.forecast_level, "urgent")
             elif float(epss.get("percentile", 0.0)) >= 0.90:
                 card.forecast_level = _forecast_level_max(card.forecast_level, "elevated")
             elif card.applicability in {"confirmed_applicable", "likely_applicable"}:
                 card.forecast_level = _forecast_level_max(card.forecast_level, APPLE_FORECAST_LEVEL_FOR_SEVERITY[card.highest_severity])
+            self._apply_risk_context(
+                card,
+                known_exploited=bool(card.kev_cves),
+                patch_available=bool(match.get("fixed_version")),
+                confidence_reason=match.get("confidence_reason", ""),
+            )
+            self._apply_false_positive_review(card, item, match, catalog)
             if current_scan_result is not None:
                 card.why_shown = self._augment_why_shown(card.why_shown, current_scan_result, match["affected_local_product"])
             self.db.record_apple_security_cve_cache(cve_id, item, source="apple-security-releases")
@@ -1596,7 +1551,7 @@ class AppleSecurityForecastEngine:
                     forecast_id="",
                     title="Apple Security Update Available",
                     category="macOS",
-                    forecast_level="watch",
+                    forecast_level="elevated",
                     affected_local_product="macOS",
                     detected_version=str(inventory.get("macos_version", "")),
                     fixed_version="",
@@ -1617,9 +1572,147 @@ class AppleSecurityForecastEngine:
                     source="apple",
                 )
                 cards[card_key] = update_card
-            update_card.forecast_level = _forecast_level_max(update_card.forecast_level, "watch")
+                self._apply_risk_context(update_card, known_exploited=False, patch_available=True, confidence_reason="Software Update reports pending Apple updates.")
+                update_card.false_positive_review = {
+                    "result": "Low false-positive risk",
+                    "reason": "macOS Software Update reported pending Apple updates locally.",
+                    "checks": {
+                        "local_update_signal": True,
+                        "private_data_inspected": False,
+                    },
+                }
+                update_card.planning_guidance = self._planning_guidance(update_card)
+                update_card.forecast_phrase = self._forecast_phrase(update_card)
+            update_card.forecast_level = _forecast_level_max(update_card.forecast_level, "elevated")
         grouped = list(cards.values())
+        diagnostics["active_forecast_cards"] = len(grouped)
+        self._last_diagnostics = diagnostics
         return grouped
+
+    def _active_apple_advisory_filter_reason(self, item: dict[str, Any]) -> str:
+        if not self._apple_related(item):
+            return "non-apple"
+        if not self._has_apple_release_evidence(item):
+            return "no-apple-release-evidence"
+        family = self._primary_family(item)
+        if family in APPLE_ECOSYSTEM_ONLY_KEYS and not getattr(self.config, "include_apple_ecosystem_advisories", False):
+            return "ecosystem-only"
+        if family not in APPLE_MAC_FOCUSED_FAMILY_KEYS:
+            return "unsupported-family"
+        advisory_dt = _advisory_dt(item)
+        if advisory_dt is None:
+            return "missing-date"
+        now = datetime.now(timezone.utc)
+        if advisory_dt > now + timedelta(days=1):
+            return "future-date"
+        if advisory_dt.year < APPLE_FORECAST_MIN_YEAR:
+            return "pre-2020"
+        if (now - advisory_dt).days > APPLE_FORECAST_MAX_ACTIVE_DAYS:
+            return "historical"
+        return ""
+
+    def _has_apple_release_evidence(self, item: dict[str, Any]) -> bool:
+        references = " ".join(str(ref) for ref in item.get("references", []))
+        text = f"{references} {item.get('description', '')}".lower()
+        return "support.apple.com" in text or "apple security" in text or "https://support.apple.com/en-us/100100" in text
+
+    def _primary_family(self, item: dict[str, Any]) -> str:
+        for affected in item.get("affected_products", []):
+            family = normalize_product_name(affected.get("product", ""))
+            if family:
+                return family
+        text = f"{item.get('description', '')} {' '.join(item.get('references', []))}".lower()
+        for family in ["visionos", "watchos", "tvos", "ipados", "ios", "macos", "safari", "webkit", "xcode"]:
+            if family in text:
+                return family
+        return ""
+
+    def _apply_risk_context(self, card: AppleSecurityForecastCard, *, known_exploited: bool, patch_available: bool, confidence_reason: str) -> None:
+        likelihood = "High" if known_exploited else "Medium" if card.forecast_level in {"elevated", "urgent", "critical"} else "Low"
+        impact = "High" if card.highest_severity in {"critical", "high"} else "Medium" if card.highest_severity == "medium" else "Low"
+        exposure = "Confirmed" if card.applicability == "confirmed_applicable" else "Likely" if card.applicability == "likely_applicable" else "Review Needed"
+        card.confidence_reason = confidence_reason or "Apple advisory and local product family were correlated."
+        card.risk_factors = {
+            "likelihood": likelihood,
+            "impact": impact,
+            "exposure": exposure,
+            "exploit_availability": "Known exploited" if known_exploited else "Not confirmed",
+            "known_exploitation": "Yes" if known_exploited else "No",
+            "patch_availability": "Yes" if patch_available else "Unknown",
+            "overall": card.forecast_level.title(),
+        }
+        card.supporting_evidence = [
+            f"Local product: {card.affected_local_product} {card.detected_version}".strip(),
+            f"Recommended version/fix: {card.fixed_version or 'review Apple advisory'}",
+            f"Confidence: {card.confidence}",
+            card.confidence_reason,
+        ]
+
+    def _apply_false_positive_review(
+        self,
+        card: AppleSecurityForecastCard,
+        item: dict[str, Any],
+        match: dict[str, Any],
+        catalog: dict[str, Any],
+    ) -> None:
+        detected_version = _parse_version(str(card.detected_version)) or str(card.detected_version)
+        version_check = _version_is_older(detected_version, str(card.fixed_version))
+        checks = {
+            "apple_release_evidence": self._has_apple_release_evidence(item),
+            "mac_relevant_product": self._primary_family(item) in APPLE_MAC_FOCUSED_FAMILY_KEYS,
+            "local_product_detected": bool(card.affected_local_product and card.detected_version),
+            "fixed_version_available": bool(card.fixed_version),
+            "version_confirms_exposure": version_check is True,
+            "version_confirms_not_affected": version_check is False,
+            "kev_family_match": bool(card.cves and any(cve_id in catalog.get("kev", {}) for cve_id in card.cves)),
+            "active_advisory_window": not self._active_apple_advisory_filter_reason(item),
+            "private_data_inspected": False,
+        }
+        if checks["version_confirms_not_affected"]:
+            result = "Likely not affected"
+            reason = "The detected local version appears to be at or newer than the Apple fixed version."
+        elif card.applicability == "confirmed_applicable" and checks["apple_release_evidence"] and checks["local_product_detected"]:
+            result = "Low false-positive risk"
+            reason = "Apple release evidence, local product detection, and version comparison all point to this Mac."
+        elif card.applicability == "likely_applicable":
+            result = "Moderate false-positive risk"
+            reason = "The product family matches, but exact version mapping is incomplete. Verify Software Update before treating this as urgent."
+        else:
+            result = "Review before acting"
+            reason = "The advisory is Apple-related, but local applicability is not strong enough for an immediate action recommendation."
+        card.false_positive_review = {
+            "result": result,
+            "reason": reason,
+            "checks": checks,
+        }
+        card.planning_guidance = self._planning_guidance(card)
+        card.forecast_phrase = self._forecast_phrase(card)
+
+    def _forecast_phrase(self, card: AppleSecurityForecastCard) -> str:
+        if card.forecast_level == "critical":
+            return "Update likely needed today"
+        if card.forecast_level == "urgent":
+            return "Plan an update soon"
+        if card.forecast_level == "elevated":
+            return "Check Software Update today"
+        if card.forecast_level == "watch":
+            return "Watch and verify"
+        return "No update planning needed"
+
+    def _planning_guidance(self, card: AppleSecurityForecastCard) -> str:
+        review = getattr(card, "false_positive_review", {}) or {}
+        result = str(review.get("result", ""))
+        if result == "Likely not affected":
+            return "No action is planned from this card unless Software Update or Apple guidance changes."
+        if card.forecast_level == "critical":
+            return "Plan to update today after confirming the update appears in Software Update or Apple release notes."
+        if card.forecast_level == "urgent":
+            return "Plan time to update soon. Verify the Apple advisory and local version before escalating concern."
+        if card.forecast_level == "elevated":
+            return "Check Software Update today or during the next normal maintenance window."
+        if card.forecast_level == "watch":
+            return "No immediate action. Keep this on the radar until Apple or local version evidence becomes clearer."
+        return "No Apple security update planning is needed from this forecast card."
 
     def _augment_why_shown(self, base: str, current_scan_result: ScanResult, product: str) -> str:
         if not current_scan_result:
@@ -1721,6 +1814,12 @@ class AppleSecurityForecastEngine:
                 applicability = "confirmed_applicable" if applicability != "review_needed" else "review_needed"
             title = "Known Exploited Apple Vulnerability"
             why_shown = "CISA KEV includes this Apple-related CVE and the local Apple family matches."
+        if confidence == "high":
+            confidence_reason = "Apple advisory references the installed product family and the local version was detected."
+        elif confidence == "medium":
+            confidence_reason = "Apple advisory references the installed product family, but exact version mapping is incomplete."
+        else:
+            confidence_reason = "Product family matched, but local version or Apple fixed-version data is incomplete."
         return {
             "cve_id": cve_id,
             "title": title,
@@ -1736,6 +1835,7 @@ class AppleSecurityForecastEngine:
             "highest_severity": _severity_from_cvss(item.get("cvss_score")),
             "source": "apple",
             "references": list(item.get("references", [])),
+            "confidence_reason": confidence_reason,
         }
 
     def _apple_related(self, item: dict[str, Any]) -> bool:
@@ -1750,6 +1850,8 @@ class AppleSecurityForecastEngine:
     def _forecast_level(self, cards: list[dict[str, Any]], inventory: dict[str, Any]) -> str:
         if not cards:
             return "clear"
+        if any(card.get("forecast_level") == "critical" for card in cards):
+            return "critical"
         if any(card.get("forecast_level") == "urgent" for card in cards):
             return "urgent"
         if any(card.get("forecast_level") == "elevated" for card in cards):
@@ -1763,6 +1865,8 @@ class AppleSecurityForecastEngine:
     def _summary_text(self, level: str, cards: list[dict[str, Any]], inventory: dict[str, Any]) -> str:
         if level == "clear":
             return "No relevant Apple security updates or high-confidence Apple CVEs were identified."
+        if level == "critical":
+            return "A known-exploited Apple security issue appears confirmed for this Mac and a security update is available."
         if level == "urgent":
             return "Known-exploited or critical Apple security items likely apply to this Mac."
         if level == "elevated":

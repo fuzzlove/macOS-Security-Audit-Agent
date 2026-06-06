@@ -98,6 +98,44 @@ def theme_stylesheet(theme: Theme, *, accessibility_override: bool = False) -> s
             border: 1px solid rgba(148, 163, 184, 100);
             border-radius: 8px;
         }}
+        QAbstractScrollArea {{
+            border: 1px solid rgba(148, 163, 184, 150);
+        }}
+        QScrollBar:vertical {{
+            background: rgba(5, 8, 13, 230);
+            width: 18px;
+            margin: 2px;
+            border: 1px solid rgba(255, 255, 255, 180);
+            border-radius: 7px;
+        }}
+        QScrollBar:horizontal {{
+            background: rgba(5, 8, 13, 230);
+            height: 18px;
+            margin: 2px;
+            border: 1px solid rgba(255, 255, 255, 180);
+            border-radius: 7px;
+        }}
+        QScrollBar::handle:vertical, QScrollBar::handle:horizontal {{
+            background: #FFD166;
+            border: 2px solid #111827;
+            border-radius: 6px;
+            min-height: 36px;
+            min-width: 36px;
+        }}
+        QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {{
+            background: #FFFFFF;
+            border: 2px solid #FFD166;
+        }}
+        QScrollBar::add-line, QScrollBar::sub-line {{
+            width: 0px;
+            height: 0px;
+            border: none;
+            background: transparent;
+        }}
+        QScrollBar::add-page, QScrollBar::sub-page {{
+            background: rgba(255, 255, 255, 45);
+            border-radius: 6px;
+        }}
         QPushButton {{
             background: {theme.button_secondary};
             color: {theme.foreground};
@@ -131,4 +169,3 @@ def theme_stylesheet(theme: Theme, *, accessibility_override: bool = False) -> s
             font-weight: 700;
         }}
     """
-
