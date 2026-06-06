@@ -1,6 +1,6 @@
 # Acknowledgements
 
-Mac Audit Agent would not be what it is today without the contributions, research, standards, feedback, and open-source work of countless individuals, organizations, and communities dedicated to improving cybersecurity for everyone.
+MSAA would not be what it is today without the contributions, research, standards, feedback, and open-source work of countless individuals, organizations, and communities dedicated to improving cybersecurity for everyone.
 
 We would like to extend our sincere appreciation to:
 
@@ -38,7 +38,7 @@ Thank you to the instructors, authors, conference speakers, trainers, and commun
 
 ### Testers and Early Users
 
-Thank you to everyone who installs, tests, critiques, reports bugs, suggests features, and provides feedback. Every issue reported, every recommendation made, and every improvement suggested helps make Mac Audit Agent a better tool for the community.
+Thank you to everyone who installs, tests, critiques, reports bugs, suggests features, and provides feedback. Every issue reported, every recommendation made, and every improvement suggested helps make MacOS Security Audit Agent (MSAA) a better tool for the community.
 
 ### Families, Schools, and Organizations
 
