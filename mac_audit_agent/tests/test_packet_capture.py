@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import os
 import json
 from pathlib import Path
 
 import pytest
+from PySide6.QtWidgets import QApplication
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from mac_audit_agent.packet_capture import (
     MAX_CAPTURE_DURATION_SECONDS,
@@ -13,6 +17,7 @@ from mac_audit_agent.packet_capture import (
     sanitize_interface_name,
     validate_capture_duration,
 )
+from mac_audit_agent.ui.main_window import PacketCaptureProgressDialog
 
 
 class FakeProcess:
@@ -91,6 +96,31 @@ def test_shell_true_is_never_used(tmp_path: Path) -> None:
     assert isinstance(captured["args"][0], list)
 
 
+def test_seconds_remaining_uses_monotonic_deadline(tmp_path: Path, monkeypatch) -> None:
+    now = {"value": 100.0}
+
+    monkeypatch.setattr("mac_audit_agent.packet_capture.time.monotonic", lambda: now["value"])
+
+    def fake_popen(*args, **kwargs):
+        return FakeProcess(returncode=0)
+
+    session = PacketCaptureSession(
+        interface="en0",
+        duration_seconds=30,
+        capture_filter="tcp",
+        evidence_dir=tmp_path,
+        user_confirmed=True,
+        popen_factory=fake_popen,
+    )
+    session.start()
+
+    assert session.seconds_remaining() == 30
+    now["value"] = 100.9
+    assert session.seconds_remaining() == 29
+    now["value"] = session._deadline_monotonic + 2.0
+    assert session.seconds_remaining() == 0
+
+
 def test_metadata_json_is_written_and_sha256_calculated(tmp_path: Path) -> None:
     def fake_popen(*args, **kwargs):
         return FakeProcess(returncode=0)
@@ -128,6 +158,36 @@ def test_failed_tcpdump_creates_clear_error(tmp_path: Path) -> None:
     assert result.metadata["status"] == "failed"
     assert "permission denied" in result.metadata["stderr_summary"]
     assert result.finding is not None
+
+
+def test_progress_dialog_marks_complete_and_schedules_close(monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    close_calls: list[int] = []
+
+    class FakeResult:
+        def __init__(self) -> None:
+            self.metadata = {"status": "completed"}
+
+    class FakeSession:
+        duration_seconds = 5
+        process = None
+
+        def seconds_remaining(self) -> int:
+            return 0
+
+        def finish(self):
+            return FakeResult()
+
+    monkeypatch.setattr("mac_audit_agent.ui.main_window.QTimer.singleShot", lambda delay, fn: (close_calls.append(delay), fn()))
+    dialog = PacketCaptureProgressDialog(FakeSession())
+    dialog._tick()
+
+    assert dialog.status_label.text() == "Status: packet capture complete"
+    assert dialog.countdown_label.text() == "Time remaining: 0s"
+    assert dialog.result.metadata["status"] == "completed"
+    assert close_calls == [750]
+    dialog.close()
+    app.processEvents()
 
 
 def test_cancel_stops_process(tmp_path: Path, monkeypatch) -> None:

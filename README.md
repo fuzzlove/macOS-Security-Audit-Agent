@@ -1,3 +1,5 @@
+# <img width="408" height="200" alt="image" src="https://github.com/user-attachments/assets/73fc617c-b7c9-4fda-9883-1f2530e01403" />
+
 # macOS Security Audit Agent (MSAA)
 
 MSAA is a local-first macOS audit, monitoring, and investigation platform. It is designed for analysts who need transparent evidence collection, reviewable alerts, and local-only reports without sending telemetry off the machine.

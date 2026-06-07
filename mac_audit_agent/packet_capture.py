@@ -134,6 +134,7 @@ class PacketCaptureSession:
         self.status = "waiting"
         self.stderr_text = ""
         self.exit_code: int | None = None
+        self._deadline_monotonic = 0.0
 
     def manual_command_preview(self) -> str:
         return " ".join(self.command)
@@ -141,6 +142,7 @@ class PacketCaptureSession:
     def start(self) -> None:
         self.start_time = utc_now_iso()
         self.status = "running"
+        self._deadline_monotonic = time.monotonic() + float(self.duration_seconds)
         self.process = self.popen_factory(
             self.command,
             stdout=subprocess.DEVNULL,
@@ -183,10 +185,9 @@ class PacketCaptureSession:
         return self._result_from_state()
 
     def seconds_remaining(self) -> int:
-        if not self.start_time:
+        if not self.start_time or not self._deadline_monotonic:
             return self.duration_seconds
-        started = self._parse_iso(self.start_time)
-        remaining = self.duration_seconds - max(0, int(time.time() - started))
+        remaining = int(self._deadline_monotonic - time.monotonic())
         return max(0, remaining)
 
     def _terminate_process(self, grace_seconds: float) -> None:
@@ -271,12 +272,6 @@ class PacketCaptureSession:
                 "remediation_references": ["tcpdump manual page: review local capture syntax and privileges before retrying."],
             }
         return PacketCaptureResult(metadata=metadata, raw_logs=logs, finding=finding, manual_command=self.manual_command_preview())
-
-    def _parse_iso(self, value: str) -> float:
-        try:
-            return time.time() if not value else time.mktime(time.strptime(value[:19], "%Y-%m-%dT%H:%M:%S"))
-        except ValueError:
-            return time.time()
 
 
 def tcpdump_available() -> bool:

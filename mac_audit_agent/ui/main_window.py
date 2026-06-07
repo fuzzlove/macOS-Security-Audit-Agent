@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import random
 import subprocess
 import shlex
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 import sys
 from typing import Callable
 from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QBrush, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QBrush, QDesktopServices, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -108,6 +111,8 @@ from mac_audit_agent.themes import DEFAULT_THEME_NAME, theme_for_name, theme_sty
 
 LOGGER = logging.getLogger(__name__)
 APP_TITLE = "macOS Security Audit Agent - Liquidsky Network Security"
+SUPPORT_IMAGE_URL = "https://github.com/user-attachments/assets/e7da53a1-36b2-40fb-9856-41c0c1409ab2"
+SUPPORT_PATREON_URL = "https://www.patreon.com/16166750/join"
 ABOUT_TITLE = f"About {APP_TITLE}"
 USAGE_GUIDE_TITLE = f"How to Use {APP_TITLE}"
 RISK_COLORS = {"safe": "#238b45", "sensitive": "#d4a017", "dangerous": "#c0392b"}
@@ -226,6 +231,18 @@ class ClickableLabel(QLabel):
         super().mousePressEvent(event)
 
 
+class ClickableFrame(QFrame):
+    clicked = Signal()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+            if hasattr(event, "accept"):
+                event.accept()
+            return
+        super().mousePressEvent(event)
+
+
 class PacketCaptureOptionsDialog(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -320,6 +337,7 @@ class PacketCaptureProgressDialog(QDialog):
         super().__init__(parent)
         self.session = session
         self.result = None
+        self._close_scheduled = False
         self.setWindowTitle("Packet Capture Running")
         layout = QVBoxLayout(self)
         self.status_label = QLabel("Status: waiting")
@@ -344,16 +362,32 @@ class PacketCaptureProgressDialog(QDialog):
             self.reject()
             return
         self.status_label.setText("Status: running")
-        self.timer.start(250)
+        self.timer.start(1000)
 
     def _tick(self) -> None:
+        if self.session.process is not None and self.session.process.poll() is not None:
+            self._complete_capture()
+            return
         remaining = self.session.seconds_remaining()
         self.countdown_label.setText(f"Time remaining: {remaining}s")
         if remaining <= 0:
-            self.timer.stop()
-            self.result = self.session.finish()
-            self.status_label.setText(f"Status: {self.result.metadata.get('status', 'completed')}")
-            self.accept()
+            self._complete_capture()
+
+    def _complete_capture(self) -> None:
+        if self._close_scheduled:
+            return
+        self._close_scheduled = True
+        self.timer.stop()
+        self.result = self.session.finish()
+        status = str(self.result.metadata.get("status", "completed"))
+        if status == "completed":
+            self.status_label.setText("Status: packet capture complete")
+        elif status == "cancelled":
+            self.status_label.setText("Status: packet capture cancelled")
+        else:
+            self.status_label.setText(f"Status: {status}")
+        self.countdown_label.setText("Time remaining: 0s")
+        QTimer.singleShot(750, self.accept)
 
     def cancel_capture(self) -> None:
         self.timer.stop()
@@ -835,6 +869,72 @@ def create_security_tray_icon(size: int = 64) -> QIcon:
     return QIcon(pixmap)
 
 
+def create_demo_qr_pixmap(size: int = 112, payload: str = "Mac Audit Agent Demo") -> QPixmap:
+    modules = 29
+    module_size = max(1, size // modules)
+    canvas = modules * module_size
+    pixmap = QPixmap(canvas, canvas)
+    pixmap.fill(QColor("#F7FAFC"))
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, False)
+    painter.setPen(Qt.NoPen)
+
+    digest = hashlib.sha256(payload.encode("utf-8")).digest()
+    bits: list[int] = []
+    for byte in digest:
+        for bit in range(8):
+            bits.append((byte >> bit) & 1)
+
+    matrix = [[False for _ in range(modules)] for _ in range(modules)]
+    for y in range(modules):
+        for x in range(modules):
+            matrix[y][x] = bool(bits[(x * 31 + y * 17) % len(bits)])
+
+    def draw_module(x: int, y: int, dark: bool) -> None:
+        painter.fillRect(x * module_size, y * module_size, module_size, module_size, QColor("#111827" if dark else "#F7FAFC"))
+
+    def draw_finder(x0: int, y0: int) -> None:
+        for y in range(7):
+            for x in range(7):
+                border = x in {0, 6} or y in {0, 6}
+                inner = 2 <= x <= 4 and 2 <= y <= 4
+                draw_module(x0 + x, y0 + y, border or inner)
+
+    draw_finder(0, 0)
+    draw_finder(modules - 7, 0)
+    draw_finder(0, modules - 7)
+
+    for y in range(modules):
+        for x in range(modules):
+            if x < 8 and y < 8:
+                continue
+            if x >= modules - 8 and y < 8:
+                continue
+            if x < 8 and y >= modules - 8:
+                continue
+            if modules // 2 - 2 <= x <= modules // 2 + 2 and modules // 2 - 2 <= y <= modules // 2 + 2:
+                matrix[y][x] = (x + y) % 2 == 0
+            draw_module(x, y, matrix[y][x])
+
+    painter.end()
+    return pixmap
+
+
+def load_support_image_pixmap(image_url: str = SUPPORT_IMAGE_URL, size: tuple[int, int] = (100, 100)) -> QPixmap:
+    width, height = size
+    request = urllib.request.Request(image_url, headers={"User-Agent": "MacAuditAgent/1.0"})
+    try:
+        with urllib.request.urlopen(request, timeout=3) as response:
+            data = response.read()
+    except Exception:
+        return QPixmap()
+    pixmap = QPixmap()
+    if not pixmap.loadFromData(data):
+        return QPixmap()
+    return pixmap.scaled(width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, db_path: Path, config: AuditConfig | None = None) -> None:
         super().__init__()
@@ -1023,6 +1123,62 @@ class MainWindow(QMainWindow):
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setWidget(widget)
         return scroll
+
+    def _build_support_section(self) -> QFrame:
+        frame = ClickableFrame()
+        frame.setObjectName("supportAd")
+        frame.setStyleSheet(
+            """
+            QFrame#supportAd {
+                background: rgba(15, 23, 42, 230);
+                border: 1px solid rgba(148, 163, 184, 90);
+                border-radius: 12px;
+            }
+            """
+        )
+        frame.setCursor(Qt.PointingHandCursor)
+        frame.setToolTip(f"Open Patreon support page: {SUPPORT_PATREON_URL}")
+        frame.clicked.connect(lambda: self._open_support_link())
+        self.support_ad_frame = frame
+        ad_layout = QVBoxLayout(frame)
+        ad_layout.setContentsMargins(12, 12, 12, 12)
+        ad_layout.setSpacing(10)
+
+        self.support_ad_image_label = QLabel()
+        self.support_ad_image_label.setFixedSize(100, 100)
+        self.support_ad_image_label.setAlignment(Qt.AlignCenter)
+        self.support_ad_image_label.setStyleSheet("background: white; border-radius: 10px;")
+        self.support_ad_image_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        pixmap = load_support_image_pixmap()
+        if pixmap.isNull():
+            pixmap = create_demo_qr_pixmap(100, "Mac Audit Agent Support")
+        self.support_ad_image_label.setPixmap(pixmap.scaled(100, 100, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+        text_layout = QVBoxLayout()
+        text_layout.setSpacing(4)
+        title = QLabel("Support the author")
+        title.setStyleSheet("font-size: 14px; font-weight: 700; color: #F8FAFC;")
+        body = QLabel("Simple support for the work behind the app.\nJoin if you'd like to help keep it going.")
+        body.setWordWrap(True)
+        body.setStyleSheet("color: #CBD5E1;")
+        title.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        body.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.support_ad_link_label = QLabel(f'<a href="{SUPPORT_PATREON_URL}">Join on Patreon</a>')
+        self.support_ad_link_label.setTextFormat(Qt.RichText)
+        self.support_ad_link_label.setWordWrap(True)
+        self.support_ad_link_label.setStyleSheet("color: #93C5FD;")
+        self.support_ad_link_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        text_layout.addWidget(title)
+        text_layout.addWidget(body)
+        text_layout.addWidget(self.support_ad_link_label)
+        text_layout.addStretch(1)
+
+        ad_layout.addWidget(self.support_ad_image_label, alignment=Qt.AlignHCenter)
+        ad_layout.addLayout(text_layout)
+        return frame
+
+    def _open_support_link(self) -> None:
+        QDesktopServices.openUrl(QUrl(SUPPORT_PATREON_URL))
 
     def _developer_mode_enabled(self) -> bool:
         stored = self.db.get_background_monitor_state("developer_mode", "")
@@ -1842,6 +1998,15 @@ class MainWindow(QMainWindow):
         self.selected_finding_hint_label.setStyleSheet("color: #9DB0C9;")
         layout.addWidget(self.selected_finding_hint_label)
         layout.addWidget(self.review_actions_frame)
+        layout.addSpacing(14)
+        support_heading = QLabel("Support the author")
+        support_heading.setStyleSheet("font-weight: 700;")
+        support_heading.setWordWrap(True)
+        layout.addWidget(support_heading)
+        support_hint = QLabel("Simple support for the work behind the app.")
+        support_hint.setWordWrap(True)
+        layout.addWidget(support_hint)
+        layout.addWidget(self._build_support_section())
         layout.addStretch(1)
         self._clear_selected_finding_panel()
         return panel

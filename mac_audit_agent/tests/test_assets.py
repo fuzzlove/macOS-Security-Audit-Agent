@@ -5,9 +5,10 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
 
 from mac_audit_agent.assets import get_asset_path
-from mac_audit_agent.ui.main_window import MainWindow, STARTUP_STRATEGY_QUOTES, choose_startup_strategy_quote, format_startup_strategy_quote
+from mac_audit_agent.ui.main_window import MainWindow, STARTUP_STRATEGY_QUOTES, choose_startup_strategy_quote, create_demo_qr_pixmap, format_startup_strategy_quote
 
 
 def test_asset_path_resolves_logo() -> None:
@@ -113,6 +114,44 @@ def test_open_reports_folder_uses_application_support_path(tmp_path: Path, monke
     assert calls == [["open", str(reports_dir)]]
     assert reports_dir.exists()
     assert "Reports folder opened" in messages[0]
+    window.close()
+    app.processEvents()
+
+
+def test_support_rail_uses_image_and_patreon_link(tmp_path: Path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    from PySide6.QtGui import QColor, QPixmap
+
+    def fake_support_image(*_args, **_kwargs):
+        pixmap = QPixmap(100, 100)
+        pixmap.fill(QColor("#FFFFFF"))
+        return pixmap
+
+    monkeypatch.setattr("mac_audit_agent.ui.main_window.load_support_image_pixmap", fake_support_image)
+    opened_urls = []
+    monkeypatch.setattr("mac_audit_agent.ui.main_window.QDesktopServices.openUrl", lambda url: opened_urls.append(url.toString()))
+    window = MainWindow(tmp_path / "audit.sqlite")
+    assert hasattr(window, "details_panel")
+    assert hasattr(window, "support_ad_frame")
+    assert hasattr(window, "support_ad_image_label")
+    assert hasattr(window, "support_ad_link_label")
+    assert window.support_ad_frame.parent() is window.details_panel
+    assert window.support_ad_frame.cursor().shape() == Qt.PointingHandCursor
+    pixmap = window.support_ad_image_label.pixmap()
+    assert pixmap is not None and not pixmap.isNull()
+    assert window.support_ad_link_label.text().startswith('<a href="https://www.patreon.com/16166750/join"')
+    assert window.support_ad_frame.toolTip().startswith("Open Patreon support page:")
+
+    class FakeEvent:
+        def button(self):
+            return Qt.LeftButton
+
+        def accept(self):
+            return None
+
+    window.support_ad_frame.mousePressEvent(FakeEvent())
+    assert opened_urls == ["https://www.patreon.com/16166750/join"]
+    assert not create_demo_qr_pixmap().isNull()
     window.close()
     app.processEvents()
 
