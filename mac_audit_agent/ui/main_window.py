@@ -1163,7 +1163,7 @@ class MainWindow(QMainWindow):
         body.setStyleSheet("color: #CBD5E1;")
         title.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         body.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.support_ad_link_label = QLabel(f'<a href="{SUPPORT_PATREON_URL}">Join on Patreon</a>')
+        self.support_ad_link_label = QLabel(f'<a href="{SUPPORT_PATREON_URL}">Support via Patreon or BuyMeACoffee</a>')
         self.support_ad_link_label.setTextFormat(Qt.RichText)
         self.support_ad_link_label.setWordWrap(True)
         self.support_ad_link_label.setStyleSheet("color: #93C5FD;")
