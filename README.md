@@ -15,6 +15,9 @@ This repository is intended to be understandable, auditable, and safe enough for
 - Exports HTML and JSON reports locally
 - Preserves evidence snapshots before cleanup or remediation
 
+<img width="2888" height="1866" alt="583D5660-09DB-4173-8608-6F3C23CE2893" src="https://github.com/user-attachments/assets/8f4f6c88-3433-403e-9d76-93ff1464f050" />
+
+
 ## What It Does Not Do
 
 - No telemetry
