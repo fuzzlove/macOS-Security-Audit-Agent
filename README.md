@@ -149,7 +149,27 @@ macos-security-audit-agent --report report.html
 macos-security-audit-agent --system-health
 ```
 
-### Source
+### GitHub
+
+Install directly from the GitHub repository:
+
+```bash
+python3 -m pip install "git+https://github.com/fuzzlove/macOS-Security-Audit-Agent.git"
+macos-security-audit-agent
+```
+
+### Local Source
+
+Clone the repository and install it locally:
+
+```bash
+git clone https://github.com/fuzzlove/macOS-Security-Audit-Agent.git
+cd macOS-Security-Audit-Agent
+python3 -m pip install -e .
+macos-security-audit-agent
+```
+
+For development dependencies and the source launcher:
 
 ```bash
 python3 -m pip install -r requirements.txt
