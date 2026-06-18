@@ -244,12 +244,12 @@ class OperationalHealthEngine:
             cards = int(cached.get("cards_count", 0) or 0)
             errors = cached.get("errors", []) or []
             if errors and not cards:
-                return HealthCheck("Apple Security Forecast", "degraded", "Forecast cache has errors and no cards.", status, "Refresh the forecast or wait for a cache update.")
+                return HealthCheck("Apple Exposure Assessment", "degraded", "Forecast cache has errors and no cards.", status, "Refresh the assessment or wait for a cache update.")
             if status in {"offline-cache", "offline-rules"}:
-                return HealthCheck("Apple Security Forecast", "degraded", f"Using cache ({cards} cards).", status, "Refresh when the network is available.")
-            return HealthCheck("Apple Security Forecast", "healthy", f"Forecast cache status: {status} ({cards} cards).", status, "No action required.")
+                return HealthCheck("Apple Exposure Assessment", "degraded", f"Using cache ({cards} cards).", status, "Refresh when the network is available.")
+            return HealthCheck("Apple Exposure Assessment", "healthy", f"Forecast cache status: {status} ({cards} cards).", status, "No action required.")
         except Exception as exc:
-            return HealthCheck("Apple Security Forecast", "broken", "Forecast health unavailable.", str(exc), "Open the forecast tab and try a manual refresh.")
+            return HealthCheck("Apple Exposure Assessment", "broken", "Forecast health unavailable.", str(exc), "Open the assessment tab and try a manual refresh.")
 
     def _report_export_health(self) -> HealthCheck:
         try:
@@ -282,7 +282,7 @@ class OperationalHealthEngine:
             "User LaunchAgent": 10,
             "System LaunchDaemon": 10,
             "Detector": 10,
-            "Apple Security Forecast": 10,
+            "Apple Exposure Assessment": 10,
             "Report Export": 10,
         }
         total = sum(weights.values()) or 1

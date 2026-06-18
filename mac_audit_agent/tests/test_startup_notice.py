@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -115,3 +116,95 @@ def test_app_opens_main_window_after_notice_is_previewed(monkeypatch) -> None:
     monkeypatch.setattr(app_module, "MainWindow", FakeWindow)
     assert app_module.main() == 17
     assert calls == ["application", "notice", "window", "show", "event-loop"]
+
+
+def test_app_falls_back_when_default_database_is_readonly(tmp_path: Path, monkeypatch) -> None:
+    calls = []
+    default_db = tmp_path / "readonly.sqlite"
+    fallback_db = tmp_path / "state" / "audit.sqlite"
+
+    class FakeApplication:
+        def __init__(self, argv) -> None:
+            calls.append("application")
+
+        def exec(self) -> int:
+            calls.append("event-loop")
+            return 0
+
+    class FakeWindow:
+        def __init__(self, db_path: Path) -> None:
+            calls.append(f"window:{db_path.name}")
+            if db_path == default_db:
+                raise sqlite3.OperationalError("attempt to write a readonly database")
+            self.db_path = db_path
+
+        def show(self) -> None:
+            calls.append("show")
+
+    warnings = []
+    monkeypatch.setattr(app_module, "QApplication", FakeApplication)
+    monkeypatch.setattr(app_module, "preview_startup_notice", lambda: True)
+    monkeypatch.setattr(app_module, "MainWindow", FakeWindow)
+    monkeypatch.setattr(app_module, "default_gui_db_path", lambda: default_db)
+    monkeypatch.setattr(app_module, "fallback_gui_db_path", lambda: fallback_db)
+    monkeypatch.setattr(app_module.QMessageBox, "warning", lambda _parent, title, message: warnings.append((title, message)))
+
+    assert app_module.main() == 0
+
+    assert calls == ["application", "window:readonly.sqlite", "window:audit.sqlite", "show", "event-loop"]
+    assert fallback_db.parent.exists()
+    assert warnings
+    assert str(default_db) in warnings[0][1]
+    assert str(fallback_db) in warnings[0][1]
+
+
+def test_app_uses_emergency_database_when_home_state_dir_is_not_writable(tmp_path: Path, monkeypatch) -> None:
+    calls = []
+    default_db = tmp_path / "readonly.sqlite"
+    fallback_db = tmp_path / "root-owned" / "audit.sqlite"
+    emergency_db = tmp_path / "tmp" / "audit.sqlite"
+
+    class FakeApplication:
+        def __init__(self, argv) -> None:
+            calls.append("application")
+
+        def exec(self) -> int:
+            calls.append("event-loop")
+            return 0
+
+    class FakeWindow:
+        def __init__(self, db_path: Path) -> None:
+            calls.append(f"window:{db_path}")
+            if db_path == default_db:
+                raise sqlite3.OperationalError("attempt to write a readonly database")
+            if db_path == fallback_db:
+                raise sqlite3.OperationalError("unable to open database")
+            self.db_path = db_path
+
+        def show(self) -> None:
+            calls.append("show")
+
+    warnings = []
+    monkeypatch.setattr(app_module, "QApplication", FakeApplication)
+    monkeypatch.setattr(app_module, "preview_startup_notice", lambda: True)
+    monkeypatch.setattr(app_module, "MainWindow", FakeWindow)
+    monkeypatch.setattr(app_module, "default_gui_db_path", lambda: default_db)
+    monkeypatch.setattr(app_module, "fallback_gui_db_path", lambda: fallback_db)
+    monkeypatch.setattr(app_module, "emergency_gui_db_path", lambda: emergency_db)
+    monkeypatch.setattr(app_module.QMessageBox, "warning", lambda _parent, title, message: warnings.append((title, message)))
+
+    assert app_module.main() == 0
+
+    assert calls == [
+        "application",
+        f"window:{default_db}",
+        f"window:{fallback_db}",
+        f"window:{emergency_db}",
+        "show",
+        "event-loop",
+    ]
+    assert emergency_db.parent.exists()
+    assert warnings
+    assert str(default_db) in warnings[0][1]
+    assert str(fallback_db) in warnings[0][1]
+    assert str(emergency_db) in warnings[0][1]

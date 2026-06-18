@@ -241,7 +241,7 @@ DEFAULT_EVENT_PREFERENCES: dict[str, dict[str, object]] = {
     "alert_storm_detected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 300, "notification_mode": "dialog"},
     "camera_activity_confirmed": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "dialog"},
     "camera_activity_stopped": {"enabled": True, "severity": "info", "notify": False, "cooldown_seconds": 60, "notification_mode": "none"},
-    "camera_activity_suspected": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 120, "notification_mode": "notification"},
+    "camera_activity_suspected": {"enabled": True, "severity": "medium", "notify": False, "cooldown_seconds": 120, "notification_mode": "none"},
     "microphone_activity_suspected": {"enabled": True, "severity": "medium", "notify": False, "cooldown_seconds": 120, "notification_mode": "none"},
     "possible_lid_opened": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "dialog"},
     "possible_lid_closed": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "dialog"},
@@ -518,9 +518,11 @@ class NotificationManager:
         preference = dict(preferences.get(event_type, {}))
         mandatory = self._is_mandatory_visible_event(event_type)
         if mandatory:
-            preference.setdefault("severity", "critical" if event_type in {self._canonical_event_type(item) for item in MANDATORY_CRITICAL_EVENT_TYPES} else "high")
-            preference.setdefault("notify", True)
-            preference.setdefault("notification_mode", "dialog" if str(preference.get("severity", "high")) in {"high", "critical"} else "notification")
+            preference["severity"] = str(preference.get("severity") or ("critical" if event_type in {self._canonical_event_type(item) for item in MANDATORY_CRITICAL_EVENT_TYPES} else "high"))
+            preference["enabled"] = True
+            preference["notify"] = True
+            if str(preference.get("notification_mode", "")).lower() in {"", "none"}:
+                preference["notification_mode"] = "dialog" if str(preference.get("severity", "high")) in {"high", "critical"} else "notification"
             preference.setdefault("cooldown_seconds", 0 if event_type in {"usb_device_connected", "new_usb_device_detected", "bluetooth_device_connected", "network_ip_assigned", "vpn_connected"} else 600)
         severity = str(preference.get("severity", "low"))
         preference.setdefault("enabled", True)
@@ -811,6 +813,36 @@ class NotificationManager:
         except Exception:
             return
 
+    def _path_parent_writable(self, path: Path) -> tuple[bool, str]:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            probe = path.parent / ".msaa_overlay_write_test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            return True, ""
+        except Exception as exc:
+            return False, str(exc)
+
+    def _overlay_state_path(self) -> Path:
+        writable, reason = self._path_parent_writable(OVERLAY_STATE_PATH)
+        if writable:
+            self.db.set_background_monitor_state("overlay_state_path", str(OVERLAY_STATE_PATH))
+            self.db.set_background_monitor_state("overlay_state_path_fallback_reason", "")
+            return OVERLAY_STATE_PATH
+        fallback = self.db.logs_dir / "state" / "security_overlay.json"
+        self.db.set_background_monitor_state("overlay_state_path", str(fallback))
+        self.db.set_background_monitor_state(
+            "overlay_state_path_fallback_reason",
+            f"Default overlay state path is not writable: {reason}",
+        )
+        return fallback
+
+    def _overlay_pid_path(self) -> Path:
+        state_path = self._overlay_state_path()
+        if state_path == OVERLAY_STATE_PATH:
+            return OVERLAY_PID_PATH
+        return state_path.with_name("security_overlay.pid")
+
     def _is_browser_helper_process(self, event: BackgroundMonitorEvent) -> bool:
         haystacks = [event.process_name or "", event.evidence or ""]
         normalized = [self._normalize_match_text(value) for value in haystacks]
@@ -835,7 +867,9 @@ class NotificationManager:
         event_type = self._canonical_event_type(event)
         if event_type in {self._canonical_event_type(item) for item in MANDATORY_CRITICAL_EVENT_TYPES}:
             return "critical_red"
-        if event_type in {"lid_opened", "lid_closed", "screen_unlocked", "screen_locked", "user_logged_in", "user_logged_out", "mouse_or_keyboard_activity_after_idle", "idle_resume_detected", "input_activity_resumed_after_idle"}:
+        if event_type in {"mouse_or_keyboard_activity_after_idle", "idle_resume_detected", "input_activity_resumed_after_idle", "input_activity_after_idle", "hid_activity_after_idle"}:
+            return "critical_red"
+        if event_type in {"lid_opened", "lid_closed", "screen_unlocked", "screen_locked", "user_logged_in", "user_logged_out"}:
             return "high_orange"
         if event_type in {"apple_security_forecast_elevated", "cve_forecast_level_increased"}:
             return "high_orange" if event.severity in {"high", "critical"} else "neutral_grey"
@@ -881,6 +915,15 @@ class NotificationManager:
         }.get(category, True)
         if not category_enabled:
             return AlertDecision(False, self._style_for_visible_alert(event, category=category), f"{category} alerts disabled", 0, False)
+
+        preference = self.preference_for(event_type)
+        if (
+            event_type in DEFAULT_EVENT_PREFERENCES
+            and not self._is_mandatory_visible_event(event_type)
+            and not self._is_idle_notice_event(event_type)
+            and (not preference.get("notify", False) or str(preference.get("notification_mode", "none")) == "none")
+        ):
+            return AlertDecision(False, self._style_for_visible_alert(event, category=category), "log-only by default", 0, False)
 
         if self._is_idle_notice_event(event_type):
             if not bool(settings.get("cfaa_idle_warning_enabled", True)):
@@ -1025,9 +1068,9 @@ class NotificationManager:
         self.db.set_background_monitor_state("cfaa_findings_digest_fingerprint", fingerprint)
         return True, ""
 
-    def notify_cfaa_idle_reminder(self, event: BackgroundMonitorEvent) -> tuple[bool, str]:
+    def notify_cfaa_idle_reminder(self, event: BackgroundMonitorEvent, *, require_dialog: bool = False) -> tuple[bool, str]:
         overlay_shown = bool(getattr(event, "visible_alert_shown", False))
-        if overlay_shown:
+        if overlay_shown and not require_dialog:
             event.notification_sent = True
             event.notification_error = ""
             event.notification_returncode = 0
@@ -1049,7 +1092,6 @@ class NotificationManager:
                 delivery_method_used="overlay",
             )
             return True, ""
-
         command, result = self._run_dialog_attempt(CFAA_ACK_MESSAGE)
         self._log_attempt(event, str(event.severity), command, result, getattr(result, "returncode", 1) == 0)
         if getattr(result, "returncode", 1) == 0:
@@ -1066,7 +1108,7 @@ class NotificationManager:
             self._record_alert_delivery(
                 event,
                 overlay_attempted=True,
-                overlay_success=True,
+                overlay_success=overlay_shown,
                 dialog_attempted=True,
                 dialog_success=True,
                 notification_attempted=False,
@@ -1101,6 +1143,7 @@ class NotificationManager:
         preference = self.preference_for(event.event_type)
         explicit_preference = event.event_type in dict(settings.get("event_preferences", {}))
         severity_before_policy = str(event.severity)
+        setattr(event, "_original_severity_for_alert", severity_before_policy)
         effective_severity = str(preference.get("severity", event.severity))
         event.severity = effective_severity
         visible_alert = self.should_show_visible_alert(event, settings)
@@ -1108,6 +1151,83 @@ class NotificationManager:
         event.alert_style = visible_alert.style
         event.cooldown_suppressed = visible_alert.reason == "within_cooldown"
         event.last_suppression_reason = visible_alert.reason
+        if not (getattr(event, "rule_id", "") or getattr(event, "trigger_rule_id", "")):
+            event.notification_decision = "invalid_incomplete"
+            event.notification_reason = "missing_rule_id"
+            event.popup_allowed = False
+            decision = {
+                "event_id": event.event_id,
+                "event_type": event.event_type,
+                "severity": effective_severity,
+                "priority": effective_severity,
+                "user_preference_loaded": explicit_preference,
+                "notify": False,
+                "alert_style": "neutral_grey",
+                "cooldown_suppressed": False,
+                "cooldown_remaining_seconds": 0,
+                "decision": "invalid_incomplete",
+                "reason": "missing_rule_id",
+                "command": "",
+                "returncode": "",
+                "stderr": "",
+                "notification_sent": False,
+                "popup_allowed": False,
+                "visible_alert_shown": False,
+                "alert_style": "neutral_grey",
+                "cooldown_suppressed": False,
+                "alert_suppressed_reason": "missing_rule_id",
+            }
+            self._update_event_alert_trace(
+                event,
+                notification_policy_checked=True,
+                notification_policy_result=decision["decision"],
+                notification_policy_reason=decision["reason"],
+                severity_before_policy=severity_before_policy,
+                severity_after_policy=effective_severity,
+                alert_required=bool(visible_alert.show),
+                alert_suppressed=not bool(visible_alert.show),
+                alert_suppression_reason=decision["alert_suppressed_reason"],
+            )
+            self._write_decision(decision)
+            return decision
+        if force:
+            event.notification_decision = "sent"
+            event.notification_reason = "forced"
+            event.cooldown_remaining_seconds = 0
+            event.popup_allowed = True
+            decision = {
+                "event_id": event.event_id,
+                "event_type": event.event_type,
+                "severity": effective_severity,
+                "priority": effective_severity,
+                "user_preference_loaded": explicit_preference,
+                "notify": True,
+                "alert_style": visible_alert.style,
+                "cooldown_suppressed": False,
+                "cooldown_remaining_seconds": 0,
+                "decision": "sent",
+                "reason": "forced",
+                "command": "",
+                "returncode": "",
+                "stderr": "",
+                "notification_sent": False,
+                "popup_allowed": True,
+                "visible_alert_shown": True,
+                "alert_suppressed_reason": "",
+            }
+            self._update_event_alert_trace(
+                event,
+                notification_policy_checked=True,
+                notification_policy_result=decision["decision"],
+                notification_policy_reason=decision["reason"],
+                severity_before_policy=severity_before_policy,
+                severity_after_policy=effective_severity,
+                alert_required=True,
+                alert_suppressed=False,
+                alert_suppression_reason="",
+            )
+            self._write_decision(decision)
+            return decision
         if not rule_for_event(event.event_type).enabled_by_default:
             event.notification_decision = "no_policy_match"
             event.notification_reason = "no_policy_match"
@@ -1153,45 +1273,6 @@ class NotificationManager:
             except ValueError:
                 current_count = 0
             self.db.set_background_monitor_state("suppressed_alert_count", str(current_count + 1))
-        if not (getattr(event, "rule_id", "") or getattr(event, "trigger_rule_id", "")):
-            event.notification_decision = "invalid_incomplete"
-            event.notification_reason = "missing_rule_id"
-            event.popup_allowed = False
-            decision = {
-                "event_id": event.event_id,
-                "event_type": event.event_type,
-                "severity": effective_severity,
-                "priority": effective_severity,
-                "user_preference_loaded": explicit_preference,
-                "notify": False,
-                "alert_style": preference.get("notification_mode", "none"),
-                "cooldown_suppressed": False,
-                "cooldown_remaining_seconds": 0,
-                "decision": "invalid_incomplete",
-                "reason": "missing_rule_id",
-                "command": "",
-                "returncode": "",
-                "stderr": "",
-                "notification_sent": False,
-                "popup_allowed": False,
-                "visible_alert_shown": False,
-                "alert_style": "neutral_grey",
-                "cooldown_suppressed": False,
-                "alert_suppressed_reason": "missing_rule_id",
-            }
-            self._update_event_alert_trace(
-                event,
-                notification_policy_checked=True,
-                notification_policy_result=decision["decision"],
-                notification_policy_reason=decision["reason"],
-                severity_before_policy=severity_before_policy,
-                severity_after_policy=effective_severity,
-                alert_required=bool(visible_alert.show),
-                alert_suppressed=not bool(visible_alert.show),
-                alert_suppression_reason=decision["alert_suppressed_reason"],
-            )
-            self._write_decision(decision)
-            return decision
         decision = {
             "event_id": event.event_id,
             "event_type": event.event_type,
@@ -1232,29 +1313,6 @@ class NotificationManager:
                 alert_required=bool(visible_alert.show),
                 alert_suppressed=True,
                 alert_suppression_reason=decision["alert_suppressed_reason"],
-            )
-            self._write_decision(decision)
-            return decision
-        if force:
-            decision["notify"] = True
-            decision["decision"] = "sent"
-            decision["reason"] = "forced"
-            event.notification_decision = "sent"
-            event.notification_reason = "forced"
-            event.cooldown_remaining_seconds = 0
-            event.popup_allowed = True
-            decision["popup_allowed"] = True
-            decision["visible_alert_shown"] = True
-            self._update_event_alert_trace(
-                event,
-                notification_policy_checked=True,
-                notification_policy_result=decision["decision"],
-                notification_policy_reason=decision["reason"],
-                severity_before_policy=severity_before_policy,
-                severity_after_policy=effective_severity,
-                alert_required=True,
-                alert_suppressed=False,
-                alert_suppression_reason="",
             )
             self._write_decision(decision)
             return decision
@@ -1316,6 +1374,8 @@ class NotificationManager:
             return decision
         decision["notify"] = True
         last_timestamp = self.db.get_background_monitor_state(self._last_key(event), "")
+        if not last_timestamp:
+            last_timestamp = self.db.get_background_monitor_state(self._legacy_last_key(event), "")
         if not last_timestamp:
             event.notification_decision = "sent"
             event.notification_reason = "first_severe_event"
@@ -1422,7 +1482,7 @@ class NotificationManager:
         event.normalized_event_type = event.event_type
         if self._is_idle_notice_event(event):
             self.show_visible_security_alert(event, reason="authorized_use_notice")
-            return self.notify_cfaa_idle_reminder(event)
+            return self.notify_cfaa_idle_reminder(event, require_dialog=True)
         settings = self.settings()
         preference = self.preference_for(event.event_type)
         message = self._message(event)
@@ -1467,6 +1527,7 @@ class NotificationManager:
             event.notification_returncode = 0
             if not force:
                 self.db.set_background_monitor_state(self._last_key(event), event.timestamp)
+                self.db.set_background_monitor_state(self._legacy_last_key(event), event.timestamp)
                 self.db.set_background_monitor_state("notification_status", self.status())
             self._record_alert_delivery(
                 event,
@@ -1485,6 +1546,7 @@ class NotificationManager:
             event.notification_returncode = 0
             if not force:
                 self.db.set_background_monitor_state(self._last_key(event), event.timestamp)
+                self.db.set_background_monitor_state(self._legacy_last_key(event), event.timestamp)
                 self.db.set_background_monitor_state("notification_status", self.status())
             self._write_fallback_log(
                 f"notification fallback: type={event.event_type} detail=visible alert shown; OS notification path unavailable"
@@ -1566,7 +1628,7 @@ class NotificationManager:
                 overlay_error="",
             )
             return False
-        state_path = OVERLAY_STATE_PATH
+        state_path = self._overlay_state_path()
         state_path.parent.mkdir(parents=True, exist_ok=True)
         previous = {}
         try:
@@ -1578,7 +1640,7 @@ class NotificationManager:
         payload = {
             "active": True,
             "event_type": event.event_type,
-            "severity": event.severity,
+            "severity": str(getattr(event, "_original_severity_for_alert", event.severity)),
             "style": decision.style,
             "title": self._overlay_title_for(event, decision),
             "details": self._overlay_details_for(event, decision),
@@ -1609,6 +1671,18 @@ class NotificationManager:
                 overlay_attempted=True,
                 overlay_success=False,
                 delivery_method_used="overlay",
+            )
+            self._update_event_alert_trace(
+                event,
+                overlay_dispatch_attempted=True,
+                overlay_dispatch_at=datetime.now().astimezone().isoformat(),
+                overlay_dispatch_result="FAILED",
+                overlay_error=str(exc),
+                alert_required=True,
+                alert_suppressed=False,
+                alert_suppression_reason="",
+                visible_alert_id="",
+                displayed_at="",
             )
             self._write_alert_pipeline_log(
                 event,
@@ -1670,7 +1744,7 @@ class NotificationManager:
         if self.db.get_background_monitor_state("security_overlay_enabled", "0") != "1":
             return False
         try:
-            payload = json.loads(OVERLAY_STATE_PATH.read_text(encoding="utf-8"))
+            payload = json.loads(self._overlay_state_path().read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             self.db.set_background_monitor_state("security_overlay_status", "inactive")
             return False
@@ -1692,16 +1766,18 @@ class NotificationManager:
         if self._security_overlay_pid_alive():
             return True
         script_path = Path(__file__).resolve().parent / "security_overlay.py"
+        state_path = self._overlay_state_path()
+        pid_path = self._overlay_pid_path()
         try:
             process = self.popen_factory(
-                [sys.executable, str(script_path), "--state-path", str(OVERLAY_STATE_PATH)],
+                [sys.executable, str(script_path), "--state-path", str(state_path)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 text=True,
                 env={**os.environ, **NOTIFICATION_PATH_ENV},
             )
-            OVERLAY_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
-            OVERLAY_PID_PATH.write_text(str(process.pid), encoding="utf-8")
+            pid_path.parent.mkdir(parents=True, exist_ok=True)
+            pid_path.write_text(str(process.pid), encoding="utf-8")
             return True
         except OSError as exc:
             self._write_fallback_log(f"security overlay launch unavailable: {exc}")
@@ -1711,7 +1787,7 @@ class NotificationManager:
 
     def _security_overlay_pid_alive(self) -> bool:
         try:
-            pid = int(OVERLAY_PID_PATH.read_text(encoding="utf-8").strip())
+            pid = int(self._overlay_pid_path().read_text(encoding="utf-8").strip())
             os.kill(pid, 0)
             return True
         except (OSError, ValueError):
@@ -1719,6 +1795,9 @@ class NotificationManager:
 
     def _last_key(self, event: BackgroundMonitorEvent) -> str:
         return f"notify:{event.event_type}:{self._alert_signature(event)}"
+
+    def _legacy_last_key(self, event: BackgroundMonitorEvent) -> str:
+        return f"notify:{event.event_type}:{event.process_name}:{event.evidence[:64]}"
 
     def _message(self, event: BackgroundMonitorEvent) -> str:
         evidence = event.evidence.strip().replace("\n", " ")
@@ -1913,7 +1992,7 @@ class NotificationManager:
         if event.event_type in {"input_activity_resumed_after_idle", "idle_resume_detected", "mouse_or_keyboard_activity_after_idle"}:
             return "Authorized Use Notice"
         if event.event_type in {"apple_security_forecast_elevated", "cve_forecast_level_increased"}:
-            return "Apple Security Forecast"
+            return "Apple Exposure Assessment"
         readable = event.event_type.replace("_", " ").strip().title()
         return readable or "Security Alert"
 

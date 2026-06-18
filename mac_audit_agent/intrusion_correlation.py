@@ -535,7 +535,8 @@ class IntrusionCorrelationEngine:
         return {"high": 2, "medium": 1, "low": 0}.get(confidence, 0)
 
     def _recent(self, events: list[dict[str, Any]], types: set[str], *, hours: int = 168) -> list[dict[str, Any]]:
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        newest = max((_parse_timestamp(item.get("timestamp", utc_now_iso())) for item in events), default=datetime.now(timezone.utc))
+        cutoff = newest - timedelta(hours=hours)
         return [item for item in events if item.get("event_type") in types and _parse_timestamp(item.get("timestamp", utc_now_iso())) >= cutoff]
 
     def _nearest_group(self, events: list[dict[str, Any]], candidates: list[dict[str, Any]], *, window_minutes: int) -> list[dict[str, Any]]:

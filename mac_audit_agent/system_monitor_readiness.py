@@ -358,6 +358,8 @@ class SystemMonitorReadiness:
         db_visible = False
         ui_visible = False
         notifier_visible = False
+        visible_alert_delivered = False
+        visible_alert_evidence = "not observed"
         try:
             db = AuditDatabase(self.db_path)
             db_visible = found_event is not None and any(event.event_id == found_event.event_id for event in db.recent_background_monitor_events(limit=100))
@@ -365,6 +367,21 @@ class SystemMonitorReadiness:
             pending = db.pending_background_monitor_events(limit=200)
             notifier_visible = found_event is not None and any(event.event_id == found_event.event_id for event in pending)
             if found_event:
+                trace = db.get_event_alert_trace(found_event.event_id)
+                deliveries = db.latest_alert_delivery_records(limit=100)
+                delivery = next((item for item in deliveries if item.event_id == found_event.event_id), None)
+                visible_alert_delivered = bool(
+                    getattr(found_event, "visible_alert_shown", False)
+                    or (trace and str(trace.overlay_dispatch_result).upper() == "SUCCESS")
+                    or (delivery and (delivery.overlay_success or delivery.dialog_success))
+                )
+                if delivery:
+                    visible_alert_evidence = (
+                        f"delivery overlay_success={delivery.overlay_success} "
+                        f"dialog_success={delivery.dialog_success} method={delivery.delivery_method_used or 'none'}"
+                    )
+                elif trace:
+                    visible_alert_evidence = f"trace overlay_result={trace.overlay_dispatch_result or 'none'} visible_alert_id={trace.visible_alert_id or 'none'}"
                 db.update_monitor_event_notification(
                     found_event.event_id,
                     notification_sent=True,
@@ -381,6 +398,16 @@ class SystemMonitorReadiness:
             stages.append(AuditCheckResult("ui_reads_event", "UI reads event", _status(ui_visible, "FAIL"), "UI can read shared DB event", "readable" if ui_visible else "missing"))
             notifier_status = self.user_notifier_manager.status()
             stages.append(AuditCheckResult("notifier_receives_event", "Notifier queue receives event", _status(notifier_visible and notifier_status.installed, "WARNING"), "pending event visible and notifier installed", f"pending={notifier_visible} notifier_installed={notifier_status.installed} loaded={notifier_status.loaded}"))
+            stages.append(
+                AuditCheckResult(
+                    "visible_alert_delivery",
+                    "Visible alert delivery observed",
+                    _status(visible_alert_delivered, "WARNING"),
+                    "overlay or dialog delivery success",
+                    visible_alert_evidence,
+                    "Synthetic deployment verification events are log-only unless a visible-alert test was explicitly routed through notifier/overlay.",
+                )
+            )
         return EventFlowVerification(generated_at=utc_now_iso(), request_id=request_id, stages=stages)
 
     def repair_mismatches(self, report: DeploymentAuditReport) -> list[str]:

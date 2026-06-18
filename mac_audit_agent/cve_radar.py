@@ -896,7 +896,7 @@ def group_forecast_cards_for_display(cards: list[dict[str, Any]]) -> list[dict[s
     grouped: list[dict[str, Any]] = []
     by_title: dict[str, dict[str, Any]] = {}
     for card in cards:
-        title = str(card.get("title", "Apple Security Forecast")).strip() or "Apple Security Forecast"
+        title = str(card.get("title", "Apple Exposure Assessment")).strip() or "Apple Exposure Assessment"
         category = str(card.get("category", "")).strip()
         group_key = f"{category}:{title}" if category else title
         existing = by_title.get(group_key)
@@ -1102,7 +1102,7 @@ class AppleSecurityForecastEngine:
         hidden_review_needed = sum(1 for card in cards if str(card.get("applicability", card.get("applicability_confidence", ""))) == "review_needed")
         state_text, why_no_cards = self._state_and_explanation(forecast_payload if forecast else legacy_payload, cards)
         LOGGER.info(
-            "Apple Security Forecast loaded from cache forecast_id=%s cards=%d state=%s",
+            "Apple Exposure Assessment loaded from cache forecast_id=%s cards=%d state=%s",
             forecast.get("forecast_id", "") if forecast else legacy.get("cache_key", "") if legacy else "",
             len(display_cards),
             state_text,
@@ -1137,7 +1137,7 @@ class AppleSecurityForecastEngine:
 
     def _state_and_explanation(self, payload: dict[str, Any], cards: list[dict[str, Any]]) -> tuple[str, str]:
         if not payload and not cards:
-            return "Forecast not checked yet", "No Apple Security Forecast has been checked yet."
+            return "Assessment not checked yet", "No Apple Exposure Assessment has been checked yet."
         if payload.get("last_error") and not cards:
             if payload.get("catalog_update_status") in {"offline-cache", "offline-rules"}:
                 return "Unable to update forecast — using cache" if payload.get("timestamp") else "Unable to update forecast — no cache available", str(payload.get("last_error", ""))
@@ -1164,7 +1164,7 @@ class AppleSecurityForecastEngine:
             return "Check Today", "Apple security update guidance may apply. Check Software Update when convenient today."
         if level == "watch":
             return "Watch", "Apple advisory data exists, but the local match is not strong enough to recommend immediate action."
-        return "Clear — no applicable Apple security updates found", "No applicable Apple security forecast cards were found."
+        return "Clear — no applicable Apple security updates found", "No applicable Apple security exposure cards were found."
 
     def _source_status(self, catalog: dict[str, Any]) -> dict[str, str]:
         sources = set(catalog.get("data_sources_used", []))
@@ -1183,11 +1183,11 @@ class AppleSecurityForecastEngine:
         manual: bool = False,
         force: bool = False,
     ) -> dict[str, Any]:
-        LOGGER.info("Apple Security Forecast update requested manual=%s force=%s", manual, force)
+        LOGGER.info("Apple Exposure Assessment update requested manual=%s force=%s", manual, force)
         forecast = self.generate_forecast(current_scan_result=current_scan_result, manual=manual, force=force)
         self.db.record_apple_security_forecast(forecast.to_dict())
         self.db.record_apple_security_forecast_cards([_card_payload(card) for card in forecast.cards])
-        LOGGER.info("Apple Security Forecast stored forecast_id=%s cards=%d level=%s simulated=%s", forecast.forecast_id, len(forecast.cards), forecast.level, forecast.simulated)
+        LOGGER.info("Apple Exposure Assessment stored forecast_id=%s cards=%d level=%s simulated=%s", forecast.forecast_id, len(forecast.cards), forecast.level, forecast.simulated)
         return forecast.to_dict()
 
     def generate_forecast(
@@ -1216,7 +1216,7 @@ class AppleSecurityForecastEngine:
             payload.setdefault("why_no_cards", str(payload.get("why_no_cards", "")))
             payload.setdefault("last_error", str(payload.get("last_error", "")))
             LOGGER.info(
-                "Apple Security Forecast using cached forecast forecast_id=%s cards=%d",
+                "Apple Exposure Assessment using cached forecast forecast_id=%s cards=%d",
                 cached.get("forecast_id", ""),
                 len(payload.get("cards", [])),
             )
@@ -1236,17 +1236,17 @@ class AppleSecurityForecastEngine:
                 payload.setdefault("why_no_cards", str(payload.get("why_no_cards", "")))
                 payload.setdefault("last_error", str(payload.get("last_error", "")))
                 LOGGER.info(
-                    "Apple Security Forecast using fresh cache forecast_id=%s cards=%d",
+                    "Apple Exposure Assessment using fresh cache forecast_id=%s cards=%d",
                     cached.get("forecast_id", ""),
                     len(payload.get("cards", [])),
                 )
                 return AppleSecurityForecast(**payload)
 
-        LOGGER.info("Apple Security Forecast collecting Apple inventory")
+        LOGGER.info("Apple Exposure Assessment collecting Apple inventory")
         catalog = self._catalog(manual=manual, force=force)
-        LOGGER.info("Apple Security Forecast catalog status=%s sources=%s errors=%d", catalog.get("catalog_update_status", "unknown"), catalog.get("data_sources_used", []), len(catalog.get("errors", [])))
+        LOGGER.info("Apple Exposure Assessment catalog status=%s sources=%s errors=%d", catalog.get("catalog_update_status", "unknown"), catalog.get("data_sources_used", []), len(catalog.get("errors", [])))
         inventory = collect_apple_security_inventory()
-        LOGGER.info("Apple Security Forecast inventory collected products=%d macOS=%s Safari=%s WebKit=%s Xcode=%s", len(inventory.get("products", [])), inventory.get("macos_version", ""), inventory.get("safari_version", ""), inventory.get("webkit_version", ""), inventory.get("xcode_version", ""))
+        LOGGER.info("Apple Exposure Assessment inventory collected products=%d macOS=%s Safari=%s WebKit=%s Xcode=%s", len(inventory.get("products", [])), inventory.get("macos_version", ""), inventory.get("safari_version", ""), inventory.get("webkit_version", ""), inventory.get("xcode_version", ""))
         cards = self._build_cards(catalog, inventory, current_scan_result)
         cards = self._apply_review_state(cards)
         cards = group_forecast_cards_for_display([card.to_dict() for card in cards])
@@ -1303,7 +1303,7 @@ class AppleSecurityForecastEngine:
             card_count=len(cards),
             diagnostics=self._last_diagnostics,
         )
-        LOGGER.info("Apple Security Forecast built forecast_id=%s level=%s cards=%d announce=%s", forecast.forecast_id, forecast.level, len(cards), forecast.should_announce)
+        LOGGER.info("Apple Exposure Assessment built forecast_id=%s level=%s cards=%d announce=%s", forecast.forecast_id, forecast.level, len(cards), forecast.should_announce)
         return forecast
 
     def purge_simulated_forecasts(self) -> None:
@@ -1712,7 +1712,7 @@ class AppleSecurityForecastEngine:
             return "Check Software Update today or during the next normal maintenance window."
         if card.forecast_level == "watch":
             return "No immediate action. Keep this on the radar until Apple or local version evidence becomes clearer."
-        return "No Apple security update planning is needed from this forecast card."
+        return "No Apple security update planning is needed from this exposure card."
 
     def _augment_why_shown(self, base: str, current_scan_result: ScanResult, product: str) -> str:
         if not current_scan_result:

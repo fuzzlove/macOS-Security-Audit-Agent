@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import logging
+import os
 import random
 import subprocess
 import shlex
@@ -89,6 +90,15 @@ from mac_audit_agent.execution_evidence import ExecutionEvidenceEngine
 from mac_audit_agent.family_safety import FamilySafetyAuditor, export_family_safety_html, export_family_safety_json
 from mac_audit_agent.intrusion_correlation import IntrusionCorrelationEngine
 from mac_audit_agent.operational_health import OperationalHealthEngine
+from mac_audit_agent.reliability import (
+    AlertPipelineInspector,
+    ConfigurationDriftEngine,
+    IncidentModeManager,
+    MonitoringCoverageEngine,
+    ReleaseReadinessEngine,
+    TrustDecayEngine,
+    export_sarif,
+)
 from mac_audit_agent.ui.action_state import ActionState, apply_action_state
 from mac_audit_agent.ui.family_safety_panel import FamilySafetyPanel
 from mac_audit_agent.ui.investigation_priority_panel import InvestigationPriorityPanel
@@ -99,6 +109,7 @@ from mac_audit_agent.ui.flight_recorder_panel import FlightRecorderPanel
 from mac_audit_agent.ui.intrusion_detection_panel import IntrusionDetectionPanel
 from mac_audit_agent.ui.logs_panel import LogsPanel
 from mac_audit_agent.ui.operational_health_panel import OperationalHealthPanel
+from mac_audit_agent.ui.reliability_panel import ReliabilityPanel
 from mac_audit_agent.ui.system_recovery_panel import RecoveryEvidenceWarningDialog, SystemRecoveryPanel
 from mac_audit_agent.ui.theme_panel import ThemeSettingsPanel
 from mac_audit_agent.recovery_center import SystemRecoveryCenter
@@ -165,7 +176,7 @@ DEFAULT_REMEDIATION_BY_CATEGORY = {
             "Use the vendor or Apple-supported update path rather than downloading random installers.",
             "Prioritize known exploited, locally applicable, high-confidence items first.",
         ],
-        "verification": ["Refresh the forecast or vulnerability scan and confirm the fixed version is detected locally."],
+        "verification": ["Refresh the assessment or vulnerability scan and confirm the fixed version is detected locally."],
     },
     "baseline": {
         "steps": [
@@ -945,6 +956,8 @@ class MainWindow(QMainWindow):
 
         self.db_path = db_path
         self.config = config or AuditConfig()
+        if config is None and db_path.parent != Path.home():
+            self.config.logs_dir = db_path.parent / "logs"
         self.registry = build_command_registry()
         self.runner = SafeCommandRunner(RunnerConfig(dry_run=self.config.dry_run))
         self.collectors = CollectorSuite(self.runner, self.config)
@@ -974,6 +987,12 @@ class MainWindow(QMainWindow):
             system_readiness=SystemMonitorReadiness(default_monitor_db_path("system")),
             cve_radar_engine=self.cve_radar_engine,
         )
+        self.alert_pipeline_inspector = AlertPipelineInspector(self.db)
+        self.monitoring_coverage_engine = MonitoringCoverageEngine(self.db)
+        self.release_readiness_engine = ReleaseReadinessEngine(self.db)
+        self.trust_decay_engine = TrustDecayEngine(self.db)
+        self.configuration_drift_engine = ConfigurationDriftEngine(self.db)
+        self.incident_mode_manager = IncidentModeManager(self.db)
         self._active_network_discovery_dialog: NetworkDiscoveryProgressDialog | None = None
         self.tray_icon: QSystemTrayIcon | None = None
         self.tray_status_action: QAction | None = None
@@ -997,6 +1016,7 @@ class MainWindow(QMainWindow):
         self._refresh_command_preview_page()
         self._refresh_dashboard()
         self.refresh_operational_health()
+        self.refresh_reliability()
         self.apply_theme_choice(
             self.db.get_background_monitor_state("selected_theme", DEFAULT_THEME_NAME),
             self.db.get_background_monitor_state("accessibility_high_contrast", "0") == "1",
@@ -1031,8 +1051,9 @@ class MainWindow(QMainWindow):
             "Intrusion Detection",
             "Investigation Priorities",
             "Flight Recorder",
-            "Evidence Snapshots",
             "Logs",
+            "Reliability",
+            "System Recovery",
             "Settings",
             "Skins",
             "Scan Categories",
@@ -1050,7 +1071,7 @@ class MainWindow(QMainWindow):
         self.cve_radar_panel.export_requested.connect(self.export_html)
         self.cve_radar_panel.review_requested.connect(self._review_cve_radar_card)
         self.cve_radar_panel.snooze_requested.connect(self._snooze_cve_radar_card)
-        self.cve_radar_panel.set_status("Forecast not checked yet")
+        self.cve_radar_panel.set_status("Assessment not checked yet")
         self.family_safety_panel = FamilySafetyPanel(self)
         self.family_safety_panel.audit_requested.connect(self.run_family_safety_audit)
         self.family_safety_panel.export_html_requested.connect(self.export_family_safety_html)
@@ -1076,6 +1097,15 @@ class MainWindow(QMainWindow):
         self.theme_panel.theme_changed.connect(self.apply_theme_choice)
         self.operational_health_panel = OperationalHealthPanel(self)
         self.operational_health_panel.refresh_requested.connect(self.refresh_operational_health)
+        self.reliability_panel = ReliabilityPanel(self)
+        self.reliability_panel.refresh_requested.connect(self.refresh_reliability)
+        self.reliability_panel.incident_mode_enable_requested.connect(lambda: self.set_incident_mode(True))
+        self.reliability_panel.incident_mode_disable_requested.connect(lambda: self.set_incident_mode(False))
+        self.reliability_panel.incident_create_snapshot_requested.connect(self.create_system_recovery_snapshot)
+        self.reliability_panel.incident_open_timeline_requested.connect(self.show_flight_recorder_page)
+        self.reliability_panel.incident_export_case_package_requested.connect(self.export_incident_case_package)
+        self.reliability_panel.incident_add_note_requested.connect(self.open_incident_note_panel)
+        self.reliability_panel.incident_review_high_priority_requested.connect(self.show_investigation_priorities_page)
         self.background_monitor_panel = BackgroundMonitorPanel(self.db, self.launch_agent_manager, self)
         self.operational_health_panel.audit_deployment_requested.connect(self.background_monitor_panel.audit_system_monitor_deployment)
         self.operational_health_panel.verify_event_flow_requested.connect(self.background_monitor_panel.verify_system_monitor_event_flow)
@@ -1092,8 +1122,9 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_intrusion_detection_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_investigation_priorities_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_flight_recorder_page(), resizable=True))
-        self.pages.addWidget(self._wrap_in_scroll_area(self._build_system_recovery_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_logs_page(), resizable=True))
+        self.pages.addWidget(self._wrap_in_scroll_area(self._build_reliability_page(), resizable=True))
+        self.pages.addWidget(self._wrap_in_scroll_area(self._build_system_recovery_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_settings_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_skins_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_categories_page(), resizable=True))
@@ -1288,6 +1319,12 @@ class MainWindow(QMainWindow):
         help_menu.addAction(about_action)
 
     def _setup_tray_icon(self) -> None:
+        if self._tray_disabled_for_test_session():
+            LOGGER.info("System tray disabled for offscreen/test session.")
+            app = QApplication.instance()
+            if app is not None:
+                app.setQuitOnLastWindowClosed(True)
+            return
         if not QSystemTrayIcon.isSystemTrayAvailable():
             LOGGER.info("System tray is not available; tray monitor icon disabled.")
             return
@@ -1337,6 +1374,9 @@ class MainWindow(QMainWindow):
         self.tray_status_timer.timeout.connect(self._refresh_tray_status)
         self.tray_status_timer.start()
         self._refresh_tray_status()
+
+    def _tray_disabled_for_test_session(self) -> bool:
+        return os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen" or bool(os.environ.get("PYTEST_CURRENT_TEST"))
 
     def _tray_monitor_summary(self) -> tuple[str, str]:
         status = self.db.get_background_monitor_status()
@@ -1444,6 +1484,8 @@ class MainWindow(QMainWindow):
         self.export_json_button.clicked.connect(self.export_json)
         self.export_html_button = QPushButton("Export HTML")
         self.export_html_button.clicked.connect(self.export_html)
+        self.export_sarif_button = QPushButton("Export SARIF")
+        self.export_sarif_button.clicked.connect(self.export_sarif_report)
         self.open_reports_folder_button = QPushButton("Open Reports Folder")
         self.open_reports_folder_button.setToolTip("Open the local reports folder.")
         self.open_reports_folder_button.clicked.connect(self.open_reports_folder)
@@ -1453,7 +1495,7 @@ class MainWindow(QMainWindow):
         )
         self.dashboard_report_actions = self._build_dashboard_action_group(
             "Reports",
-            [self.export_json_button, self.export_html_button, self.open_reports_folder_button],
+            [self.export_json_button, self.export_html_button, self.export_sarif_button, self.open_reports_folder_button],
         )
         self.dashboard_advanced_note = QFrame()
         advanced_note_layout = QVBoxLayout(self.dashboard_advanced_note)
@@ -1498,9 +1540,9 @@ class MainWindow(QMainWindow):
         forecast_layout = QVBoxLayout(self.dashboard_forecast_frame)
         forecast_layout.setContentsMargins(14, 14, 14, 14)
         forecast_layout.setSpacing(6)
-        forecast_title = QLabel("Apple Security Forecast")
+        forecast_title = QLabel("Apple Exposure Assessment")
         forecast_title.setStyleSheet("font-size: 16px; font-weight: 700; color: #F0F6FC;")
-        self.dashboard_forecast_level_label = QLabel("Level: Forecast not checked yet")
+        self.dashboard_forecast_level_label = QLabel("Level: Assessment not checked yet")
         self.dashboard_forecast_last_checked_label = QLabel("Last checked: not yet")
         self.dashboard_forecast_cards_label = QLabel("Cards: 0")
         self.dashboard_forecast_kev_label = QLabel("KEV: 0")
@@ -1511,7 +1553,7 @@ class MainWindow(QMainWindow):
             self.dashboard_forecast_kev_label,
         ]:
             label.setStyleSheet("color: #D6E4FF;")
-        self.open_forecast_button = make_forecast_button("Show Forecast", "Keep the Dashboard selected and focus the Apple Security Forecast section below.", "primary")
+        self.open_forecast_button = make_forecast_button("Show Assessment", "Keep the Dashboard selected and focus the Apple Exposure Assessment section below.", "primary")
         self.open_forecast_button.clicked.connect(self.show_forecast_page)
         forecast_layout.addWidget(forecast_title)
         forecast_layout.addWidget(self.dashboard_forecast_level_label)
@@ -1819,6 +1861,13 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.system_recovery_panel)
+        return page
+
+    def _build_reliability_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.reliability_panel)
         return page
 
     def _build_settings_page(self) -> QWidget:
@@ -2778,7 +2827,7 @@ class MainWindow(QMainWindow):
             "accounts": "Use Logs > Monitor Events and Remediation Actions. Refresh after account changes; clear only after exporting investigation records.",
             "files": "Use Logs > Scan Command Logs and Remediation Actions. Refresh file/process evidence before cleanup and keep logs until recovery is confirmed.",
             "process": "Use Logs > Monitor Events and Scan Command Logs. Refresh after stopping a process; preserve the process timeline first.",
-            "vulnerability": "Use Logs > Scan Command Logs and Apple Security Forecast details. Refresh after updating; clear stale scan logs only after the fixed version is verified.",
+            "vulnerability": "Use Logs > Scan Command Logs and Apple Exposure Assessment details. Refresh after updating; clear stale scan logs only after the fixed version is verified.",
             "baseline": "Use Logs > Scan Command Logs. Refresh baseline comparison after marking expected changes; clear only old scan logs after export.",
             "monitor": "Use Logs > Monitor Events and Application File Logs. Refresh after monitor repair; do not clear monitor events until alert flow is verified.",
         }
@@ -2934,6 +2983,8 @@ class MainWindow(QMainWindow):
         export_state = ActionState(has_scan_result, True, "Run a scan first to generate an exportable report.", ["completed scan"])
         apply_action_state(self.export_json_button, export_state)
         apply_action_state(self.export_html_button, export_state)
+        if hasattr(self, "export_sarif_button"):
+            apply_action_state(self.export_sarif_button, export_state)
         latest_scan = None
         findings = []
         if self.current_scan_active:
@@ -3288,6 +3339,109 @@ class MainWindow(QMainWindow):
                 }
             )
 
+    def refresh_reliability(self) -> None:
+        if not hasattr(self, "reliability_panel"):
+            return
+        try:
+            drift_payload = self._current_configuration_drift_payload()
+            payload = {
+                "alert_pipeline": self.alert_pipeline_inspector.build_health().to_dict(),
+                "monitoring_coverage": self.monitoring_coverage_engine.build_report().to_dict(),
+                "release_readiness": self.release_readiness_engine.build_report(run_expensive=False).to_dict(),
+                "trust_decay": self.trust_decay_engine.build_report(),
+                "configuration_drift": drift_payload,
+                "incident_mode": self.incident_mode_manager.status(),
+            }
+            self.reliability_panel.set_payload(payload)
+            if self.current_payload is not None:
+                self.current_payload["reliability"] = payload
+            LOGGER.info(
+                "Reliability dashboard rendered coverage=%s release=%s trust=%s",
+                payload["monitoring_coverage"].get("score"),
+                payload["release_readiness"].get("ReleaseReadinessScore"),
+                payload["trust_decay"].get("current_score"),
+            )
+        except Exception as exc:
+            LOGGER.exception("Failed to refresh Reliability dashboard: %s", exc)
+            self.reliability_panel.set_payload(
+                {
+                    "alert_pipeline": {"last_failure_stage": f"dashboard:{exc}"},
+                    "monitoring_coverage": {"score": 0, "components": []},
+                    "release_readiness": {"ReleaseReadinessScore": 0, "status": "blocked", "checks": []},
+                    "trust_decay": {"current_score": 0, "trend": "unknown", "timeline": []},
+                    "configuration_drift": {"changes": []},
+                    "incident_mode": self.incident_mode_manager.status(),
+                }
+            )
+
+    def _current_reliability_payload(self) -> dict:
+        try:
+            drift_payload = self._current_configuration_drift_payload()
+            return {
+                "alert_pipeline": self.alert_pipeline_inspector.build_health().to_dict(),
+                "monitoring_coverage": self.monitoring_coverage_engine.build_report().to_dict(),
+                "release_readiness": self.release_readiness_engine.build_report(run_expensive=False).to_dict(),
+                "trust_decay": self.trust_decay_engine.build_report(),
+                "configuration_drift": drift_payload,
+                "incident_mode": self.incident_mode_manager.status(),
+            }
+        except Exception as exc:
+            LOGGER.exception("Failed to build reliability export payload: %s", exc)
+            return {
+                "alert_pipeline": {"last_failure_stage": f"export:{exc}"},
+                "monitoring_coverage": {"score": 0, "components": []},
+                "release_readiness": {"ReleaseReadinessScore": 0, "status": "blocked", "checks": []},
+                "trust_decay": {"current_score": 0, "trend": "unknown", "timeline": []},
+                "configuration_drift": {"changes": []},
+                "incident_mode": self.incident_mode_manager.status(),
+            }
+
+    def _current_configuration_drift_payload(self) -> dict:
+        snapshot: dict[str, object] = {}
+        raw_snapshot = self.db.get_background_monitor_state("current_monitor_snapshot", "")
+        if raw_snapshot:
+            try:
+                loaded = json.loads(raw_snapshot)
+                if isinstance(loaded, dict):
+                    snapshot.update(loaded)
+            except json.JSONDecodeError:
+                LOGGER.warning("Ignoring corrupt current_monitor_snapshot for configuration drift")
+        artifacts = {}
+        if self.current_scan_result is not None:
+            artifacts = getattr(self.current_scan_result, "collected_artifacts", {}) or {}
+        network_discovery = artifacts.get("network_discovery", {}) if isinstance(artifacts, dict) else {}
+        values = {
+            "remote_login": snapshot.get("remote_login_enabled", ""),
+            "screen_sharing": snapshot.get("screen_sharing_enabled", ""),
+            "file_sharing": snapshot.get("file_sharing_enabled", ""),
+            "dns_servers": snapshot.get("dns_servers", network_discovery.get("dns_servers", "") if isinstance(network_discovery, dict) else ""),
+            "vpn_state": snapshot.get("vpn_interfaces", network_discovery.get("vpn_interfaces", "") if isinstance(network_discovery, dict) else ""),
+            "proxy_settings": snapshot.get("proxy_settings", ""),
+            "admin_users": snapshot.get("admin_users", artifacts.get("admin_users", "") if isinstance(artifacts, dict) else ""),
+            "launchagents": snapshot.get("launch_agents", ""),
+            "launchdaemons": snapshot.get("launch_daemons", ""),
+            "login_items": snapshot.get("login_items", ""),
+            "profiles_mdm": snapshot.get("profiles_mdm", artifacts.get("profiles_mdm", "") if isinstance(artifacts, dict) else ""),
+            "firewall": snapshot.get("firewall", artifacts.get("firewall", "") if isinstance(artifacts, dict) else ""),
+            "filevault": snapshot.get("filevault", artifacts.get("filevault", "") if isinstance(artifacts, dict) else ""),
+            "gatekeeper": snapshot.get("gatekeeper", artifacts.get("gatekeeper", "") if isinstance(artifacts, dict) else ""),
+            "sip": snapshot.get("sip", artifacts.get("sip", "") if isinstance(artifacts, dict) else ""),
+        }
+        if any(value not in ("", None, []) for value in values.values()):
+            self.configuration_drift_engine.update_snapshot(values, source_detector="monitor_snapshot")
+        return self.configuration_drift_engine.timeline()
+
+    def set_incident_mode(self, enabled: bool) -> None:
+        status = self.incident_mode_manager.set_enabled(enabled)
+        self.refresh_reliability()
+        message = status.get("banner") or "Incident Mode disabled."
+        self.statusBar().showMessage(str(message), 5000)
+
+    def open_incident_note_panel(self) -> None:
+        self.incident_mode_manager.record_note_panel_opened()
+        self.show_investigation_notes_page()
+        self.refresh_reliability()
+
     def apply_theme_choice(self, theme_name: str, accessibility: bool) -> None:
         theme = theme_for_name(theme_name)
         self.db.set_background_monitor_state("selected_theme", theme.name)
@@ -3376,16 +3530,16 @@ class MainWindow(QMainWindow):
             self.current_scan_result.collected_artifacts["cve_radar"] = radar_payload
         if hasattr(self, "cve_radar_panel"):
             self.cve_radar_panel.set_radar_data(radar_payload)
-            state_text = str(radar_payload.get("state_text", "") or radar_payload.get("level", radar_payload.get("forecast_level", "Forecast not checked yet")))
+            state_text = str(radar_payload.get("state_text", "") or radar_payload.get("level", radar_payload.get("forecast_level", "Assessment not checked yet")))
             self.cve_radar_panel.set_status(state_text)
         if hasattr(self, "dashboard_forecast_level_label"):
-            level_text = str(radar_payload.get("state_text", radar_payload.get("level", "Forecast not checked yet")))
+            level_text = str(radar_payload.get("state_text", radar_payload.get("level", "Assessment not checked yet")))
             self.dashboard_forecast_level_label.setText(f"Level: {level_text}")
             self.dashboard_forecast_last_checked_label.setText(f"Last checked: {radar_payload.get('generated_at', radar_payload.get('timestamp', 'not yet'))}")
             self.dashboard_forecast_cards_label.setText(f"Cards: {radar_payload.get('card_count', len(radar_payload.get('display_cards', radar_payload.get('cards', []))))}")
             self.dashboard_forecast_kev_label.setText(f"KEV: {radar_payload.get('kev_count', radar_payload.get('kev_matches', 0))}")
         LOGGER.info(
-            "Apple Security Forecast rendered card_count=%d state=%s",
+            "Apple Exposure Assessment rendered card_count=%d state=%s",
             len(radar_payload.get("display_cards", radar_payload.get("cards", []))),
             radar_payload.get("state_text", radar_payload.get("level", "")),
         )
@@ -3400,17 +3554,17 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "cve_radar_panel"):
             return
         if initial_load and not manual and not force and not self.config.auto_update_apple_security_forecast:
-            LOGGER.info("Apple Security Forecast initial load from cache only")
+            LOGGER.info("Apple Exposure Assessment initial load from cache only")
             cached = self.cve_radar_engine.load_cached_state()
             self._apply_cve_radar_payload(cached)
-            self.statusBar().showMessage("Apple Security Forecast loaded from cache", 3000)
+            self.statusBar().showMessage("Apple Exposure Assessment loaded from cache", 3000)
             return
         if not manual and not force and not self.config.auto_update_apple_security_forecast:
             cached = self.cve_radar_engine.load_cached_state()
             self._apply_cve_radar_payload(cached)
-            self.cve_radar_panel.set_status(str(cached.get("state_text", "Forecast not checked yet")))
+            self.cve_radar_panel.set_status(str(cached.get("state_text", "Assessment not checked yet")))
             return
-        self.cve_radar_panel.set_status("Checking Apple Security Forecast...")
+        self.cve_radar_panel.set_status("Checking Apple Exposure Assessment...")
         try:
             radar_payload = self.cve_radar_engine.update_radar(
                 current_scan_result=self.current_scan_result,
@@ -3418,8 +3572,8 @@ class MainWindow(QMainWindow):
                 force=force,
             )
         except Exception as exc:
-            LOGGER.exception("Failed to refresh Apple Security Forecast: %s", exc)
-            self.statusBar().showMessage("Apple Security Forecast update failed", 5000)
+            LOGGER.exception("Failed to refresh Apple Exposure Assessment: %s", exc)
+            self.statusBar().showMessage("Apple Exposure Assessment update failed", 5000)
             cached = self.cve_radar_engine.load_cached_state()
             if not cached.get("timestamp") and not cached.get("display_cards"):
                 cached["state_text"] = "Unable to update forecast — no cache available"
@@ -3432,11 +3586,11 @@ class MainWindow(QMainWindow):
             return
         self._apply_cve_radar_payload(radar_payload)
         LOGGER.info(
-            "Apple Security Forecast rendered state=%s cards=%d",
+            "Apple Exposure Assessment rendered state=%s cards=%d",
             radar_payload.get("state_text", radar_payload.get("level", "")),
             len(radar_payload.get("display_cards", radar_payload.get("cards", []))),
         )
-        self.statusBar().showMessage("Apple Security Forecast updated", 3000)
+        self.statusBar().showMessage("Apple Exposure Assessment updated", 3000)
 
     def refresh_cve_radar(self, manual: bool = False, force: bool = False) -> None:
         self.refresh_apple_security_forecast(manual=manual, force=force)
@@ -3528,6 +3682,7 @@ class MainWindow(QMainWindow):
                 extra_roots=self._recovery_extra_specs() or None,
             )
             snapshot = self.recovery_center.create_evidence_snapshot(self.current_scan_result, self.current_payload, assessment, preview, reason="manual")
+            self.incident_mode_manager.record_evidence_snapshot(snapshot.get("snapshot_path", ""), reason="manual")
             self.statusBar().showMessage("System recovery snapshot created", 5000)
             QMessageBox.information(self, "Evidence Snapshot Created", f"Snapshot created before cleanup:\n{snapshot['snapshot_path']}")
         except Exception as exc:
@@ -3544,6 +3699,11 @@ class MainWindow(QMainWindow):
 
     def run_system_recovery_cleanup(self) -> None:
         if not hasattr(self, "system_recovery_panel"):
+            return
+        allowed, reason = self.incident_mode_manager.cleanup_allowed(confirmed=False)
+        if not allowed:
+            QMessageBox.warning(self, "Incident Mode Active", reason)
+            self.statusBar().showMessage("Cleanup blocked by Incident Mode", 5000)
             return
         warning_dialog = RecoveryEvidenceWarningDialog(self)
         result = warning_dialog.exec()
@@ -3637,7 +3797,7 @@ class MainWindow(QMainWindow):
             f"  apple_security_cve_cache: {diagnostics.get('table_counts', {}).get('apple_security_cve_cache', 0)}",
             f"  apple_security_review_state: {diagnostics.get('table_counts', {}).get('apple_security_review_state', 0)}",
         ]
-        dialog = CveRadarDetailsDialog("Forecast Diagnostics", "\n".join(lines), self)
+        dialog = CveRadarDetailsDialog("Assessment Diagnostics", "\n".join(lines), self)
         dialog.exec()
 
     def _review_cve_radar_card(self, card: dict[str, object]) -> None:
@@ -3647,7 +3807,7 @@ class MainWindow(QMainWindow):
         for alert_id in alert_ids:
             self.cve_radar_engine.mark_reviewed(alert_id, notes="Marked reviewed from radar panel.")
         self._apply_cve_radar_payload(self.cve_radar_engine.load_cached_state())
-        self.statusBar().showMessage("Apple Security Forecast item marked reviewed", 3000)
+        self.statusBar().showMessage("Apple Exposure Assessment item marked reviewed", 3000)
 
     def _snooze_cve_radar_card(self, card: dict[str, object], values: dict[str, object]) -> None:
         alert_ids = [str(item.get("alert_id", "")) for item in card.get("alerts", [card]) if isinstance(item, dict) and item.get("alert_id")]
@@ -3663,7 +3823,7 @@ class MainWindow(QMainWindow):
                 notes="Snoozed from radar panel.",
             )
         self._apply_cve_radar_payload(self.cve_radar_engine.load_cached_state())
-        self.statusBar().showMessage("Apple Security Forecast item snoozed", 3000)
+        self.statusBar().showMessage("Apple Exposure Assessment item snoozed", 3000)
 
     def _change_page(self, row: int) -> None:
         if row >= 0 and hasattr(self, "pages"):
@@ -3686,7 +3846,7 @@ class MainWindow(QMainWindow):
         self._show_sidebar_page("Dashboard")
         if hasattr(self, "cve_radar_panel"):
             self.cve_radar_panel.setFocus(Qt.OtherFocusReason)
-        self.statusBar().showMessage("Apple Security Forecast is available on the Dashboard", 3000)
+        self.statusBar().showMessage("Apple Exposure Assessment is available on the Dashboard", 3000)
 
     def show_intrusion_detection_page(self) -> None:
         self._show_sidebar_page("Intrusion Detection")
@@ -3694,11 +3854,14 @@ class MainWindow(QMainWindow):
     def show_investigation_priorities_page(self) -> None:
         self._show_sidebar_page("Investigation Priorities")
 
+    def show_investigation_notes_page(self) -> None:
+        self._show_sidebar_page("Investigation Notes")
+
     def show_flight_recorder_page(self) -> None:
         self._show_sidebar_page("Flight Recorder")
 
     def show_system_recovery_page(self) -> None:
-        self._show_sidebar_page("Evidence Snapshots")
+        self._show_sidebar_page("System Recovery")
 
     def show_logs_page(self) -> None:
         self._show_sidebar_page("Logs")
@@ -4128,7 +4291,7 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event) -> None:
-        if self.tray_icon is not None and self.tray_icon.isVisible() and not self._force_quit_from_tray:
+        if self.tray_icon is not None and self.tray_icon.isVisible() and not self._force_quit_from_tray and not self._tray_disabled_for_test_session():
             event.ignore()
             self.hide()
             self._refresh_tray_status()
@@ -4751,6 +4914,7 @@ class MainWindow(QMainWindow):
         investigation_audit_trail = [item.to_dict() for item in self.db.list_investigation_audit_trail(limit=1000)] if include_investigation_notes else []
         try:
             investigation_priorities = self.investigation_priority_engine.build_priorities(scan_result=self.current_scan_result).to_dict() if self.current_scan_result else None
+            reliability = self._current_reliability_payload()
             saved_path = export_scan_result_json(
                 self.current_scan_result,
                 Path(path),
@@ -4760,6 +4924,7 @@ class MainWindow(QMainWindow):
                 investigation_notes=investigation_notes,
                 investigation_audit_trail=investigation_audit_trail,
                 investigation_priorities=investigation_priorities,
+                reliability=reliability,
             )
         except OSError as exc:
             self.statusBar().showMessage("export failed", 5000)
@@ -4768,13 +4933,13 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("report exported", 5000)
         QMessageBox.information(self, "JSON Report Exported", f"Saved JSON report to:\n{saved_path}")
 
-    def export_html(self) -> None:
+    def export_html(self) -> Path | None:
         if not self._ensure_scan_state():
-            return
+            return None
         default_report_path = str(default_html_report_path())
         path, _ = QFileDialog.getSaveFileName(self, "Export HTML Report", default_report_path, "HTML Files (*.html)")
         if not path:
-            return
+            return None
         include_background_monitor_logs = self._confirm_include_background_monitor_logs()
         include_investigation_notes = self._confirm_include_investigation_notes()
         background_monitor_events = [item.to_dict() for item in self.db.recent_background_monitor_events(limit=1000)] if include_background_monitor_logs else []
@@ -4782,6 +4947,7 @@ class MainWindow(QMainWindow):
         investigation_audit_trail = [item.to_dict() for item in self.db.list_investigation_audit_trail(limit=1000)] if include_investigation_notes else []
         try:
             investigation_priorities = self.investigation_priority_engine.build_priorities(scan_result=self.current_scan_result).to_dict() if self.current_scan_result else None
+            reliability = self._current_reliability_payload()
             saved_path = export_scan_result_html(
                 self.current_scan_result,
                 Path(path),
@@ -4791,13 +4957,39 @@ class MainWindow(QMainWindow):
                 investigation_notes=investigation_notes,
                 investigation_audit_trail=investigation_audit_trail,
                 investigation_priorities=investigation_priorities,
+                reliability=reliability,
             )
         except OSError as exc:
             self.statusBar().showMessage("export failed", 5000)
             QMessageBox.critical(self, "Export Failed", f"Failed to export HTML report:\n{exc}")
-            return
+            return None
         self.statusBar().showMessage("report exported", 5000)
         QMessageBox.information(self, "HTML Report Exported", f"Saved HTML report to:\n{saved_path}")
+        return Path(saved_path)
+
+    def export_incident_case_package(self) -> None:
+        saved_path = self.export_html()
+        if saved_path is None:
+            return
+        self.incident_mode_manager.record_case_package_export(saved_path, format="html")
+        self.refresh_reliability()
+
+    def export_sarif_report(self) -> None:
+        if not self._ensure_scan_state():
+            return
+        default_path = get_reports_dir() / f"msaa_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sarif"
+        path, _ = QFileDialog.getSaveFileName(self, "Export SARIF Report", str(default_path), "SARIF Files (*.sarif *.json)")
+        if not path:
+            return
+        try:
+            findings = list(getattr(self.current_scan_result, "findings", []) or [])
+            saved_path = export_sarif(findings, Path(path), redact_paths=True)
+        except OSError as exc:
+            self.statusBar().showMessage("SARIF export failed", 5000)
+            QMessageBox.critical(self, "Export Failed", f"Failed to export SARIF report:\n{exc}")
+            return
+        self.statusBar().showMessage("SARIF report exported", 5000)
+        QMessageBox.information(self, "SARIF Report Exported", f"Saved SARIF report to:\n{saved_path}")
 
     def open_reports_folder(self) -> None:
         reports_dir = get_reports_dir()

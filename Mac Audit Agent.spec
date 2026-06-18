@@ -1,5 +1,4 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
 
 datas = [
     ('mac_audit_agent/assets', 'mac_audit_agent/assets'),
@@ -13,8 +12,6 @@ datas = [
 ]
 binaries = []
 hiddenimports = []
-tmp_ret = collect_all('PySide6')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
@@ -45,7 +42,7 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
-    target_arch=None,
+    target_arch='universal2',
     codesign_identity=None,
     entitlements_file=None,
     icon=['mac_audit_agent/assets/app_icon.icns'],
@@ -63,5 +60,9 @@ app = BUNDLE(
     coll,
     name='Mac Audit Agent.app',
     icon='mac_audit_agent/assets/app_icon.icns',
-    bundle_identifier=None,
+    bundle_identifier='com.fuzzlove.macos-security-audit-agent',
+    version='0.1.1',
+    info_plist={
+        'CFBundleVersion': '0.1.1',
+    },
 )

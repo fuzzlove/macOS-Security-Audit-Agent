@@ -169,9 +169,10 @@ Command:
 
 Result:
 
-- Installed successfully with runtime dependency `PySide6`.
-- Console script installed successfully.
-- Installed package resources resolved from `site-packages`.
+- Re-run required with Python 3.10 or newer.
+- Current host `/usr/bin/python3` is Python 3.9.6, and the wheel correctly enforces `requires-python >=3.10`.
+- A Python 3.9 clean venv rejects the wheel with `requires a different Python: 3.9.6 not in '>=3.10'`.
+- Installed console-script, resource, report, and `--release-readiness` checks must be repeated in a Python 3.10+ clean venv before upload.
 
 ## PyPI Name Status
 

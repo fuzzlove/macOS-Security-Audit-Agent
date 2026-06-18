@@ -440,6 +440,26 @@ def test_duplicate_monitor_events_increment_occurrence_count(tmp_path: Path) -> 
     assert saved.timestamp == "2026-06-06T00:00:05+00:00"
 
 
+def test_zero_dedupe_window_records_each_monitor_event(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    first = BackgroundMonitorEvent(
+        event_id="event-1",
+        timestamp="2026-06-06T00:00:00+00:00",
+        event_type="lid_opened",
+        severity="high",
+        source="test",
+        evidence="Synthetic visible alert verification.",
+        confidence="high",
+    )
+    second = BackgroundMonitorEvent(**{**first.to_dict(), "event_id": "event-2", "timestamp": "2026-06-06T00:00:01+00:00"})
+
+    assert db.record_monitor_event(first, dedupe_window_seconds=0) is True
+    assert db.record_monitor_event(second, dedupe_window_seconds=0) is True
+
+    saved = db.latest_monitor_events(limit=10)
+    assert [event.event_id for event in saved[:2]] == ["event-2", "event-1"]
+
+
 def test_high_volume_duplicate_monitor_events_are_categorized(tmp_path: Path) -> None:
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
     base = BackgroundMonitorEvent(

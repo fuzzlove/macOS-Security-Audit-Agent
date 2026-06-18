@@ -25,7 +25,7 @@ Implementation helper: `mac_audit_agent/ui/action_state.py`.
 | Investigation Priorities | Ranked finding review queue | Yes | Priority details require selected item | Yes | Optional | Yes | Yes | No | Review actions should stay inside priority panel | No |
 | Flight Recorder | Timeline of monitor activity and correlated events | Yes | Context requires selected event | No | Yes | No | Yes | No | Context action hidden until selection | No |
 | Evidence Snapshots | Recovery, cleanup, snapshot, and preservation workflow | Some actions require snapshots/history | Some tables require row selection | No | No | No | Yes | No | Snapshot open/export/delete should only appear when snapshots exist | No |
-| Apple Security Forecast | Apple security intelligence and local exposure assessment | Forecast data | Details/review/snooze/guidance require selected card | No | No | Forecast cards | Yes | No | Selection actions now explain requirement | No |
+| Apple Exposure Assessment | Apple security intelligence and local exposure assessment | Forecast data | Details/review/snooze/guidance require selected card | No | No | Forecast cards | Yes | No | Selection actions now explain requirement | No |
 | Logs | Local scan logs and background monitor events | No | No | Optional | Optional | No | Yes | No | No | No |
 | Settings | Operational health and background monitor configuration | No | Some monitor event actions require selection | No | Optional | No | Yes | No | Advanced/test monitor buttons should move behind Advanced menu over time | No |
 | Skins | Local appearance controls | No | No | No | No | No | Yes | No | No | No |
@@ -116,13 +116,13 @@ Context-dependent actions:
 - Show Context: hidden until a pattern or event is selected.
 - Export AI Summary: disabled with reason until a local summary is available.
 
-### Apple Security Forecast
+### Apple Exposure Assessment
 
 Primary actions:
 
-- Update Forecast
+- Update Assessment
 - Diagnostics
-- Export Forecast
+- Export Assessment
 
 Context-dependent actions:
 
@@ -131,7 +131,7 @@ Context-dependent actions:
 - Snooze
 - Guidance
 
-These are disabled with tooltip "Select a forecast card first."
+These are disabled with tooltip "Select a exposure card first."
 
 ### Background Monitor
 
@@ -198,7 +198,7 @@ Findings:
 
 - Most `pass` entries are exception handling no-ops in system integration code and are not visible UI placeholders.
 - Test/mock/stub mentions are in tests or diagnostic language and are not exposed as unfinished user controls.
-- Explicit test controls are visible in Background Monitor and Apple Security Forecast. They are functional, but should be grouped as diagnostics instead of mixed with primary workflows.
+- Explicit test controls are visible in Background Monitor and Apple Exposure Assessment. They are functional, but should be grouped as diagnostics instead of mixed with primary workflows.
 
 ## Acceptance Progress
 
@@ -209,7 +209,7 @@ Completed in this pass:
 - Added reasons/tooltips for disabled remediation commands.
 - Hidden Intrusion Detection context action until a pattern/event is selected.
 - Added disabled reason for unavailable AI summary export.
-- Added disabled reasons for Apple Security Forecast card actions.
+- Added disabled reasons for Apple Exposure Assessment card actions.
 - Added disabled reasons for background monitor lifecycle controls.
 - Hidden monitor event context/provenance/trace actions until event selection.
 - Added disabled reasons for Dashboard report export controls.

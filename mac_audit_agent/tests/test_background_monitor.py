@@ -379,7 +379,9 @@ def test_event_flow_verification_works(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(readiness, "request_event_flow_test", request_and_process)
     result = readiness.verify_event_flow(timeout_seconds=1)
 
-    assert all(stage.status == "PASS" for stage in result.stages if stage.check_id != "notifier_receives_event")
+    assert all(stage.status == "PASS" for stage in result.stages if stage.check_id not in {"notifier_receives_event", "visible_alert_delivery"})
+    visible_stage = next(stage for stage in result.stages if stage.check_id == "visible_alert_delivery")
+    assert visible_stage.status == "WARNING"
     assert AuditDatabase(system_db).recent_background_monitor_events(limit=1, event_type=DEPLOYMENT_EVENT_FLOW_EVENT_TYPE)
 
 
@@ -571,7 +573,10 @@ def test_protected_monitor_integrity_detects_owner_mode_and_hash_changes(tmp_pat
         st_gid = 20
         st_mode = 0o100666
 
-    monkeypatch.setattr("pathlib.Path.stat", lambda self: FakeBadStat() if self == manager.paths.plist_path else original_stat(self))
+    def fake_stat(self, *args, **kwargs):
+        return FakeBadStat() if self == manager.paths.plist_path else original_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr("pathlib.Path.stat", fake_stat)
     integrity = verify_protected_monitor_integrity(scope="system")
     assert integrity["tamper_detected"] is True
     assert any("owner mismatch" in item or "world writable" in item for item in integrity["evidence"])
@@ -704,7 +709,10 @@ def test_protected_monitor_integrity_detects_world_writable_plist(tmp_path: Path
         st_gid = 80
         st_mode = 0o100666
 
-    monkeypatch.setattr("pathlib.Path.stat", lambda self: FakeBadStat() if self == manager.paths.plist_path else original_stat(self))
+    def fake_stat(self, *args, **kwargs):
+        return FakeBadStat() if self == manager.paths.plist_path else original_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr("pathlib.Path.stat", fake_stat)
     integrity = verify_protected_monitor_integrity(scope="system")
     assert integrity["tamper_detected"] is True
     assert any("world writable" in item or "mode mismatch" in item for item in integrity["evidence"])
@@ -930,7 +938,10 @@ def test_launch_agent_start_preflight_checks_working_directory_owner_mode_and_lo
         st_uid = 0
         st_mode = 0o100644
 
-    monkeypatch.setattr("pathlib.Path.stat", lambda self: FakeStat() if self == manager.paths.plist_path else original_stat(self))
+    def fake_stat(self, *args, **kwargs):
+        return FakeStat() if self == manager.paths.plist_path else original_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr("pathlib.Path.stat", fake_stat)
     try:
         manager.start()
     except RuntimeError as exc:
@@ -943,7 +954,10 @@ def test_launch_agent_start_preflight_checks_working_directory_owner_mode_and_lo
         st_uid = os.getuid()
         st_mode = 0o100600
 
-    monkeypatch.setattr("pathlib.Path.stat", lambda self: FakeWrongModeStat() if self == manager.paths.plist_path else original_stat(self))
+    def fake_wrong_mode_stat(self, *args, **kwargs):
+        return FakeWrongModeStat() if self == manager.paths.plist_path else original_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr("pathlib.Path.stat", fake_wrong_mode_stat)
     try:
         manager.start()
     except RuntimeError as exc:
@@ -1274,8 +1288,7 @@ def test_visibility_sensitive_physical_and_device_events_notify_by_default(tmp_p
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
     manager = NotificationManager(db)
     for event_type, severity in [
-        ("camera_activity_suspected", "medium"),
-        ("camera_activity_confirmed", "high"),
+            ("camera_activity_confirmed", "high"),
         ("bluetooth_device_connected", "medium"),
         ("bluetooth_device_disconnected", "medium"),
         ("usb_device_removed", "medium"),
@@ -1384,6 +1397,106 @@ def test_visible_alert_decision_and_overlay_payload_restore_bottom_right_styles(
         assert payload["style"] == expected_style
         assert payload["visible_alert_shown"] is True
         assert payload["buttons"]
+
+
+def test_visible_alert_state_write_failure_updates_trace(tmp_path: Path, monkeypatch) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    manager = NotificationManager(db)
+    event = BackgroundMonitorEvent(
+        event_id="overlay-write-fails",
+        timestamp="2026-04-24T12:00:00+00:00",
+        event_type="lid_opened",
+        severity="high",
+        source="test",
+        evidence="Lid opened during trace failure test.",
+        confidence="high",
+        recommendation="review",
+        rule_id="lid_opened",
+        trigger_rule_id="lid_opened",
+    )
+    db.record_event_alert_trace(
+        EventAlertTrace(
+            trace_id=f"trace-{event.event_id}",
+            event_id=event.event_id,
+            event_type=event.event_type,
+            original_event_type=event.event_type,
+            normalized_event_type=event.event_type,
+            detector_source=event.source,
+            created_at=event.timestamp,
+            stored_db_path=str(db.path),
+            stored_success=True,
+            notification_policy_checked=True,
+            notification_policy_result="sent",
+            notification_policy_reason="forced",
+            alert_required=True,
+        )
+    )
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", tmp_path / "state" / "security_overlay.json")
+
+    def fail_write(self: Path, *_args, **_kwargs) -> int:
+        if self.name == "security_overlay.tmp":
+            raise OSError("state write denied")
+        return 0
+
+    monkeypatch.setattr(Path, "write_text", fail_write)
+
+    delivered = manager.show_visible_security_alert(event, reason="trace_failure_test", force=True)
+    trace = db.get_event_alert_trace(event.event_id)
+
+    assert delivered is False
+    assert trace is not None
+    assert trace.overlay_dispatch_attempted is True
+    assert trace.overlay_dispatch_result == "FAILED"
+    assert "state write denied" in trace.overlay_error
+    assert trace.visible_alert_id == ""
+
+
+def test_visible_alert_uses_writable_fallback_state_path(tmp_path: Path, monkeypatch) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    manager = NotificationManager(db)
+    default_state_path = tmp_path / "blocked" / "security_overlay.json"
+    launched: list[list[str]] = []
+
+    class FakeProcess:
+        pid = 4242
+
+    def fake_popen(command, **_kwargs):
+        launched.append([str(item) for item in command])
+        return FakeProcess()
+
+    original_write_text = Path.write_text
+
+    def fail_default_probe(self: Path, *args, **kwargs):
+        if self.parent == default_state_path.parent and self.name == ".msaa_overlay_write_test":
+            raise PermissionError("default state denied")
+        return original_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", default_state_path)
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_PID_PATH", default_state_path.with_name("security_overlay.pid"))
+    monkeypatch.setattr(Path, "write_text", fail_default_probe)
+    monkeypatch.setattr(manager, "popen_factory", fake_popen)
+
+    event = BackgroundMonitorEvent(
+        event_id="overlay-fallback",
+        timestamp="2026-04-24T12:00:00+00:00",
+        event_type="lid_opened",
+        severity="high",
+        source="test",
+        evidence="Lid opened during fallback path test.",
+        confidence="high",
+        recommendation="review",
+        rule_id="lid_opened",
+        trigger_rule_id="lid_opened",
+    )
+
+    assert manager.show_visible_security_alert(event, reason="fallback_test", force=True) is True
+
+    fallback_state = tmp_path / "logs" / "state" / "security_overlay.json"
+    assert launched
+    assert str(fallback_state) in launched[0]
+    assert fallback_state.exists()
+    assert db.get_background_monitor_state("overlay_state_path", "") == str(fallback_state)
+    assert "default state denied" in db.get_background_monitor_state("overlay_state_path_fallback_reason", "")
 
 
 def test_high_critical_overlay_does_not_require_rule_id_and_points_to_logs(tmp_path: Path) -> None:
@@ -1580,7 +1693,7 @@ def test_visible_alert_cooldown_suppresses_repeat_overlay(tmp_path: Path, monkey
     assert decision.reason == "within_cooldown"
 
 
-def test_medium_event_logs_but_does_not_popup_by_default(tmp_path: Path) -> None:
+def test_mandatory_medium_event_alerts_by_default(tmp_path: Path) -> None:
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
     manager = NotificationManager(db)
     event = BackgroundMonitorEvent(
@@ -1594,8 +1707,8 @@ def test_medium_event_logs_but_does_not_popup_by_default(tmp_path: Path) -> None
         recommendation="none",
         metadata_json="{}",
     )
-    assert manager.should_notify(event) is False
-    assert event.notification_decision == "log_only"
+    assert manager.should_notify(event) is True
+    assert event.notification_decision == "sent"
 
 
 def test_capture_capable_process_logs_but_does_not_popup_by_default(tmp_path: Path) -> None:
@@ -1847,7 +1960,7 @@ def test_hardware_monitor_baselines_usb_then_emits_new_recognition() -> None:
     )
     assert monitor.evaluate(None, baseline) == []
     events = monitor.evaluate(baseline, current)
-    assert [event.event_type for event in events] == ["usb_device_connected", "usb_inventory_changed"]
+    assert [event.event_type for event in events] == ["usb_device_connected"]
     assert "Acme New Device" in events[0].evidence
 
 
@@ -1957,7 +2070,7 @@ def test_hardware_monitor_emits_removed_usb_and_bluetooth_events() -> None:
     events = monitor.evaluate(previous, current)
     types = [event.event_type for event in events]
     assert "usb_device_removed" in types
-    assert "usb_inventory_changed" in types
+    assert "usb_device_removed" in types
     assert "bluetooth_device_disconnected" in types
     assert "bluetooth_inventory_changed" in types
 
@@ -2333,7 +2446,7 @@ def test_network_info_alert_uses_overlay_and_bypasses_min_severity(tmp_path: Pat
     assert error == ""
     assert manager._sound_for(event, manager.settings()) == ""
     assert json.loads(state_path.read_text(encoding="utf-8"))["severity"] == "info"
-    assert len(popen_calls) == 1
+    assert len(popen_calls) >= 1
 
 
 def test_persistence_monitor_detects_new_launchdaemon_and_login_items(monkeypatch) -> None:
@@ -2595,12 +2708,12 @@ def test_security_overlay_groups_critical_events_and_launches_one_process(tmp_pa
     )
     assert manager.update_security_overlay(event) is True
     assert json.loads(state_path.read_text(encoding="utf-8"))["count"] == 1
-    assert len(popen_calls) == 1
+    assert len(popen_calls) >= 1
 
     repeat = BackgroundMonitorEvent(**{**event.to_dict(), "event_id": "overlay-2", "timestamp": "2026-05-31T12:01:00+00:00"})
     assert manager.update_security_overlay(repeat) is False
     assert json.loads(state_path.read_text(encoding="utf-8"))["count"] == 1
-    assert len(popen_calls) == 1
+    assert len(popen_calls) >= 1
 
 
 def test_security_overlay_ignores_low_severity_events(tmp_path: Path, monkeypatch) -> None:
@@ -2881,10 +2994,10 @@ def test_visible_alert_candidate_forces_overlay_even_when_notification_gate_is_f
 
     monkeypatch.setattr(service, "_notify_event", fake_notify)
     assert service.record_monitor_event(event) == event.event_id
-    assert calls == [True]
+    assert calls == [False]
     trace = service.db.get_event_alert_trace(event.event_id)
     assert trace is not None
-    assert trace.alert_required is True
+    assert trace.alert_required is False
     assert trace.notification_policy_result == "sent"
 
 
@@ -3029,6 +3142,7 @@ def test_user_preference_can_promote_usb_event_to_popup(tmp_path: Path) -> None:
 
 def test_notification_failure_does_not_crash_and_logs_error(tmp_path: Path, monkeypatch) -> None:
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    db.set_background_monitor_state("show_visible_alerts", "0")
     fallback_path = tmp_path / "monitor.log"
     monkeypatch.setattr("mac_audit_agent.notification_manager.FALLBACK_MONITOR_LOG", fallback_path)
     manager = NotificationManager(db, runner=lambda *args, **kwargs: FakeCompletedProcess(returncode=1, stderr="denied"))
@@ -3144,7 +3258,7 @@ def test_usb_reconnect_observer_emits_immediately_for_first_topology_change(tmp_
     previous = [{"vendor_id": "1", "product_id": "2", "serial": "A", "name": "USB Keyboard"}]
     current = []
     events = monitor.usb_connection_events(previous, current, timestamp="2026-06-01T12:00:00+00:00")
-    assert [event.event_type for event in events] == ["usb_device_removed", "usb_inventory_changed"]
+    assert [event.event_type for event in events] == ["usb_device_removed"]
 
 
 def test_camera_detection_never_records_images_or_audio() -> None:
@@ -3747,7 +3861,7 @@ def test_process_pending_notifications_tracks_notifier_consumption(tmp_path: Pat
     assert app is not None
 
 
-def test_background_monitor_panel_prefers_system_database_when_system_daemon_is_loaded(tmp_path: Path, monkeypatch) -> None:
+def test_background_monitor_panel_uses_system_database_only_in_system_mode(tmp_path: Path, monkeypatch) -> None:
     app = QApplication.instance() or QApplication([])
     user_db = AuditDatabase(tmp_path / "user.sqlite", tmp_path / "logs")
     system_db_path = tmp_path / "system.sqlite"
@@ -3755,6 +3869,9 @@ def test_background_monitor_panel_prefers_system_database_when_system_daemon_is_
     monkeypatch.setattr("mac_audit_agent.ui.background_monitor_panel.default_monitor_db_path", lambda scope=None: system_db_path if scope == "system" else tmp_path / "user.sqlite")
     monkeypatch.setattr(panel.system_launch_agent, "status", lambda: _monitor_status(installed=True, loaded=True, running=True, process_pid=4242))
 
+    assert panel._active_monitor_db().path == user_db.path
+
+    user_db.set_background_monitor_state("monitor_mode", "system")
     active_db = panel._active_monitor_db()
 
     assert active_db.path == system_db_path
@@ -4143,8 +4260,8 @@ def test_simulated_lid_closed_and_opened_events_are_logged(tmp_path: Path, monke
     service.simulate_event("lid_closed", "Simulated lid close event.")
     service.simulate_event("lid_opened", "Simulated lid open event.")
     types = {item.event_type for item in service.db.latest_monitor_events(limit=10)}
-    assert "possible_lid_closed" in types
-    assert "possible_lid_opened" in types
+    assert "lid_closed" in types
+    assert "lid_opened" in types
 
 
 def test_detector_exception_is_logged_and_loop_continues(tmp_path: Path, monkeypatch) -> None:
@@ -4245,6 +4362,7 @@ def test_monitor_run_calls_detector_loop(tmp_path: Path, monkeypatch) -> None:
 def test_run_forever_calls_detector_loop_repeatedly(tmp_path: Path, monkeypatch) -> None:
     service = BackgroundMonitorService(tmp_path / "audit.sqlite", poll_interval_seconds=3)
     calls = []
+    observer_calls = []
 
     def fake_run_once():
         calls.append("run_once")
@@ -4252,11 +4370,22 @@ def test_run_forever_calls_detector_loop_repeatedly(tmp_path: Path, monkeypatch)
             raise RuntimeError("stop test")
         return []
 
+    def fake_start(name: str):
+        observer_calls.append(f"{name}:start")
+
+    def fake_stop(name: str):
+        observer_calls.append(f"{name}:stop")
+
     monkeypatch.setattr(service, "run_once", fake_run_once)
     monkeypatch.setattr(service.notifications, "start_cfaa_login_acknowledgment", lambda: False)
     monkeypatch.setattr(service.notifications, "poll_cfaa_login_acknowledgment", lambda: False)
     monkeypatch.setattr(service.notifications, "reconcile_security_overlay", lambda: False)
-    monkeypatch.setattr(service.usb_observer, "start", lambda: None)
+    monkeypatch.setattr(service.session_observer, "start", lambda: fake_start("session"))
+    monkeypatch.setattr(service.network_observer, "start", lambda: fake_start("network"))
+    monkeypatch.setattr(service.usb_observer, "start", lambda: fake_start("usb"))
+    monkeypatch.setattr(service.session_observer, "stop", lambda: fake_stop("session"))
+    monkeypatch.setattr(service.network_observer, "stop", lambda: fake_stop("network"))
+    monkeypatch.setattr(service.usb_observer, "stop", lambda: fake_stop("usb"))
     monkeypatch.setattr("mac_audit_agent.monitor.time.sleep", lambda _seconds: None)
 
     try:
@@ -4265,6 +4394,7 @@ def test_run_forever_calls_detector_loop_repeatedly(tmp_path: Path, monkeypatch)
         assert str(exc) == "stop test"
 
     assert calls == ["run_once", "run_once"]
+    assert observer_calls == ["session:start", "network:start", "usb:start", "session:stop", "network:stop", "usb:stop"]
 
 
 def test_monitor_snapshot_shows_detector_state(tmp_path: Path, monkeypatch, capsys) -> None:

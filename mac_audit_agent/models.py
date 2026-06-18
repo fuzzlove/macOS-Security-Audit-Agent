@@ -820,7 +820,17 @@ class EventAlertTrace:
     displayed_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload.setdefault("canonical_event_type", self.normalized_event_type or self.event_type)
+        payload.setdefault("db_path_written", self.stored_db_path)
+        payload.setdefault("policy_checked", self.notification_policy_checked)
+        payload.setdefault("policy_result", self.notification_policy_result)
+        payload.setdefault("policy_reason", self.notification_policy_reason)
+        payload.setdefault("suppression_reason", self.alert_suppression_reason)
+        return payload
+
+
+AlertPipelineTrace = EventAlertTrace
 
 
 @dataclass

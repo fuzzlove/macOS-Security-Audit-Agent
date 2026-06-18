@@ -108,11 +108,11 @@ BUTTON_STYLES = {
 }
 
 BUTTON_TOOLTIPS = {
-    "update": "Check Apple security advisories and refresh the local exposure forecast.",
-    "diagnostics": "Show source status, cache age, inventory, and forecast generation details.",
-    "details": "Open full advisory details and local evidence for this forecast card.",
-    "review": "Mark this forecast item as reviewed without hiding it permanently.",
-    "snooze": "Temporarily hide alerts for this forecast item.",
+    "update": "Check Apple security advisories and refresh the local exposure assessment.",
+    "diagnostics": "Show source status, cache age, inventory, and assessment generation details.",
+    "details": "Open full advisory details and local evidence for this assessment card.",
+    "review": "Mark this assessment item as reviewed without hiding it permanently.",
+    "snooze": "Temporarily hide alerts for this assessment item.",
     "guidance": "Show recommended Apple update steps.",
 }
 
@@ -149,7 +149,7 @@ class CveRadarDetailsDialog(QDialog):
 class CveRadarSnoozeDialog(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Snooze Apple Security Forecast")
+        self.setWindowTitle("Snooze Apple Exposure Assessment")
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Choose how long to snooze this radar card."))
         self.time_checkbox = QCheckBox("Use time-based snooze")
@@ -206,7 +206,7 @@ class CveRadarCardWidget(QFrame):
         layout.addWidget(self._meta_label(card))
         layout.addWidget(self._summary_label("Why shown", self._why_text(card)))
         if card.get("forecast_phrase") or card.get("planning_guidance"):
-            layout.addWidget(self._summary_label("Forecast", self._forecast_text(card)))
+            layout.addWidget(self._summary_label("Assessment", self._forecast_text(card)))
         layout.addWidget(self._summary_label("What to do now", str(card.get("recommended_action", card.get("what_to_do", "")))))
         layout.addWidget(self._summary_label("Update guidance", str(card.get("update_guidance", card.get("update_path", "")))))
         false_positive_review = card.get("false_positive_review", {})
@@ -229,7 +229,7 @@ class CveRadarCardWidget(QFrame):
             badges.append("EPSS high")
         confidence = str(card.get("applicability_confidence", card.get("confidence", ""))).title()
         badges.append(f"Confidence: {confidence}")
-        badges.append(f"Forecast: {str(card.get('forecast_level', 'watch')).title()}")
+        badges.append(f"Assessment: {str(card.get('forecast_level', 'watch')).title()}")
         badges.append(f"Source: {card.get('source', '')}")
         badges.append(f"CVE(s): {', '.join(card.get('cve_ids', card.get('cves', []))) or card.get('cve_id', '')}")
         badges.append(f"Product: {card.get('detected_product', card.get('affected_local_product', ''))} {card.get('detected_version', '')}".strip())
@@ -337,7 +337,7 @@ class CveRadarPanel(QFrame):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
 
-        header = QLabel("Apple Security Intelligence")
+        header = QLabel("Apple Exposure Assessment")
         header.setStyleSheet("font-size: 18px; font-weight: 700; color: #D9E6FF;")
         subtitle = QLabel("Local Apple exposure assessment based on this Mac, Apple advisories, and exploitation intelligence.")
         subtitle.setWordWrap(True)
@@ -356,14 +356,14 @@ class CveRadarPanel(QFrame):
         self.detected_macos_label = QLabel("Detected macOS: not checked")
         self.detected_safari_label = QLabel("Detected Safari: not checked")
         self.cves_evaluated_label = QLabel("Advisories assessed: 0")
-        self.applicable_label = QLabel("Active forecast cards: 0")
+        self.applicable_label = QLabel("Active assessment cards: 0")
         self.filtered_stale_label = QLabel("Filtered stale/invalid records: 0")
         self.hidden_review_needed_label = QLabel("Hidden review-needed: 0")
         self.source_status_label = QLabel("Source status: not checked")
         self.kev_label = QLabel("KEV matches: 0")
         self.apple_updates_label = QLabel("Apple updates available: no")
-        self.status_label = QLabel("Forecast not checked yet")
-        self.reason_label = QLabel("No forecast has been checked yet.")
+        self.status_label = QLabel("Assessment not checked yet")
+        self.reason_label = QLabel("No assessment has been checked yet.")
         self.reason_label.setWordWrap(True)
         for widget in [
             self.last_updated_label,
@@ -406,9 +406,9 @@ class CveRadarPanel(QFrame):
 
         button_grid = QVBoxLayout()
         top_button_row = QHBoxLayout()
-        self.update_button = make_forecast_button("Update Forecast", BUTTON_TOOLTIPS["update"], "primary")
+        self.update_button = make_forecast_button("Update Assessment", BUTTON_TOOLTIPS["update"], "primary")
         self.diagnostics_button = make_forecast_button("Diagnostics", BUTTON_TOOLTIPS["diagnostics"], "secondary")
-        self.export_button = make_forecast_button("Export Forecast", "Export the current Apple Security Forecast report.", "secondary")
+        self.export_button = make_forecast_button("Export Assessment", "Export the current Apple Exposure Assessment report.", "secondary")
         self.details_button = make_forecast_button("View Details", BUTTON_TOOLTIPS["details"], "primary")
         self.review_button = make_forecast_button("Reviewed", BUTTON_TOOLTIPS["review"], "secondary")
         self.snooze_button = make_forecast_button("Snooze", BUTTON_TOOLTIPS["snooze"], "warning")
@@ -428,7 +428,7 @@ class CveRadarPanel(QFrame):
 
         self.details = QTextEdit()
         self.details.setReadOnly(True)
-        self.details.setPlaceholderText("Select a forecast card to view details.")
+        self.details.setPlaceholderText("Select an assessment card to view details.")
         self.details.setMaximumHeight(260)
         self.details.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         layout.addWidget(self.details)
@@ -522,7 +522,7 @@ class CveRadarPanel(QFrame):
         self.detected_macos_label.setText(f"Detected macOS: {inventory.get('macos_version', 'not checked')} {inventory.get('macos_build', '')}".strip())
         self.detected_safari_label.setText(f"Detected Safari: {inventory.get('safari_version', 'not checked')}")
         self.cves_evaluated_label.setText(f"Advisories assessed: {self._radar_payload.get('cve_count', self._radar_payload.get('cves_evaluated', 0))}")
-        self.applicable_label.setText(f"Active forecast cards: {self._radar_payload.get('card_count', self._radar_payload.get('applicable_cves', len(self._radar_payload.get('display_cards', []))))}")
+        self.applicable_label.setText(f"Active assessment cards: {self._radar_payload.get('card_count', self._radar_payload.get('applicable_cves', len(self._radar_payload.get('display_cards', []))))}")
         diagnostics = self._radar_payload.get("diagnostics", {}) if isinstance(self._radar_payload.get("diagnostics", {}), dict) else {}
         stale_invalid = int(diagnostics.get("stale_advisories", 0)) + int(diagnostics.get("invalid_advisories", 0))
         self.filtered_stale_label.setText(f"Filtered stale/invalid records: {stale_invalid}")
@@ -548,7 +548,7 @@ class CveRadarPanel(QFrame):
             item = QListWidgetItem()
             item.setFlags(Qt.NoItemFlags)
             widget = QFrame()
-            title = QLabel("No current Apple/macOS security forecast items matched this Mac.")
+            title = QLabel("No current Apple/macOS security assessment items matched this Mac.")
             title.setWordWrap(True)
             title.setStyleSheet("font-weight: 700; color: #D9E6FF;")
             label = QLabel(self._reason_text(self._radar_payload))
@@ -617,7 +617,7 @@ class CveRadarPanel(QFrame):
 
     def _set_buttons_enabled(self, enabled: bool) -> None:
         self.diagnostics_button.setEnabled(True)
-        state = ActionState(enabled, True, "Select a forecast card first.", ["selected forecast card"])
+        state = ActionState(enabled, True, "Select an assessment card first.", ["selected assessment card"])
         for button in [self.details_button, self.review_button, self.snooze_button, self.guidance_button]:
             apply_action_state(button, state)
 
@@ -625,14 +625,14 @@ class CveRadarPanel(QFrame):
         alerts = card.get("alerts") or [card]
         lines = [
             f"Title: {card.get('title', '')}",
-            f"Forecast level: {card.get('forecast_level', '')}",
+            f"Assessment level: {card.get('forecast_level', '')}",
             f"Applicability: {card.get('applicability', card.get('applicability_confidence', ''))}",
             f"Confidence: {card.get('confidence', card.get('applicability_confidence', ''))}",
             f"Source: {card.get('source', '')}",
             f"KEV: {'yes' if card.get('kev') or card.get('kev_cves') else 'no'}",
             f"Apple related: {'yes' if card.get('apple_related') or card.get('source') == 'apple' else 'no'}",
             f"Why shown: {card.get('why_shown_to_you') or card.get('why_shown') or self._why_text(card)}",
-            f"Forecast phrase: {card.get('forecast_phrase', '')}",
+            f"Assessment phrase: {card.get('forecast_phrase', '')}",
             f"Planning guidance: {card.get('planning_guidance', '')}",
             f"False-positive review: {json.dumps(card.get('false_positive_review', {}), indent=2, sort_keys=True)}",
             f"What to do now: {card.get('recommended_action', card.get('what_to_do', ''))}",
@@ -670,11 +670,11 @@ class CveRadarPanel(QFrame):
 
     def _state_text(self, payload: dict[str, Any]) -> str:
         if not payload.get("timestamp") and not payload.get("generated_at"):
-            return "Forecast not checked yet"
+            return "Assessment not checked yet"
         if payload.get("last_error") and not payload.get("display_cards"):
             if payload.get("timestamp"):
-                return "Unable to update forecast — using cache"
-            return "Unable to update forecast — no cache available"
+                return "Unable to update assessment - using cache"
+            return "Unable to update assessment - no cache available"
         level = str(payload.get("level", payload.get("forecast_level", ""))).lower()
         if level == "critical":
             return "Update Today"
@@ -686,11 +686,11 @@ class CveRadarPanel(QFrame):
             return "Watch"
         if payload.get("display_cards"):
             return "Clear — no applicable Apple security updates found"
-        return "Forecast not checked yet"
+        return "Assessment not checked yet"
 
     def _reason_text(self, payload: dict[str, Any]) -> str:
         if not payload.get("timestamp") and not payload.get("generated_at"):
-            return "No Apple Security Forecast has been checked yet."
+            return "No Apple Exposure Assessment has been checked yet."
         if payload.get("last_error") and not payload.get("display_cards"):
             return "Update failed and the panel is using cached data." if payload.get("timestamp") else "Update failed and no cache exists."
         cards = payload.get("alerts") or payload.get("cards") or payload.get("display_cards") or []
@@ -708,7 +708,7 @@ class CveRadarPanel(QFrame):
             if payload.get("catalog_update_status") == "offline-rules":
                 return "Offline and no cache is available."
             return "No applicable Apple security advisories matched this Mac."
-        return str(payload.get("summary", "")) or "Forecast data loaded."
+        return str(payload.get("summary", "")) or "Assessment data loaded."
 
     def current_card(self) -> dict[str, Any] | None:
         return self._selected_card
@@ -738,7 +738,7 @@ class CveRadarPanel(QFrame):
         self._snooze_card(card)
 
     def _open_card_details(self, card: dict[str, Any]) -> None:
-        dialog = CveRadarDetailsDialog(str(card.get("title", "Apple Security Forecast Details")), self._detail_text(card), self)
+        dialog = CveRadarDetailsDialog(str(card.get("title", "Apple Exposure Assessment Details")), self._detail_text(card), self)
         dialog.exec()
 
     def _open_card_update_guidance(self, card: dict[str, Any]) -> None:

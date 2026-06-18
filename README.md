@@ -10,7 +10,7 @@ This repository is intended to be understandable, auditable, and safe enough for
 - Surfaces findings with evidence, confidence, and rule provenance
 - Tracks review state, notes, suppression decisions, and case history
 - Correlates events into investigation patterns and flight-recorder timelines
-- Provides Apple Security Forecast summaries with low-noise grouping
+- Provides Apple Exposure Assessment summaries with low-noise grouping
 - Supports optional user LaunchAgent mode and optional root-owned system LaunchDaemon mode
 - Exports HTML and JSON reports locally
 - Preserves evidence snapshots before cleanup or remediation
@@ -125,7 +125,7 @@ Do not delete logs automatically during an active investigation.
 - Investigation Priorities
 - Flight Recorder
 - Evidence Snapshots
-- Apple Security Forecast
+- Apple Exposure Assessment
 - Logs
 - Settings
 - Operational Health
@@ -150,6 +150,7 @@ macos-security-audit-agent --safe-scan
 macos-security-audit-agent --aggressive-scan
 macos-security-audit-agent --report report.html
 macos-security-audit-agent --system-health
+macos-security-audit-agent --release-readiness
 ```
 
 ### GitHub

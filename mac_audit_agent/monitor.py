@@ -71,6 +71,9 @@ DISCLAIMER = (
 FALLBACK_MONITOR_LOG = monitor_log_root() / "monitor.log"
 STDOUT_MONITOR_LOG = default_launch_agent_paths().stdout_path
 STDERR_MONITOR_LOG = default_launch_agent_paths().stderr_path
+DEFAULT_FALLBACK_MONITOR_LOG = FALLBACK_MONITOR_LOG
+DEFAULT_STDOUT_MONITOR_LOG = STDOUT_MONITOR_LOG
+DEFAULT_STDERR_MONITOR_LOG = STDERR_MONITOR_LOG
 IMPORTANT_EVENT_TYPES = {
     "capture_capable_process_observed",
     "camera_activity_confirmed",
@@ -341,6 +344,17 @@ class _DaemonNotificationManager:
 class BackgroundMonitorService:
     def __init__(self, db_path: Path, poll_interval_seconds: int = 5, executor=None, record_startup: bool = True, mode: str = MONITOR_ROLE_LEGACY) -> None:
         self.db = AuditDatabase(db_path)
+        db_path = Path(db_path).expanduser()
+        if db_path.parent not in {Path.home(), default_monitor_db_path("user").parent, default_monitor_db_path("system").parent}:
+            local_log_dir = db_path.parent / "logs"
+            self.log_paths = [
+                local_log_dir / "monitor.log",
+                local_log_dir / "background_monitor.stdout.log",
+            ]
+            self.error_log_paths = [local_log_dir / "background_monitor.stderr.log"]
+        else:
+            self.log_paths = [FALLBACK_MONITOR_LOG, STDOUT_MONITOR_LOG]
+            self.error_log_paths = [STDERR_MONITOR_LOG]
         self.poll_interval_seconds = max(3, min(5, poll_interval_seconds))
         self.executor = executor or self._run_command
         self.record_startup = record_startup
@@ -398,22 +412,40 @@ class BackgroundMonitorService:
             self._write_log_line(f"startup: monitor initialized | db_path={self.db.path}")
             self._record_startup_diagnostics()
             self.record_startup = True
-        if self.user_notifier_mode:
-            self.notifications.start_cfaa_login_acknowledgment()
-        if not self.user_notifier_mode:
-            self.session_observer.start()
-            self.network_observer.start()
-            self.usb_observer.start()
-        while True:
+        observers_started = False
+        try:
             if self.user_notifier_mode:
-                self.record_heartbeat()
-                self.process_pending_notifications()
-            else:
-                self.notifications.poll_cfaa_login_acknowledgment()
                 self.notifications.start_cfaa_login_acknowledgment()
-                self.notifications.reconcile_security_overlay()
-                self.run_once()
-            time.sleep(self.self_impact_watchdog.effective_poll_interval(self.poll_interval_seconds))
+            if not self.user_notifier_mode:
+                self.session_observer.start()
+                self.network_observer.start()
+                self.usb_observer.start()
+                observers_started = True
+            while True:
+                if self.user_notifier_mode:
+                    self.record_heartbeat()
+                    self.process_pending_notifications()
+                else:
+                    self.notifications.poll_cfaa_login_acknowledgment()
+                    self.notifications.start_cfaa_login_acknowledgment()
+                    self.notifications.reconcile_security_overlay()
+                    self.run_once()
+                time.sleep(self.self_impact_watchdog.effective_poll_interval(self.poll_interval_seconds))
+        finally:
+            if observers_started:
+                self.stop_observers()
+
+    def stop_observers(self) -> None:
+        for name, observer in (
+            ("session_observer", self.session_observer),
+            ("network_observer", self.network_observer),
+            ("usb_observer", self.usb_observer),
+        ):
+            try:
+                observer.stop()
+            except Exception as exc:
+                self._write_log_line(f"observer stop failed: {name}: {exc}")
+                self.db.set_background_monitor_state(f"{name}_stop_error", str(exc))
 
     def run_once(self) -> list[BackgroundMonitorEvent]:
         if self.user_notifier_mode:
@@ -967,10 +999,6 @@ class BackgroundMonitorService:
             return None
         self._route_log_only_activity_overlay(event)
         force_visible_alert = False
-        try:
-            force_visible_alert = bool(self.notifications.should_show_visible_alert(event, force=True).show)
-        except Exception:
-            force_visible_alert = False
         if not _skip_storm_detection:
             storm_event = self._maybe_build_alert_storm_event(event)
             if storm_event is not None:
@@ -1239,10 +1267,6 @@ class BackgroundMonitorService:
                 self.db.set_background_monitor_state("last_event_consumed_at", event.timestamp)
                 continue
             force_visible_alert = False
-            try:
-                force_visible_alert = bool(self.notifications.should_show_visible_alert(event, force=True).show)
-            except Exception:
-                force_visible_alert = False
             if not self._should_notify_event(event, notify_force=force_visible_alert):
                 suppressed_count += 1
                 self.db.set_background_monitor_state("last_notification_decision", event.notification_decision or "log_only")
@@ -2219,7 +2243,7 @@ class BackgroundMonitorService:
         return event
 
     def _ensure_log_paths(self) -> None:
-        for path in [FALLBACK_MONITOR_LOG, STDOUT_MONITOR_LOG, STDERR_MONITOR_LOG]:
+        for path in [*self._active_log_paths(), *self._active_error_log_paths()]:
             try:
                 ensure_monitor_log_file(path)
             except OSError:
@@ -2230,11 +2254,24 @@ class BackgroundMonitorService:
 
     def _write_log_line(self, message: str) -> None:
         timestamped = f"{utc_now_iso()} {message}\n"
-        for path in [FALLBACK_MONITOR_LOG, STDOUT_MONITOR_LOG]:
+        for path in self._active_log_paths():
             try:
                 append_monitor_log_line(path, timestamped)
             except OSError:
                 LOGGER.exception("Failed to append monitor log line: %s", path)
+
+    def _active_log_paths(self) -> list[Path]:
+        paths = list(getattr(self, "log_paths", [FALLBACK_MONITOR_LOG, STDOUT_MONITOR_LOG]))
+        for current, default in [(FALLBACK_MONITOR_LOG, DEFAULT_FALLBACK_MONITOR_LOG), (STDOUT_MONITOR_LOG, DEFAULT_STDOUT_MONITOR_LOG)]:
+            if current != default and current not in paths:
+                paths.append(current)
+        return paths
+
+    def _active_error_log_paths(self) -> list[Path]:
+        paths = list(getattr(self, "error_log_paths", [STDERR_MONITOR_LOG]))
+        if STDERR_MONITOR_LOG != DEFAULT_STDERR_MONITOR_LOG and STDERR_MONITOR_LOG not in paths:
+            paths.append(STDERR_MONITOR_LOG)
+        return paths
 
     def _run_command(self, command: list[str]) -> tuple[int, str, str]:
         executable = Path(command[0])

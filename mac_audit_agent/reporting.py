@@ -244,6 +244,7 @@ def export_scan_result_json(
     investigation_notes: list[dict] | None = None,
     investigation_audit_trail: list[dict] | None = None,
     investigation_priorities: dict | None = None,
+    reliability: dict | None = None,
 ) -> Path:
     output_path = output_path or default_json_report_path()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -254,6 +255,7 @@ def export_scan_result_json(
     packet_captures = payload.get("collected_artifacts", {}).get("packet_captures", [])
     network_discovery = payload.get("collected_artifacts", {}).get("network_discovery", {})
     apple_security_forecast = payload.get("collected_artifacts", {}).get("apple_security_forecast", payload.get("collected_artifacts", {}).get("cve_radar", {}))
+    reliability = reliability or payload.get("collected_artifacts", {}).get("reliability", payload.get("reliability", {})) or {}
     if apple_security_forecast:
         production_cards = _production_forecast_cards(apple_security_forecast)
         apple_security_forecast = dict(apple_security_forecast)
@@ -270,6 +272,7 @@ def export_scan_result_json(
     payload["security_score"] = score
     payload["score_label"] = score_label
     payload["apple_security_forecast"] = apple_security_forecast
+    payload["reliability"] = reliability
     payload["intrusion_correlation"] = intrusion_correlation
     payload["report_summary"] = {
         "security_score": score,
@@ -287,6 +290,7 @@ def export_scan_result_json(
         "packet_captures": packet_captures,
         "network_discovery": network_discovery,
         "apple_security_forecast": apple_security_forecast,
+        "reliability": reliability,
         "intrusion_correlation": intrusion_correlation,
         "execution_evidence": execution_evidence,
         "investigation_priorities": investigation_priorities,
@@ -335,6 +339,21 @@ def export_scan_result_json(
         "coverage": intrusion_correlation.get("coverage", {}).get("score", 0) if intrusion_correlation else 0,
         "user_presence": intrusion_correlation.get("user_presence", {}).get("state", "unknown") if intrusion_correlation else "unknown",
         "ai_summary_path": intrusion_correlation.get("ai_summary_path", "") if intrusion_correlation else "",
+    }
+    payload["report_summary"]["reliability_summary"] = {
+        "alert_last_failure_stage": reliability.get("alert_pipeline", {}).get("last_failure_stage", "") if reliability else "",
+        "suppressed_count": reliability.get("alert_pipeline", {}).get("suppressed_count", 0) if reliability else 0,
+        "no_policy_match_count": reliability.get("alert_pipeline", {}).get("no_policy_match_count", 0) if reliability else 0,
+        "db_path_mismatch": reliability.get("alert_pipeline", {}).get("db_path_mismatch", False) if reliability else False,
+        "monitoring_coverage_score": reliability.get("monitoring_coverage", {}).get("score", 0) if reliability else 0,
+        "release_readiness_score": reliability.get("release_readiness", {}).get("ReleaseReadinessScore", 0) if reliability else 0,
+        "release_readiness_status": reliability.get("release_readiness", {}).get("status", "unknown") if reliability else "unknown",
+        "trust_current_score": reliability.get("trust_decay", {}).get("current_score", 0) if reliability else 0,
+        "trust_previous_score": reliability.get("trust_decay", {}).get("previous_score", 0) if reliability else 0,
+        "trust_delta": reliability.get("trust_decay", {}).get("delta", 0) if reliability else 0,
+        "trust_trend": reliability.get("trust_decay", {}).get("trend", "unknown") if reliability else "unknown",
+        "configuration_drift_changes": len(reliability.get("configuration_drift", {}).get("changes", [])) if reliability else 0,
+        "incident_mode_active": reliability.get("incident_mode", {}).get("active", False) if reliability else False,
     }
     if include_background_monitor_logs:
         payload["background_monitor_events"] = background_monitor_events or []
@@ -492,6 +511,7 @@ def export_scan_result_html(
     investigation_notes: list[dict] | None = None,
     investigation_audit_trail: list[dict] | None = None,
     investigation_priorities: dict | None = None,
+    reliability: dict | None = None,
 ) -> Path:
     output_path = output_path or default_html_report_path()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -504,6 +524,7 @@ def export_scan_result_html(
     packet_captures = artifacts.get("packet_captures", [])
     network_discovery = artifacts.get("network_discovery", {})
     apple_security_forecast = artifacts.get("apple_security_forecast", artifacts.get("cve_radar", {}))
+    reliability = reliability or artifacts.get("reliability", {}) or {}
     if apple_security_forecast:
         production_cards = _production_forecast_cards(apple_security_forecast)
         apple_security_forecast = dict(apple_security_forecast)
@@ -723,8 +744,8 @@ def export_scan_result_html(
     forecast_summary_rows = "".join(
         f"<tr><td>{html.escape(str(label))}</td><td>{html.escape(str(value))}</td></tr>"
         for label, value in [
-            ("Forecast Updated", str(apple_security_forecast.get("generated_at", apple_security_forecast.get("timestamp", ""))) or "not run"),
-            ("Forecast Level", str(apple_security_forecast.get("level", apple_security_forecast.get("forecast_level", "clear")))),
+            ("Assessment Updated", str(apple_security_forecast.get("generated_at", apple_security_forecast.get("timestamp", ""))) or "not run"),
+            ("Assessment Level", str(apple_security_forecast.get("level", apple_security_forecast.get("forecast_level", "clear")))),
             ("Sources Used", ", ".join(str(item) for item in apple_security_forecast.get("sources_used", [])) or "none"),
             ("CVEs Evaluated", str(apple_security_forecast.get("cve_count", apple_security_forecast.get("cves_evaluated", 0)))),
             ("Applicable Cards", str(len(forecast_cards))),
@@ -738,7 +759,7 @@ def export_scan_result_html(
         ]
     )
     if not apple_security_forecast or not forecast_cards:
-        forecast_summary_rows += '<tr><td colspan="2">Apple Security Forecast: no applicable cards at report time.</td></tr>'
+        forecast_summary_rows += '<tr><td colspan="2">Apple Exposure Assessment: no applicable cards at report time.</td></tr>'
     forecast_rows = "".join(
         f"""
         <tr class="{severity_css_class(str(card.get('severity', 'info')))}">
@@ -755,7 +776,7 @@ def export_scan_result_html(
         </tr>
         """
         for card in forecast_cards
-    ) or '<tr><td colspan="10">Apple Security Forecast: no applicable cards at report time.</td></tr>'
+    ) or '<tr><td colspan="10">Apple Exposure Assessment: no applicable cards at report time.</td></tr>'
     intrusion_patterns = intrusion_correlation.get("patterns", []) if isinstance(intrusion_correlation, dict) else []
     intrusion_summary_rows = "".join(
         f"<tr><td>{html.escape(str(label))}</td><td>{html.escape(str(value))}</td></tr>"
@@ -780,6 +801,75 @@ def export_scan_result_html(
         """
         for pattern in intrusion_patterns
     ) or '<tr><td colspan="6">No correlated intrusion patterns identified from the current local evidence.</td></tr>'
+    alert_pipeline = reliability.get("alert_pipeline", {}) if isinstance(reliability, dict) else {}
+    monitoring_coverage = reliability.get("monitoring_coverage", {}) if isinstance(reliability, dict) else {}
+    release_readiness = reliability.get("release_readiness", {}) if isinstance(reliability, dict) else {}
+    trust_decay = reliability.get("trust_decay", {}) if isinstance(reliability, dict) else {}
+    configuration_drift = reliability.get("configuration_drift", {}) if isinstance(reliability, dict) else {}
+    incident_mode = reliability.get("incident_mode", {}) if isinstance(reliability, dict) else {}
+    reliability_summary_rows = "".join(
+        f"<tr><td>{html.escape(str(label))}</td><td>{html.escape(str(value))}</td></tr>"
+        for label, value in [
+            ("Alert Last Failure Stage", alert_pipeline.get("last_failure_stage", "none")),
+            ("Suppressed Alerts", alert_pipeline.get("suppressed_count", 0)),
+            ("No Policy Match", alert_pipeline.get("no_policy_match_count", 0)),
+            ("DB Path Mismatch", "yes" if alert_pipeline.get("db_path_mismatch") else "no"),
+            ("Monitoring Coverage Score", monitoring_coverage.get("MonitoringCoverageScore", monitoring_coverage.get("score", 0))),
+            ("Release Readiness Score", release_readiness.get("ReleaseReadinessScore", 0)),
+            ("Release Readiness Status", release_readiness.get("status", "unknown")),
+            ("Trust Score", f"{trust_decay.get('previous_score', 0)} -> {trust_decay.get('current_score', 0)}"),
+            ("Trust Delta", trust_decay.get("delta", 0)),
+            ("Trust Trend", trust_decay.get("trend", "unknown")),
+            ("Configuration Drift Changes", len(configuration_drift.get("changes", []))),
+            ("Incident Mode Active", "yes" if incident_mode.get("active") else "no"),
+        ]
+    )
+    coverage_rows = "".join(
+        f"""
+        <tr class="{severity_css_class('high' if str(component.get('status', '')).lower() in {'failing', 'disabled'} else 'medium' if str(component.get('status', '')).lower() == 'degraded' else 'info')}">
+          <td>{html.escape(str(component.get('component', component.get('name', ''))))}</td>
+          <td>{html.escape(str(component.get('status', 'unknown')))}</td>
+          <td>{html.escape(str(component.get('last_successful_run', '')))}</td>
+          <td>{html.escape(str(component.get('last_event', '')))}</td>
+          <td>{html.escape(str(component.get('last_error', '')))}</td>
+          <td>{html.escape(str(component.get('heartbeat_age_seconds', '')))}</td>
+          <td>{html.escape(str(component.get('permission_status', '')))}</td>
+          <td>{html.escape(str(component.get('failure_reason', '')))}</td>
+          <td>{html.escape(str(component.get('recommended_fix', '')))}</td>
+        </tr>
+        """
+        for component in monitoring_coverage.get("components", [])
+    ) or '<tr><td colspan="9">Monitoring coverage has not been calculated.</td></tr>'
+    trust_timeline = trust_decay.get("score_history") or trust_decay.get("timeline", [])
+    trust_rows = "".join(
+        f"""
+        <tr>
+          <td>{html.escape(str(item.get('created_at', item.get('timestamp', ''))))}</td>
+          <td>{html.escape(str(item.get('previous_score', '')))}</td>
+          <td>{html.escape(str(item.get('current_score', '')))}</td>
+          <td>{html.escape(str(item.get('delta', '')))}</td>
+          <td>{html.escape(', '.join(str(cause) for cause in item.get('causes', [])) or str(item.get('cause', item.get('reason', ''))))}</td>
+          <td>{html.escape(str(item.get('recommended_action', '')))}</td>
+        </tr>
+        """
+        for item in trust_timeline
+    ) or '<tr><td colspan="6">No trust score changes recorded.</td></tr>'
+    drift_rows = "".join(
+        f"""
+        <tr class="{severity_css_class(str(change.get('severity', 'info')))}">
+          <td>{html.escape(str(change.get('setting', change.get('name', ''))))}</td>
+          <td>{html.escape(str(change.get('previous_value', '')))}</td>
+          <td>{html.escape(str(change.get('current_value', '')))}</td>
+          <td>{html.escape(str(change.get('first_seen', '')))}</td>
+          <td>{html.escape(str(change.get('last_seen', '')))}</td>
+          <td>{html.escape(str(change.get('source_detector', '')))}</td>
+          <td>{html.escape(str(change.get('confidence', '')))}</td>
+          <td>{html.escape(str(change.get('why_it_matters', '')))}</td>
+          <td>{html.escape(str(change.get('recommended_verification', change.get('recommended_action', ''))))}</td>
+        </tr>
+        """
+        for change in configuration_drift.get("changes", [])
+    ) or '<tr><td colspan="9">No configuration drift changes recorded.</td></tr>'
     network_change_rows = "".join(
         f"<tr><td>{html.escape(str(change_type).replace('_', ' ').title())}</td><td>{html.escape(json.dumps(item, sort_keys=True))}</td></tr>"
         for change_type, items in network_discovery.get("comparison", {}).items()
@@ -913,6 +1003,29 @@ def export_scan_result_html(
     </table>
   </div>
   <div class="card">
+    <h2>Reliability and Trust</h2>
+    <p>Operational reliability evidence from the Alert Pipeline Health, Monitoring Coverage, Release Readiness, Trust Timeline, Configuration Drift, and Incident Mode views.</p>
+    <table>
+      <thead><tr><th>Field</th><th>Value</th></tr></thead>
+      <tbody>{reliability_summary_rows}</tbody>
+    </table>
+    <h3>Monitoring Coverage Dashboard</h3>
+    <table>
+      <thead><tr><th>Component</th><th>Status</th><th>Last Successful Run</th><th>Last Event</th><th>Last Error</th><th>Heartbeat Age</th><th>Permission</th><th>Failure Reason</th><th>Recommended Fix</th></tr></thead>
+      <tbody>{coverage_rows}</tbody>
+    </table>
+    <h3>Trust Timeline</h3>
+    <table>
+      <thead><tr><th>When</th><th>Previous</th><th>Current</th><th>Delta</th><th>Causes</th><th>Recommended Action</th></tr></thead>
+      <tbody>{trust_rows}</tbody>
+    </table>
+    <h3>Configuration Drift Timeline</h3>
+    <table>
+      <thead><tr><th>Setting</th><th>Previous</th><th>Current</th><th>First Seen</th><th>Last Seen</th><th>Source Detector</th><th>Confidence</th><th>Why It Matters</th><th>Recommended Verification</th></tr></thead>
+      <tbody>{drift_rows}</tbody>
+    </table>
+  </div>
+  <div class="card">
     <h2>Ports</h2>
     <table>
       <thead><tr><th>Process</th><th>PID</th><th>Protocol</th><th>Local Address</th><th>Port</th><th>State</th><th>Review Needed</th></tr></thead>
@@ -996,7 +1109,7 @@ def export_scan_result_html(
     <table><thead><tr><th>Shell</th><th>Pattern</th><th>Matches</th><th>Redacted Evidence</th></tr></thead><tbody>{history_rows}</tbody></table>
   </div>
   <div class="card">
-    <h2>Apple Security Forecast</h2>
+    <h2>Apple Exposure Assessment</h2>
     <table>
       <thead><tr><th>Field</th><th>Value</th></tr></thead>
       <tbody>{forecast_summary_rows}</tbody>
@@ -1007,7 +1120,7 @@ def export_scan_result_html(
           <th>Card</th>
           <th>CVE IDs</th>
           <th>Source</th>
-          <th>Forecast Level</th>
+          <th>Assessment Level</th>
           <th>Applicability</th>
           <th>KEV</th>
           <th>Apple</th>

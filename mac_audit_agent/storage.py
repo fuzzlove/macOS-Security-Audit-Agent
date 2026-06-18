@@ -1917,7 +1917,7 @@ class AuditDatabase:
             """,
             (event.event_type, event.process_name, event.pid, event.evidence),
         ).fetchone()
-        if row:
+        if row and dedupe_window_seconds > 0:
             try:
                 event_ts = datetime.fromisoformat(event.timestamp)
                 last_ts = datetime.fromisoformat(str(row["timestamp"]))
@@ -1927,9 +1927,6 @@ class AuditDatabase:
             if event_ts and last_ts and (event_ts - last_ts).total_seconds() < dedupe_window_seconds:
                 self._record_background_event_duplicate(row, event, duplicate_group_key)
                 return False
-        if row and not dedupe_window_seconds:
-            self._record_background_event_duplicate(row, event, duplicate_group_key)
-            return False
         self.conn.execute(
             """
             INSERT OR REPLACE INTO background_monitor_events

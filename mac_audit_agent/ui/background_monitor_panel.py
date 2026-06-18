@@ -290,8 +290,7 @@ class BackgroundMonitorPanel(QWidget):
 
     def _active_monitor_db(self) -> AuditDatabase:
         system_db_path = default_monitor_db_path("system")
-        system_status = self.system_launch_agent.status()
-        if self._system_mode_enabled() or system_status.loaded or system_status.running:
+        if self._system_mode_enabled():
             try:
                 if self.db.path == system_db_path:
                     return self.db
@@ -2309,7 +2308,10 @@ class BackgroundMonitorPanel(QWidget):
                 truncate_monitor_log_file(path)
             removed = 0
             if clear_db:
-                removed = self.db.clear_monitor_events()
+                active_db = self._active_monitor_db()
+                removed = active_db.clear_monitor_events()
+                if active_db.path != self.db.path:
+                    removed += self.db.clear_monitor_events()
             self._event_service()._write_log_line("Monitor logs cleared by user.")
             self._write_app_log("Monitor logs cleared by user.")
             if clear_db:

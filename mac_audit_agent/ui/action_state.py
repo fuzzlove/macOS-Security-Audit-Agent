@@ -14,11 +14,13 @@ class ActionState:
 
 
 def apply_action_state(widget: QWidget, state: ActionState) -> None:
-    widget.setVisible(state.visible)
+    if hasattr(widget, "setVisible"):
+        widget.setVisible(state.visible)
     widget.setEnabled(state.enabled)
     if state.enabled:
-        tooltip = widget.toolTip() or ""
+        tooltip = (widget.toolTip() or "") if hasattr(widget, "toolTip") else ""
     else:
         requirement_text = ", ".join(state.requirements)
         tooltip = state.reason or (f"Requires: {requirement_text}" if requirement_text else "Unavailable in the current state.")
-    widget.setToolTip(tooltip)
+    if hasattr(widget, "setToolTip"):
+        widget.setToolTip(tooltip)

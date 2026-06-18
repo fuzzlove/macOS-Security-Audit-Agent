@@ -26,7 +26,7 @@
 - investigation notes
 - exported reports
 - evidence snapshots
-- Apple Security Forecast cache
+- Apple Exposure Assessment cache
 
 ## Adversary/Failure Classes
 

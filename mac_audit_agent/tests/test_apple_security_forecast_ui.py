@@ -13,8 +13,8 @@ from mac_audit_agent.cve_radar import AppleSecurityForecast
 def test_apple_security_forecast_shows_not_checked_on_startup(tmp_path: Path) -> None:
     app = QApplication.instance() or QApplication([])
     window = MainWindow(tmp_path / "audit.sqlite")
-    assert window.cve_radar_panel.status_label.text() == "Forecast not checked yet"
-    assert "No Apple Security Forecast has been checked yet." in window.cve_radar_panel.reason_label.text()
+    assert window.cve_radar_panel.status_label.text() == "Assessment not checked yet"
+    assert "No Apple Exposure Assessment has been checked yet." in window.cve_radar_panel.reason_label.text()
     window.close()
     app.processEvents()
 
@@ -55,7 +55,7 @@ def test_simulated_forecast_cache_is_not_rendered_after_restart(tmp_path: Path) 
     app.processEvents()
 
     restarted = MainWindow(db_path)
-    assert restarted.cve_radar_panel.status_label.text() == "Forecast not checked yet"
+    assert restarted.cve_radar_panel.status_label.text() == "Assessment not checked yet"
     assert restarted.cve_radar_panel.current_card() is None
     restarted.close()
     app.processEvents()
@@ -65,13 +65,13 @@ def test_forecast_tab_exists_and_dashboard_is_compact(tmp_path: Path) -> None:
     app = QApplication.instance() or QApplication([])
     window = MainWindow(tmp_path / "audit.sqlite")
     sidebar_items = [window.sidebar.item(index).text() for index in range(window.sidebar.count())]
-    assert "Apple Security Forecast" not in sidebar_items
+    assert "Apple Exposure Assessment" not in sidebar_items
     assert window.cve_radar_panel.parentWidget() is not None
     assert window.cve_radar_panel.window() is window
     assert window.dashboard_forecast_frame.isVisible() is False or window.dashboard_forecast_frame.objectName() == "dashboardForecastSummary"
     assert window.dashboard_forecast_level_label.text().startswith("Level:")
     assert window.dashboard_forecast_cards_label.text().startswith("Cards:")
-    assert window.open_forecast_button.text() == "Show Forecast"
+    assert window.open_forecast_button.text() == "Show Assessment"
     assert window.open_forecast_button.toolTip()
     window.close()
     app.processEvents()
@@ -106,9 +106,9 @@ def test_forecast_buttons_have_widths_labels_and_tooltips() -> None:
         assert "background: #" in button.styleSheet()
         assert "rgba(" not in button.styleSheet()
         assert "min-height: 34px" in button.styleSheet()
-    assert buttons["update"].text() == "Update Forecast"
+    assert buttons["update"].text() == "Update Assessment"
     assert buttons["diagnostics"].text() == "Diagnostics"
-    assert buttons["export"].text() == "Export Forecast"
+    assert buttons["export"].text() == "Export Assessment"
     assert buttons["details"].text() == "View Details"
     assert buttons["review"].text() == "Reviewed"
     assert buttons["snooze"].text() == "Snooze"

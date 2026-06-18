@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -479,7 +480,7 @@ def test_reports_include_apple_security_forecast_section(tmp_path: Path) -> None
     json_content = json_path.read_text(encoding="utf-8")
     html_content = html_path.read_text(encoding="utf-8")
     assert '"apple_security_forecast"' in json_content
-    assert "Apple Security Forecast" in html_content
+    assert "Apple Exposure Assessment" in html_content
     assert "CVE-2026-0001" in html_content
     assert "Sources Used" in html_content
 
@@ -551,6 +552,102 @@ def test_reports_include_investigation_priorities_section(tmp_path: Path) -> Non
     assert "Top Priorities" in html_content
 
 
+def test_reports_include_reliability_trust_and_drift_sections(tmp_path: Path) -> None:
+    scan_result = make_scan_result()
+    reliability = {
+        "alert_pipeline": {
+            "last_failure_stage": "policy",
+            "suppressed_count": 2,
+            "no_policy_match_count": 1,
+            "db_path_mismatch": False,
+        },
+        "monitoring_coverage": {
+            "score": 82,
+            "components": [
+                {
+                    "name": "Bluetooth detector",
+                    "status": "degraded",
+                    "last_successful_run": "2026-06-16T10:00:00+00:00",
+                    "last_event": "bluetooth_inventory_changed",
+                    "last_error": "stale heartbeat",
+                    "heartbeat_age_seconds": 999,
+                    "permission_status": "available",
+                    "failure_reason": "Heartbeat age exceeded threshold",
+                    "recommended_fix": "Restart monitoring.",
+                }
+            ],
+        },
+        "release_readiness": {"ReleaseReadinessScore": 74, "status": "needs work", "checks": []},
+        "trust_decay": {
+            "previous_score": 89,
+            "current_score": 71,
+            "delta": -18,
+            "trend": "declining",
+            "score_history": [
+                {
+                    "created_at": "2026-06-16T10:05:00+00:00",
+                    "previous_score": 89,
+                    "current_score": 71,
+                    "delta": -18,
+                    "causes": ["New LaunchDaemon", "Unknown USB"],
+                    "related_events": [{"event_id": "event-1", "event_type": "launchdaemon_added"}],
+                    "recommended_action": "Review persistence and device inventory.",
+                }
+            ],
+            "timeline": [
+                {
+                    "created_at": "2026-06-16T10:05:00+00:00",
+                    "previous_score": 89,
+                    "current_score": 71,
+                    "delta": -18,
+                    "causes": ["New LaunchDaemon", "Unknown USB"],
+                    "recommended_action": "Review persistence and device inventory.",
+                }
+            ],
+        },
+        "configuration_drift": {
+            "changes": [
+                {
+                    "setting": "Remote Login",
+                    "previous_value": "Disabled",
+                    "current_value": "Enabled",
+                    "first_seen": "2026-06-16T10:00:00+00:00",
+                    "last_seen": "2026-06-16T10:05:00+00:00",
+                    "source_detector": "session",
+                    "confidence": "medium",
+                    "severity": "high",
+                    "why_it_matters": "SSH access is now available.",
+                    "recommended_verification": "Review Sharing settings.",
+                }
+            ]
+        },
+        "incident_mode": {"active": True},
+    }
+    scan_result.collected_artifacts["reliability"] = reliability
+
+    json_path = export_scan_result_json(scan_result, tmp_path / "scan.json")
+    html_path = export_scan_result_html(scan_result, tmp_path / "scan.html")
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    html_content = html_path.read_text(encoding="utf-8")
+
+    assert payload["report_summary"]["reliability_summary"]["monitoring_coverage_score"] == 82
+    assert payload["report_summary"]["reliability_summary"]["incident_mode_active"] is True
+    assert payload["reliability"]["trust_decay"]["delta"] == -18
+    assert payload["reliability"]["trust_decay"]["score_history"][0]["related_events"][0]["event_id"] == "event-1"
+    assert "Reliability and Trust" in html_content
+    assert "Monitoring Coverage Dashboard" in html_content
+    assert "Trust Timeline" in html_content
+    assert "New LaunchDaemon" in html_content
+    assert "Configuration Drift Timeline" in html_content
+    assert "Incident Mode Active" in html_content
+    assert "Heartbeat Age" in html_content
+    assert "999" in html_content
+    assert "available" in html_content
+    assert "Remote Login" in html_content
+    assert "Confidence" in html_content
+    assert "medium" in html_content
+
+
 def test_reports_include_empty_apple_security_forecast_section(tmp_path: Path) -> None:
     scan_result = make_scan_result()
     json_path = export_scan_result_json(scan_result, tmp_path / "scan.json")
@@ -558,7 +655,7 @@ def test_reports_include_empty_apple_security_forecast_section(tmp_path: Path) -
     json_content = json_path.read_text(encoding="utf-8")
     html_content = html_path.read_text(encoding="utf-8")
     assert '"apple_security_forecast_summary"' in json_content
-    assert "Apple Security Forecast: no applicable cards at report time." in html_content
+    assert "Apple Exposure Assessment: no applicable cards at report time." in html_content
 
 
 def test_packet_capture_metadata_included_but_contents_not_embedded(tmp_path: Path) -> None:

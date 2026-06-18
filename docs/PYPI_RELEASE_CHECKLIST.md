@@ -40,6 +40,8 @@ Product: macOS Security Audit Agent
 - [x] `macos-security-audit-agent --aggressive-scan`
 - [x] `macos-security-audit-agent --report report.html`
 - [x] `macos-security-audit-agent --system-health`
+- [x] `macos-security-audit-agent --release-readiness`
+- [x] `macos-security-audit-agent --verify-clean-install --clean-install-python /path/to/python3.12`
 - [x] Console script launches help successfully after wheel install.
 - [x] HTML report generation works after wheel install.
 
@@ -48,11 +50,9 @@ Product: macOS Security Audit Agent
 - [x] `python -m compileall -q mac_audit_agent`
 - [x] `python -m build`
 - [x] `twine check dist/*`
-- [x] Clean venv local wheel install.
-- [x] Installed package import sweep.
-- [x] Installed package resource check.
-- [x] Installed console-script help check.
-- [x] Installed report generation check.
+- [x] Clean venv local wheel install verifier passes with Python 3.10 or newer.
+- [x] `python_version`, `wheel_exists`, `venv_create`, `wheel_install`, `import_sweep`, `resource_check`, `console_help`, and `release_readiness_cli` stages are all `PASS`.
+- [x] Release Readiness dashboard shows `clean wheel install verified` as `pass`.
 
 ## Before First Upload
 

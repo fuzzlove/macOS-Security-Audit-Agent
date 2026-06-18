@@ -229,7 +229,7 @@ class SystemRecoveryCenter:
         forecast = self.db.latest_apple_security_forecast() or {}
         forecast_level = str(forecast.get("level", "")).lower()
         if forecast_level == "urgent":
-            reasons.append("Apple Security Forecast is urgent.")
+            reasons.append("Apple Exposure Assessment is urgent.")
         processes = payload.get("processes", {}).get("all", []) if isinstance(payload.get("processes"), dict) else []
         low_trust = 0
         for item in processes:

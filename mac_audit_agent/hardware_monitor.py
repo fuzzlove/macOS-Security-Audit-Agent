@@ -321,28 +321,6 @@ class HardwareMonitor:
                     current_state="removed",
                 )
             )
-        if previous_usb != current_usb:
-            added = sorted(current_usb - previous_usb)
-            removed = sorted(previous_usb - current_usb)
-            if added or removed:
-                events.append(
-                    self._event(
-                        timestamp=timestamp,
-                        event_type="usb_inventory_changed",
-                        severity="medium",
-                        source="ioreg_usb_observer",
-                        evidence=(
-                            "USB inventory changed; "
-                            f"added={len(added)} removed={len(removed)}."
-                        ),
-                        confidence="high",
-                        recommendation="Review the USB devices that were added or removed.",
-                        metadata={"added": added, "removed": removed},
-                        rule=rule_for_event("usb_inventory_changed"),
-                        previous_state=f"count={len(previous_devices)}",
-                        current_state=f"count={len(current_devices)}",
-                    )
-                )
         return events
 
     def _parse_usb_devices(self, output: str) -> list[dict[str, str]]:
@@ -440,7 +418,6 @@ class HardwareMonitor:
             "address": address,
             "vendor_id": str(item.get("device_vendorID") or item.get("vendor_id") or ""),
             "product_id": str(item.get("device_productID") or item.get("product_id") or ""),
-            "source_bucket": source_bucket,
         }
 
     def _usb_key(self, item: dict[str, str]) -> str:
@@ -558,22 +535,35 @@ class USBReconnectObserver:
 
     def _run(self) -> None:
         previous = self.monitor.collect_usb_devices()
-        pending: list[BackgroundMonitorEvent] = []
+        pending_previous: list[dict[str, str]] | None = None
+        pending_current: list[dict[str, str]] | None = None
         last_topology_change = 0.0
         while not self._stop.wait(self.poll_seconds):
             current = self.monitor.collect_usb_devices()
             previous_keys = {self.monitor._usb_key(item) for item in previous}
             current_keys = {self.monitor._usb_key(item) for item in current}
             if current_keys != previous_keys:
-                new_events = self.monitor.usb_connection_events(previous, current)
                 if self.quiet_window_seconds <= 0:
+                    new_events = self.monitor.usb_connection_events(previous, current)
                     for event in new_events:
                         self.events.put(event)
                 else:
-                    pending.extend(new_events)
+                    if pending_previous is None:
+                        pending_previous = previous
+                    pending_current = current
                 last_topology_change = time.monotonic()
-            if pending and time.monotonic() - last_topology_change >= self.quiet_window_seconds:
-                for event in pending:
+            if pending_previous is not None and pending_current is not None and time.monotonic() - last_topology_change >= self.quiet_window_seconds:
+                final_physical_keys = {self.monitor.usb_physical_key(item) for item in pending_current}
+                pending_events = self.monitor.usb_connection_events(pending_previous, pending_current)
+                for event in pending_events:
+                    if event.event_type == "usb_device_removed":
+                        try:
+                            metadata = json.loads(event.metadata_json)
+                        except json.JSONDecodeError:
+                            metadata = {}
+                        if self.monitor.usb_physical_key(metadata) in final_physical_keys:
+                            continue
                     self.events.put(event)
-                pending.clear()
+                pending_previous = None
+                pending_current = None
             previous = current

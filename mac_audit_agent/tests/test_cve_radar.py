@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
@@ -331,7 +332,7 @@ def test_corrupt_forecast_payload_does_not_crash(tmp_path: Path) -> None:
     engine.db.conn.commit()
 
     cached = engine.load_cached_state()
-    assert cached["state_text"] in {"Forecast not checked yet", "Clear — no applicable Apple security updates found"}
+    assert cached["state_text"] in {"Assessment not checked yet", "Clear — no applicable Apple security updates found"}
     assert cached["last_error"] == ""
 
 
@@ -482,8 +483,8 @@ def test_no_forecast_state_renders_explanation(tmp_path: Path) -> None:
 
     cached = engine.load_cached_state()
 
-    assert cached["state_text"] == "Forecast not checked yet"
-    assert cached["why_no_cards"] == "No Apple Security Forecast has been checked yet."
+    assert cached["state_text"] == "Assessment not checked yet"
+    assert cached["why_no_cards"] == "No Apple Exposure Assessment has been checked yet."
 
 
 def test_historical_apple_advisories_are_hidden_by_default(tmp_path: Path) -> None:
@@ -495,6 +496,27 @@ def test_historical_apple_advisories_are_hidden_by_default(tmp_path: Path) -> No
 
     assert alerts == []
     assert engine._last_diagnostics["historical_advisories"] == 1
+
+
+def test_apple_exposure_uses_90_day_diagnostic_window_and_180_day_active_limit(tmp_path: Path) -> None:
+    engine = make_engine(tmp_path)
+    within_hard_limit = make_apple_cve("CVE-2026-OLDER-ACTIVE", "macOS", cvss=8.0, fixed_version="14.1")
+    within_hard_limit["published_date"] = (datetime.now(timezone.utc) - timedelta(days=120)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    stale = make_apple_cve("CVE-2026-STALE", "macOS", cvss=9.8, fixed_version="14.1")
+    stale["published_date"] = (datetime.now(timezone.utc) - timedelta(days=181)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    alerts = engine._build_cards(
+        {"kev": {}, "epss": {}, "cves": [within_hard_limit, stale]},
+        make_inventory(("macOS", "14.0")),
+        None,
+    )
+
+    assert len(alerts) == 1
+    assert alerts[0].cves == ["CVE-2026-OLDER-ACTIVE"]
+    assert engine._last_diagnostics["advisories_within_90_days"] == 0
+    assert engine._last_diagnostics["historical_advisories"] == 1
+    assert engine._last_diagnostics["stale_advisories"] == 1
+    assert engine._last_diagnostics["active_forecast_cards"] == 1
 
 
 def test_1999_apple_records_are_rejected_from_active_forecast(tmp_path: Path) -> None:

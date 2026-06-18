@@ -29,7 +29,7 @@ The tool is for local macOS audit, monitoring, and investigation work. It is not
 - notes
 - review decisions
 - evidence snapshots
-- Apple Security Forecast cache
+- Apple Exposure Assessment cache
 - deployment and health status
 
 ## Logs Generated

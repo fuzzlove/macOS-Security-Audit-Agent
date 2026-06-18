@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -114,6 +115,71 @@ def test_developer_mode_reveals_synthetic_controls_only_when_enabled(tmp_path: P
     assert all(not button.isHidden() for button in window.background_monitor_panel.developer_only_buttons())
     assert all(action.isVisible() for action in window.developer_monitor_actions)
 
+    window.close()
+    app.processEvents()
+
+
+def test_reliability_refresh_updates_configuration_drift_from_monitor_snapshot(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(tmp_path / "audit.sqlite")
+    window.db.set_background_monitor_state(
+        "current_monitor_snapshot",
+        json.dumps({"remote_login_enabled": False, "screen_sharing_enabled": False, "launch_agents": ["baseline.plist"]}, sort_keys=True),
+    )
+    window._current_configuration_drift_payload()
+    window.db.set_background_monitor_state(
+        "current_monitor_snapshot",
+        json.dumps({"remote_login_enabled": True, "screen_sharing_enabled": False, "launch_agents": ["baseline.plist"]}, sort_keys=True),
+    )
+
+    payload = window._current_configuration_drift_payload()
+
+    assert any(change.get("setting") == "Remote Login / SSH" for change in payload.get("changes", []))
+    window.close()
+    app.processEvents()
+
+
+def test_main_window_reliability_page_exposes_required_dashboards_and_actions(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(tmp_path / "audit.sqlite")
+
+    tab_names = [window.reliability_panel.tabs.tabText(index) for index in range(window.reliability_panel.tabs.count())]
+
+    assert "Alert Pipeline Health" in tab_names
+    assert "Monitoring Coverage" in tab_names
+    assert "Release Readiness" in tab_names
+    assert "Trust Timeline" in tab_names
+    assert "Configuration Drift" in tab_names
+    assert "Incident Mode" in tab_names
+    assert window.export_sarif_button.text() == "Export SARIF"
+    assert window.reliability_panel.incident_snapshot_button.text() == "Create Evidence Snapshot"
+    assert window.reliability_panel.incident_timeline_button.text() == "Open Timeline"
+    assert window.reliability_panel.incident_export_button.text() == "Export Case Package"
+    assert window.reliability_panel.incident_note_button.text() == "Add Investigation Note"
+    assert window.reliability_panel.incident_priority_button.text() == "Review High Priority Events"
+    assert window.reliability_panel.alert_table.rowCount() >= 8
+    assert window.reliability_panel.coverage_table.columnCount() == 9
+    assert window.reliability_panel.release_table.columnCount() == 4
+
+    window.close()
+    app.processEvents()
+
+
+def test_incident_mode_actions_record_note_and_case_package_activity(tmp_path: Path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(tmp_path / "audit.sqlite")
+    window.incident_mode_manager.set_enabled(True)
+    monkeypatch.setattr(window, "show_investigation_notes_page", lambda: None)
+    monkeypatch.setattr(window, "export_html", lambda: tmp_path / "case.html")
+
+    window.open_incident_note_panel()
+    window.export_incident_case_package()
+    status = window.incident_mode_manager.status()
+
+    assert status["notes_panel_opened"] is True
+    assert status["investigation_note_count"] == 1
+    assert status["case_package_count"] == 1
+    assert status["last_case_package"]["path"] == str(tmp_path / "case.html")
     window.close()
     app.processEvents()
 

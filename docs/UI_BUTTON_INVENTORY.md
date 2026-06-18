@@ -13,20 +13,20 @@ Rule: a visible production control must either perform a working action or expla
 | Export JSON | Dashboard | Export current report | `export_json` | Completed scan | Scan result exists | Run a scan first to generate an exportable report. | Keep state-aware |
 | Export HTML | Dashboard | Export current report | `export_html` | Completed scan | Scan result exists | Run a scan first to generate an exportable report. | Keep state-aware |
 | Open Reports Folder | Dashboard | Open local report directory | `open_reports_folder` | None | Always | n/a | Keep |
-| Open Forecast | Dashboard summary | Open Apple Security Forecast tab | `show_forecast_page` | None | Always | n/a | Keep |
+| Open Assessment | Dashboard summary | Open Apple Exposure Assessment tab | `show_forecast_page` | None | Always | n/a | Keep |
 | Open Health | Dashboard summary | Open Settings health panel | `show_settings_page` | None | Always | n/a | Keep |
 
-## Apple Security Forecast
+## Apple Exposure Assessment
 
 | Label | Panel | Purpose | Function | Required State | Enabled Condition | Disabled Reason | Decision |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Update Forecast | Apple Security Forecast | Refresh Apple/macOS security update advisor | `refresh_apple_security_forecast` | None | Always | n/a | Keep |
-| Diagnostics | Apple Security Forecast | Show source/cache/filter diagnostics | `show_apple_security_forecast_diagnostics` | None | Always | n/a | Keep |
-| Export Forecast | Apple Security Forecast | Export current production report | `export_html` | Report payload | Always available; report handles empty forecast | n/a | Keep |
-| View Details | Apple Security Forecast | Inspect selected forecast card | `open_details` | Selected card | Card selected | Select a forecast card first. | Keep state-aware |
-| Reviewed | Apple Security Forecast | Mark selected forecast reviewed | `mark_reviewed` | Selected card | Card selected | Select a forecast card first. | Keep state-aware |
-| Snooze | Apple Security Forecast | Temporarily snooze selected card | `snooze_selected` | Selected card | Card selected | Select a forecast card first. | Keep state-aware |
-| Update Guide | Apple Security Forecast | Show Apple update guidance | `open_update_guidance` | Selected card | Card selected | Select a forecast card first. | Keep state-aware |
+| Update Assessment | Apple Exposure Assessment | Refresh Apple/macOS security update advisor | `refresh_apple_security_forecast` | None | Always | n/a | Keep |
+| Diagnostics | Apple Exposure Assessment | Show source/cache/filter diagnostics | `show_apple_security_forecast_diagnostics` | None | Always | n/a | Keep |
+| Export Assessment | Apple Exposure Assessment | Export current production report | `export_html` | Report payload | Always available; report handles empty forecast | n/a | Keep |
+| View Details | Apple Exposure Assessment | Inspect selected exposure card | `open_details` | Selected card | Card selected | Select a exposure card first. | Keep state-aware |
+| Reviewed | Apple Exposure Assessment | Mark selected forecast reviewed | `mark_reviewed` | Selected card | Card selected | Select a exposure card first. | Keep state-aware |
+| Snooze | Apple Exposure Assessment | Temporarily snooze selected card | `snooze_selected` | Selected card | Card selected | Select a exposure card first. | Keep state-aware |
+| Update Guide | Apple Exposure Assessment | Show Apple update guidance | `open_update_guidance` | Selected card | Card selected | Select a exposure card first. | Keep state-aware |
 
 Removed from production: `Generate Demo`, `Safari/WebKit Demo`, `Clear Demo`, synthetic/demo forecast generation.
 
