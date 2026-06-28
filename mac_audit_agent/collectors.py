@@ -62,7 +62,16 @@ from mac_audit_agent.models import (
     utc_now_iso,
 )
 from mac_audit_agent.network_discovery import discover_local_network
+from mac_audit_agent.nmap_wrapper import (
+    DEFAULT_SCAN_PROFILE,
+    NMAP_INSTALL_MESSAGE,
+    NmapScanResult,
+    find_nmap_binary,
+    profile_for_scan,
+    run_nmap_scan,
+)
 from mac_audit_agent.runner import SafeCommandRunner
+from mac_audit_agent.system_integrity import SystemIntegrityEngine
 
 
 SEVERITY_WEIGHTS = {"info": 0, "low": 2, "medium": 7, "high": 15, "critical": 25}
@@ -284,6 +293,21 @@ class CollectorSuite:
             current_findings=findings,
         )
         findings.extend(self._findings_for_comparison(comparison))
+        system_integrity_artifacts = {
+            "system_info": system_info,
+            "ports": ports_artifact,
+            "localhost_scan": localhost_scan_artifact,
+            "users": users,
+            "permission_snapshots": permission_snapshots,
+            "file_issues": file_issues,
+            "processes": processes,
+            "launch_snapshots": launch_snapshots,
+            "network_info": network_info,
+            "ssh_artifacts": ssh_artifacts,
+            "baseline_diff": comparison.to_dict(),
+        }
+        system_integrity_report = SystemIntegrityEngine().analyze_artifacts(system_integrity_artifacts)
+        findings.extend(system_integrity_report.findings)
         if not findings:
             findings.append(self._finding(
                 category="Summary",
@@ -316,6 +340,7 @@ class CollectorSuite:
             "command_results": command_results,
             "network_info": network_info,
             "ssh_artifacts": ssh_artifacts,
+            "system_integrity": system_integrity_report.to_dict(),
         }
         scan_result.baseline_diff = comparison.to_dict()
         return scan_result
@@ -568,6 +593,16 @@ class CollectorSuite:
             "missing_from_enumeration": [],
             "errors": [],
             "scanned_port_count": 0,
+            "engine": "internal_socket",
+            "nmap": {
+                "installed": bool(find_nmap_binary()),
+                "path": find_nmap_binary() or "",
+                "profile": DEFAULT_SCAN_PROFILE,
+                "ports": [],
+                "warnings": [],
+                "errors": [],
+                "fallback_used": True,
+            },
         }
 
     def _empty_localhost_full_port_scan_artifact(self) -> dict[str, object]:
@@ -579,6 +614,16 @@ class CollectorSuite:
             "scanned_tcp_count": 0,
             "scanned_udp_count": 0,
             "errors": [],
+            "engine": "internal_socket",
+            "nmap": {
+                "installed": bool(find_nmap_binary()),
+                "path": find_nmap_binary() or "",
+                "profiles": [],
+                "ports": [],
+                "warnings": [],
+                "errors": [],
+                "fallback_used": True,
+            },
         }
 
     def _resolve_localhost_scan_target(self, override: str | None = None) -> str:
@@ -643,6 +688,79 @@ class CollectorSuite:
         if normalized_protocol not in {"tcp", "udp", "both"}:
             raise ValueError(f"Unsupported localhost scan protocol: {protocol}")
 
+        nmap_artifacts: dict[str, object] = {
+            "installed": bool(find_nmap_binary()),
+            "path": find_nmap_binary() or "",
+            "profile": profile_for_scan(scan_mode, normalized_protocol),
+            "ports": [],
+            "warnings": [],
+            "errors": [],
+            "fallback_used": True,
+        }
+        nmap_results: list[NmapScanResult] = []
+        if nmap_artifacts["installed"] and not self.config.dry_run:
+            profile_keys = [profile_for_scan(scan_mode, normalized_protocol)]
+            if normalized_protocol == "both":
+                profile_keys = [
+                    profile_for_scan(scan_mode, "tcp"),
+                    profile_for_scan("safe", "udp"),
+                ]
+            for profile_key in profile_keys:
+                result = run_nmap_scan(profile_key, target=target)
+                nmap_results.append(result)
+            nmap_errors = [error for result in nmap_results for error in (result.errors or [])]
+            if nmap_results and not nmap_errors:
+                tcp_open_ports = sorted(
+                    port.port
+                    for result in nmap_results
+                    for port in result.ports
+                    if port.protocol.lower() == "tcp" and port.state == "open"
+                )
+                udp_open_ports = sorted(
+                    port.port
+                    for result in nmap_results
+                    for port in result.ports
+                    if port.protocol.lower() == "udp" and port.state in {"open", "open|filtered"}
+                )
+                if normalized_protocol == "tcp":
+                    open_ports: dict[str, list[int]] | list[int] = tcp_open_ports
+                elif normalized_protocol == "udp":
+                    open_ports = udp_open_ports
+                else:
+                    open_ports = {"tcp": tcp_open_ports, "udp": udp_open_ports}
+                nmap_artifacts.update(
+                    {
+                        "profile": ", ".join(result.profile_label for result in nmap_results),
+                        "ports": [port.to_dict() for result in nmap_results for port in result.ports],
+                        "warnings": [warning for result in nmap_results for warning in (result.warnings or [])],
+                        "errors": [],
+                        "fallback_used": False,
+                        "raw_xml": "\n".join(result.raw_xml for result in nmap_results if result.raw_xml),
+                        "command_used": [result.command_used_redacted for result in nmap_results],
+                        "sudo_required": any(result.sudo_required for result in nmap_results),
+                        "target": target,
+                        "timestamp": utc_now_iso(),
+                    }
+                )
+                return {
+                    "target": target,
+                    "mode": scan_mode,
+                    "protocol": normalized_protocol,
+                    "open_ports": open_ports,
+                    "missing_from_enumeration": [],
+                    "errors": [],
+                    "scanned_port_count": len([port for result in nmap_results for port in result.ports]),
+                    "engine": "nmap",
+                    "nmap": nmap_artifacts,
+                }
+            nmap_artifacts.update(
+                {
+                    "errors": nmap_errors or [NMAP_INSTALL_MESSAGE],
+                    "warnings": [warning for result in nmap_results for warning in (result.warnings or [])],
+                    "fallback_used": True,
+                }
+            )
+
         ports_to_scan = self._localhost_scan_ports_for_mode(scan_mode)
         tcp_open_ports: list[int] = []
         udp_open_ports: list[int] = []
@@ -668,8 +786,10 @@ class CollectorSuite:
             "protocol": normalized_protocol,
             "open_ports": open_ports,
             "missing_from_enumeration": [],
-            "errors": errors,
+            "errors": errors + [str(error) for error in nmap_artifacts.get("errors", [])],
             "scanned_port_count": len(ports_to_scan),
+            "engine": "internal_socket",
+            "nmap": nmap_artifacts,
         }
 
     def collect_full_localhost_port_scan(
@@ -687,6 +807,42 @@ class CollectorSuite:
         artifact["target"] = target
         artifact["scanned_tcp_count"] = len(tcp_port_list)
         artifact["scanned_udp_count"] = len(udp_port_list)
+        if find_nmap_binary() and not self.config.dry_run and tcp_ports is None and udp_ports is None:
+            tcp_result = run_nmap_scan("localhost_tcp_full", target=target)
+            udp_result = run_nmap_scan("localhost_udp_full", target=target)
+            nmap_errors = list(tcp_result.errors or []) + list(udp_result.errors or [])
+            if not nmap_errors:
+                all_ports = list(tcp_result.ports) + list(udp_result.ports)
+                artifact["tcp_open_ports"] = sorted(port.port for port in all_ports if port.protocol.lower() == "tcp" and port.state == "open")
+                artifact["udp_responsive_or_unknown_ports"] = sorted(port.port for port in all_ports if port.protocol.lower() == "udp" and port.state in {"open", "open|filtered"})
+                artifact["scanned_tcp_count"] = 65535
+                artifact["scanned_udp_count"] = 65535
+                artifact["engine"] = "nmap"
+                artifact["nmap"] = {
+                    "installed": True,
+                    "path": tcp_result.nmap_path or udp_result.nmap_path,
+                    "profiles": [tcp_result.profile_label, udp_result.profile_label],
+                    "ports": [port.to_dict() for port in all_ports],
+                    "warnings": list(tcp_result.warnings or []) + list(udp_result.warnings or []),
+                    "errors": [],
+                    "fallback_used": False,
+                    "raw_xml": "\n".join(item.raw_xml for item in [tcp_result, udp_result] if item.raw_xml),
+                    "command_used": [tcp_result.command_used_redacted, udp_result.command_used_redacted],
+                    "sudo_required": tcp_result.sudo_required or udp_result.sudo_required,
+                    "target": target,
+                    "timestamp": utc_now_iso(),
+                }
+                return artifact
+            artifact["nmap"] = {
+                "installed": True,
+                "path": tcp_result.nmap_path or udp_result.nmap_path,
+                "profiles": [tcp_result.profile_label, udp_result.profile_label],
+                "ports": [],
+                "warnings": list(tcp_result.warnings or []) + list(udp_result.warnings or []),
+                "errors": nmap_errors,
+                "fallback_used": True,
+                "sudo_required": tcp_result.sudo_required or udp_result.sudo_required,
+            }
         tcp_open_ports: list[int] = []
         tcp_banners: dict[int, str] = {}
         udp_responsive_or_unknown_ports: list[int] = []
@@ -1336,17 +1492,17 @@ class CollectorSuite:
         return [
             self._finding(
                 category="Localhost Port Scan",
-                title="Localhost port responds but was not found in process listing",
-                severity="high",
+                title="Visibility mismatch detected",
+                severity="high" if port in self.config.concerning_ports else "medium",
                 description="A localhost-only active port scan found a responsive port that was not present in the listening-port enumeration output.",
                 evidence=str(port),
                 evidence_summary=f"localhost port {port} responded but was not enumerated",
                 raw_evidence_ref=f"localhost_scan:{port}",
                 why_this_matters="A mismatch between active probing and local enumeration can indicate transient listeners, parser issues, permission gaps, or a service that needs closer validation.",
                 false_positive_notes="Race conditions, permission issues, transient services, parser bugs, or sandboxing can cause mismatches.",
-                recommended_next_steps="Investigate with multiple tools, reboot into trusted environment if rootkit concern persists, and compare against baseline.",
+                recommended_next_steps="Investigate with multiple local tools, compare against baseline, and identify the owning service before taking action.",
                 what_can_go_wrong="Do not assume compromise from this alone. Killing or deleting unknown services can break legitimate software.",
-                command_used="localhost port scan",
+                command_used=str(localhost_scan_artifact.get("engine", "localhost port scan")),
             )
             for port in missing_ports
         ]

@@ -4,6 +4,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal
 
+from mac_audit_agent.frameworks import extract_mapping_fields, mapping_dicts, mappings_for_finding
+
 
 RiskLevel = Literal["safe", "sensitive", "dangerous"]
 Severity = Literal["info", "low", "medium", "high", "critical"]
@@ -245,6 +247,16 @@ class Finding:
     false_positive_hints: list[str] = field(default_factory=list)
     recommended_verification_steps: list[str] = field(default_factory=list)
     source_trace: str = ""
+    nist_csf_functions: list[str] = field(default_factory=list)
+    nist_800_53_controls: list[str] = field(default_factory=list)
+    nist_800_61_lifecycle_phase: list[str] = field(default_factory=list)
+    mitre_attack_techniques: list[str] = field(default_factory=list)
+    cisa_kev_refs: list[str] = field(default_factory=list)
+    cve_refs: list[str] = field(default_factory=list)
+    framework_mappings: list[dict[str, Any]] = field(default_factory=list)
+    technical_explanation: str = ""
+    plain_english_explanation: str = ""
+    analyst_next_step: str = ""
     created_at: str = field(default_factory=utc_now_iso)
 
     def __post_init__(self) -> None:
@@ -277,6 +289,13 @@ class Finding:
             self.local_network_impact = "Validate whether this finding can affect only the local host or also nearby systems and shared services."
         if not self.recommended_verification_steps:
             self.recommended_verification_steps = list(self.verification_steps)
+        mappings = mappings_for_finding(asdict(self))
+        fields = extract_mapping_fields(mappings)
+        if not self.framework_mappings:
+            self.framework_mappings = mapping_dicts(mappings)
+        for field_name, values in fields.items():
+            if not getattr(self, field_name):
+                setattr(self, field_name, values)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -295,6 +314,13 @@ class Finding:
         if not data["recommended_verification_steps"]:
             data["recommended_verification_steps"] = list(data["verification_steps"])
         data["recommendation"] = data["recommended_next_steps"]
+        if data["severity"] in {"high", "critical"}:
+            try:
+                from mac_audit_agent.explanations import ensure_finding_explanations
+
+                data = ensure_finding_explanations(data)
+            except Exception:
+                pass
         return data
 
 

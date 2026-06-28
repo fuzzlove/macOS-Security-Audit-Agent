@@ -7,6 +7,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any
 
+from mac_audit_agent.frameworks import FrameworkMapping, mapping_dicts, mappings_for_rule, validate_mapping_payload
+
 
 @dataclass(frozen=True)
 class Rule:
@@ -19,11 +21,16 @@ class Rule:
     source_detector: str
     false_positive_hints: list[str]
     verification_steps: list[str]
+    evidence_fields: list[str]
+    recommendation: str
+    framework_mappings: list[FrameworkMapping]
     mitre_mapping: str = ""
     enabled_by_default: bool = True
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        data["framework_mappings"] = mapping_dicts(self.framework_mappings)
+        return data
 
 
 def _rule(
@@ -38,6 +45,9 @@ def _rule(
     verification_steps: list[str],
     mitre_mapping: str = "",
     enabled_by_default: bool = True,
+    evidence_fields: list[str] | None = None,
+    recommendation: str = "",
+    framework_mappings: list[FrameworkMapping] | None = None,
 ) -> Rule:
     return Rule(
         rule_id=rule_id,
@@ -49,6 +59,9 @@ def _rule(
         source_detector=source_detector,
         false_positive_hints=false_positive_hints,
         verification_steps=verification_steps,
+        evidence_fields=evidence_fields or ["event_type", "timestamp", "evidence", "source_detector"],
+        recommendation=recommendation or "Review the finding evidence, compare against baseline, and document analyst conclusions.",
+        framework_mappings=framework_mappings if framework_mappings is not None else mappings_for_rule(rule_id, category, name, mitre_mapping),
         mitre_mapping=mitre_mapping,
         enabled_by_default=enabled_by_default,
     )
@@ -944,6 +957,14 @@ def validate_rule_registry() -> list[str]:
             problems.append(f"rule {rule_id} is missing description")
         if not rule.source_detector:
             problems.append(f"rule {rule_id} is missing source_detector")
+        if not rule.evidence_fields:
+            problems.append(f"rule {rule_id} is missing evidence_fields")
+        if not rule.recommendation:
+            problems.append(f"rule {rule_id} is missing recommendation")
+        if not rule.framework_mappings:
+            problems.append(f"rule {rule_id} is missing framework_mappings")
+        for mapping in rule.framework_mappings:
+            problems.extend(f"rule {rule_id}: {problem}" for problem in validate_mapping_payload(mapping.to_dict()))
     return problems
 
 

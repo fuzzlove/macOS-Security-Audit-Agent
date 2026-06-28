@@ -75,6 +75,14 @@ from mac_audit_agent.ui.action_state import ActionState, apply_action_state
 from mac_audit_agent.notification_manager import NotificationManager
 from mac_audit_agent.reporting import export_monitor_events_html, export_monitor_events_json, get_reports_dir
 from mac_audit_agent.models import BackgroundMonitorEvent, utc_now_iso
+from mac_audit_agent.monitor_settings import (
+    CATEGORY_EVENT_TYPES,
+    MonitorSettings,
+    installed_monitor_values,
+    load_settings,
+    save_settings,
+    settings_diagnostics,
+)
 from mac_audit_agent.storage import AuditDatabase
 from mac_audit_agent.system_monitor_readiness import SystemMonitorReadiness
 from mac_audit_agent.ui.context_dialog import ContextDialog
@@ -268,18 +276,26 @@ class BackgroundMonitorPanel(QWidget):
         self.system_launch_agent = LaunchAgentManager(default_monitor_db_path("system"), scope="system")
         self.protected_launch_agent = self.system_launch_agent
         self.service = BackgroundMonitorService(self.db.path, record_startup=False)
+        if self.service.db.path == self.db.path:
+            self.service.db.close()
+            self.service.db = self.db
         self.notifications = NotificationManager(self.db)
         self.workflow_layer = InvestigatorWorkflowLayer(self.db)
         self.system_readiness = SystemMonitorReadiness(default_monitor_db_path("system"))
+        self.monitor_settings = load_settings(self.db)
+        self._loading_monitor_settings = False
         self._notification_service_cache: BackgroundMonitorService | None = None
         self._notification_service_db_path = ""
         self._event_service_cache: BackgroundMonitorService | None = None
         self._event_service_db_path = ""
+        self._active_db_cache: AuditDatabase | None = None
+        self._active_db_cache_path = ""
         self.current_events: list = []
         self._build_ui()
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh)
-        self.refresh_timer.start(5000)
+        if not os.environ.get("PYTEST_CURRENT_TEST"):
+            self.refresh_timer.start(5000)
         self.refresh()
 
     def _fallback_log_path_text(self) -> str:
@@ -294,7 +310,12 @@ class BackgroundMonitorPanel(QWidget):
             try:
                 if self.db.path == system_db_path:
                     return self.db
-                return AuditDatabase(system_db_path)
+                if self._active_db_cache is None or self._active_db_cache_path != str(system_db_path):
+                    if self._active_db_cache is not None:
+                        self._active_db_cache.close()
+                    self._active_db_cache = AuditDatabase(system_db_path)
+                    self._active_db_cache_path = str(system_db_path)
+                return self._active_db_cache
             except Exception as exc:
                 self.db.set_background_monitor_state("last_error", f"Unable to open shared system monitor database: {exc}")
                 return self.db
@@ -439,7 +460,7 @@ class BackgroundMonitorPanel(QWidget):
         settings_layout.addWidget(self.rate_limit_input, 1, 9)
         settings_layout.addWidget(QLabel("Notification Mode"), 1, 10)
         self.notification_mode_combo = QComboBox()
-        for mode in ["notification", "dialog", "both"]:
+        for mode in ["none", "notification", "dialog", "both"]:
             self.notification_mode_combo.addItem(mode, mode)
         settings_layout.addWidget(self.notification_mode_combo, 1, 11)
         settings_layout.addWidget(QLabel("Notification Sound"), 1, 12)
@@ -481,7 +502,70 @@ class BackgroundMonitorPanel(QWidget):
         settings_layout.addWidget(QLabel("Category Cooldown Seconds"), 3, 0)
         self.cooldown_seconds_input = QLineEdit("600")
         settings_layout.addWidget(self.cooldown_seconds_input, 3, 1)
+        settings_layout.addWidget(QLabel("Dialogs"), 3, 2)
+        self.dialog_alerts_checkbox = QCheckBox()
+        settings_layout.addWidget(self.dialog_alerts_checkbox, 3, 3)
+        settings_layout.addWidget(QLabel("Notification Center"), 3, 4)
+        self.notification_center_checkbox = QCheckBox()
+        settings_layout.addWidget(self.notification_center_checkbox, 3, 5)
+        settings_layout.addWidget(QLabel("Persistent Alerts"), 3, 6)
+        self.persistent_alerts_checkbox = QCheckBox()
+        settings_layout.addWidget(self.persistent_alerts_checkbox, 3, 7)
+        settings_layout.addWidget(QLabel("Alert Sounds"), 3, 8)
+        self.enable_alert_sounds_checkbox = QCheckBox()
+        settings_layout.addWidget(self.enable_alert_sounds_checkbox, 3, 9)
+        settings_layout.addWidget(QLabel("Authorized Use Warning"), 3, 10)
+        self.authorized_use_warning_checkbox = QCheckBox()
+        settings_layout.addWidget(self.authorized_use_warning_checkbox, 3, 11)
+        settings_layout.addWidget(QLabel("Critical Overlay"), 3, 12)
+        self.critical_overlay_checkbox = QCheckBox()
+        settings_layout.addWidget(self.critical_overlay_checkbox, 3, 13)
+        category_title = QLabel("Event Categories")
+        category_title.setStyleSheet("font-weight: 700;")
+        settings_layout.addWidget(category_title, 4, 0, 1, 2)
+        self.category_checkboxes: dict[str, QCheckBox] = {}
+        category_labels = [
+            ("usb", "USB"),
+            ("bluetooth", "Bluetooth"),
+            ("camera", "Camera"),
+            ("lid", "Lid"),
+            ("session", "Session"),
+            ("mouse", "Mouse"),
+            ("keyboard", "Keyboard"),
+            ("trackpad", "Trackpad"),
+            ("network", "Network"),
+            ("persistence", "Persistence"),
+            ("admin", "Admin"),
+            ("apple_exposure", "Apple Exposure"),
+            ("monitor_health", "Monitor Health"),
+        ]
+        for offset, (key, label) in enumerate(category_labels):
+            row = 5 + offset // 4
+            column = (offset % 4) * 2
+            settings_layout.addWidget(QLabel(label), row, column)
+            checkbox = QCheckBox()
+            settings_layout.addWidget(checkbox, row, column + 1)
+            self.category_checkboxes[key] = checkbox
+        for widget in [
+            self.show_physical_session_alerts_checkbox,
+            self.show_usb_bluetooth_alerts_checkbox,
+            self.show_network_change_alerts_checkbox,
+            self.show_admin_persistence_alerts_checkbox,
+            self.show_apple_forecast_alerts_checkbox,
+        ]:
+            widget.setVisible(False)
+        for label in self.findChildren(QLabel):
+            if label.text() in {"Physical/Session", "USB/Bluetooth", "Network", "Admin/Persistence", "Apple Forecast"}:
+                label.setVisible(False)
         layout.addLayout(settings_layout)
+
+        layout.addWidget(QLabel("Settings Diagnostics"))
+        self.repair_settings_mismatch_button = QPushButton("Repair Settings Mismatch")
+        self.repair_settings_mismatch_button.clicked.connect(self.repair_settings_mismatch)
+        layout.addWidget(self.repair_settings_mismatch_button)
+        self.settings_diagnostics_panel = QTextEdit()
+        self.settings_diagnostics_panel.setReadOnly(True)
+        layout.addWidget(self.settings_diagnostics_panel)
 
         emergency_layout = QGridLayout()
         emergency_title = QLabel("Security Response > Emergency Lockdown")
@@ -629,6 +713,7 @@ class BackgroundMonitorPanel(QWidget):
         self.verify_event_flow_button.clicked.connect(self.verify_system_monitor_event_flow)
         self.repair_deployment_button.clicked.connect(self.repair_system_monitor_deployment)
         self.save_settings_button.clicked.connect(self.save_notification_settings)
+        self._connect_monitor_setting_signals()
         self.save_lockdown_policy_button.clicked.connect(self.save_emergency_lockdown_policy)
         self.lockdown_dry_run_button.clicked.connect(self.dry_run_emergency_lockdown_policy)
         self.lockdown_assist_test_button.clicked.connect(self.simulate_lockdown_assist_mode)
@@ -642,6 +727,162 @@ class BackgroundMonitorPanel(QWidget):
         self.export_html_button.clicked.connect(self.export_html)
         self.set_developer_mode(False)
         self.refresh_emergency_lockdown_policy()
+
+    def _connect_monitor_setting_signals(self) -> None:
+        for widget in [
+            self.notify_all_checkbox,
+            self.notify_important_checkbox,
+            self.popup_only_severe_checkbox,
+            self.browser_capture_popup_checkbox,
+            self.show_visible_alerts_checkbox,
+            self.dialog_alerts_checkbox,
+            self.notification_center_checkbox,
+            self.persistent_alerts_checkbox,
+            self.enable_alert_sounds_checkbox,
+            self.authorized_use_warning_checkbox,
+            self.critical_overlay_checkbox,
+            self.cfaa_idle_warning_checkbox,
+            *self.category_checkboxes.values(),
+        ]:
+            widget.toggled.connect(lambda _checked, self=self: self.apply_monitor_settings_from_ui())
+        for combo in [self.notify_min_severity_combo, self.notification_mode_combo]:
+            combo.currentIndexChanged.connect(lambda _index, self=self: self.apply_monitor_settings_from_ui())
+        for line_edit in [self.rate_limit_input, self.notification_sound_input, self.idle_warning_minutes_input, self.cooldown_seconds_input]:
+            line_edit.editingFinished.connect(self.apply_monitor_settings_from_ui)
+
+    def _notification_mode_from_controls(self) -> str:
+        if self.dialog_alerts_checkbox.isChecked() and self.notification_center_checkbox.isChecked():
+            return "both"
+        if self.dialog_alerts_checkbox.isChecked():
+            return "dialog"
+        if self.notification_center_checkbox.isChecked():
+            return "notification"
+        return "none"
+
+    def _sync_notification_delivery_controls(self) -> None:
+        mode = str(self.notification_mode_combo.currentData() or self.monitor_settings.notification.notification_mode)
+        self.dialog_alerts_checkbox.setChecked(mode in {"dialog", "both"})
+        self.notification_center_checkbox.setChecked(mode in {"notification", "both"})
+
+    def _settings_from_ui(self) -> MonitorSettings:
+        settings = load_settings(self.db)
+        settings.alerting.notify_all_events = self.notify_all_checkbox.isChecked()
+        settings.alerting.notify_important_events = self.notify_important_checkbox.isChecked()
+        settings.alerting.notify_min_severity = str(self.notify_min_severity_combo.currentData() or "info")
+        settings.alerting.popup_only_severe_events = self.popup_only_severe_checkbox.isChecked()
+        settings.alerting.browser_capture_process_popup = self.browser_capture_popup_checkbox.isChecked()
+        settings.notification.bottom_right_alerts = self.show_visible_alerts_checkbox.isChecked()
+        settings.notification.dialogs = self.dialog_alerts_checkbox.isChecked()
+        settings.notification.notification_center = self.notification_center_checkbox.isChecked()
+        settings.notification.notification_mode = self._notification_mode_from_controls()
+        mode_index = self.notification_mode_combo.findData(settings.notification.notification_mode)
+        if mode_index >= 0:
+            self.notification_mode_combo.blockSignals(True)
+            self.notification_mode_combo.setCurrentIndex(mode_index)
+            self.notification_mode_combo.blockSignals(False)
+        settings.notification.persistent_alerts = self.persistent_alerts_checkbox.isChecked()
+        settings.notification.enable_alert_sounds = self.enable_alert_sounds_checkbox.isChecked()
+        settings.notification.authorized_use_warning = self.authorized_use_warning_checkbox.isChecked()
+        settings.notification.critical_overlay = self.critical_overlay_checkbox.isChecked()
+        settings.notification.duplicate_rate_limit_seconds = int(self.rate_limit_input.text().strip() or "10")
+        settings.notification.notification_sound = self.notification_sound_input.text().strip() or "Glass"
+        settings.notification.cooldown_seconds = int(self.cooldown_seconds_input.text().strip() or "600")
+        settings.performance.idle_warning_minutes = int(self.idle_warning_minutes_input.text().strip() or "2")
+        for key, checkbox in self.category_checkboxes.items():
+            setattr(settings.event_categories, key, checkbox.isChecked())
+        settings.apple_exposure.enabled = settings.event_categories.apple_exposure
+        settings.notification.authorized_use_warning = settings.notification.authorized_use_warning and self.cfaa_idle_warning_checkbox.isChecked()
+        return settings
+
+    def apply_monitor_settings_from_ui(self) -> None:
+        if self._loading_monitor_settings:
+            return
+        try:
+            settings = self._settings_from_ui()
+            self.monitor_settings = save_settings(self.db, settings)
+            self._active_monitor_db().set_background_monitor_state("notification_status", self._notification_service().notifications.status())
+            self._refresh_settings_diagnostics()
+        except ValueError as exc:
+            self.db.set_background_monitor_state("monitor_settings_last_error", str(exc))
+            QMessageBox.warning(self, "Invalid Monitor Settings", str(exc))
+        except Exception as exc:
+            self.db.set_background_monitor_state("monitor_settings_last_error", str(exc))
+            QMessageBox.warning(self, "Monitor Settings Failed", str(exc))
+
+    def _set_monitor_settings_controls(self, settings: MonitorSettings) -> None:
+        self._loading_monitor_settings = True
+        try:
+            self.notify_all_checkbox.setChecked(settings.alerting.notify_all_events)
+            self.notify_important_checkbox.setChecked(settings.alerting.notify_important_events)
+            severity_index = self.notify_min_severity_combo.findData(settings.alerting.notify_min_severity)
+            if severity_index >= 0:
+                self.notify_min_severity_combo.setCurrentIndex(severity_index)
+            self.popup_only_severe_checkbox.setChecked(settings.alerting.popup_only_severe_events)
+            self.browser_capture_popup_checkbox.setChecked(settings.alerting.browser_capture_process_popup)
+            self.show_visible_alerts_checkbox.setChecked(settings.notification.bottom_right_alerts)
+            self.dialog_alerts_checkbox.setChecked(settings.notification.notification_mode in {"dialog", "both"})
+            self.notification_center_checkbox.setChecked(settings.notification.notification_mode in {"notification", "both"})
+            self.persistent_alerts_checkbox.setChecked(settings.notification.persistent_alerts)
+            self.enable_alert_sounds_checkbox.setChecked(settings.notification.enable_alert_sounds)
+            self.authorized_use_warning_checkbox.setChecked(settings.notification.authorized_use_warning)
+            self.critical_overlay_checkbox.setChecked(settings.notification.critical_overlay)
+            self.cfaa_idle_warning_checkbox.setChecked(settings.notification.authorized_use_warning)
+            self.idle_warning_minutes_input.setText(str(settings.performance.idle_warning_minutes))
+            self.cooldown_seconds_input.setText(str(settings.notification.cooldown_seconds))
+            self.rate_limit_input.setText(str(settings.notification.duplicate_rate_limit_seconds))
+            self.notification_sound_input.setText(str(settings.notification.notification_sound))
+            mode_index = self.notification_mode_combo.findData(settings.notification.notification_mode)
+            if mode_index >= 0:
+                self.notification_mode_combo.setCurrentIndex(mode_index)
+            for key, checkbox in self.category_checkboxes.items():
+                checkbox.setChecked(bool(getattr(settings.event_categories, key)))
+        finally:
+            self._loading_monitor_settings = False
+
+    def _runtime_settings_values(self) -> dict[str, object]:
+        settings = self._notification_service().notifications.settings()
+        return {
+            "notify_min_severity": settings.get("notify_min_severity", ""),
+            "notification_mode": settings.get("notification_mode", ""),
+            "cooldown_seconds_per_category": settings.get("cooldown_seconds_per_category", ""),
+            "duplicate_rate_limit_seconds": settings.get("duplicate_rate_limit_seconds", ""),
+            "show_visible_alerts": settings.get("show_visible_alerts", ""),
+            "persistent_alerts": settings.get("persistent_alerts", ""),
+            "enable_alert_sounds": settings.get("enable_alert_sounds", ""),
+            "critical_overlay_enabled": settings.get("critical_overlay_enabled", ""),
+            "show_physical_session_alerts": settings.get("show_physical_session_alerts", ""),
+            "show_usb_bluetooth_alerts": settings.get("show_usb_bluetooth_alerts", ""),
+            "show_network_change_alerts": settings.get("show_network_change_alerts", ""),
+            "show_admin_persistence_alerts": settings.get("show_admin_persistence_alerts", ""),
+            "show_apple_forecast_alerts": settings.get("show_apple_forecast_alerts", ""),
+        }
+
+    def _refresh_settings_diagnostics(self) -> None:
+        if not hasattr(self, "settings_diagnostics_panel"):
+            return
+        diagnostics = settings_diagnostics(
+            self.db,
+            self.monitor_settings,
+            runtime_values=self._runtime_settings_values(),
+            installed_values=installed_monitor_values(self.db, launch_agent=self.launch_agent, system_launch_agent=self.system_launch_agent),
+        )
+        if diagnostics.get("mismatches"):
+            diagnostics["repair"] = "Runtime differs from installed monitor. Use Repair Background Monitor or reinstall the selected monitor mode."
+        if hasattr(self, "repair_settings_mismatch_button"):
+            self.repair_settings_mismatch_button.setEnabled(bool(diagnostics.get("mismatches")))
+        self.settings_diagnostics_panel.setPlainText(json.dumps(diagnostics, indent=2, sort_keys=True, default=str))
+
+    def repair_settings_mismatch(self) -> None:
+        self.monitor_settings = save_settings(self.db, load_settings(self.db))
+        if self.monitor_settings.installation.monitor_mode in {"system", "protected"}:
+            QMessageBox.information(
+                self,
+                "Repair Settings Mismatch",
+                "Runtime settings were reapplied. System LaunchDaemon installation settings require reinstall or repair with administrator approval.",
+            )
+        else:
+            QMessageBox.information(self, "Repair Settings Mismatch", "Runtime settings were reapplied.")
+        self._refresh_settings_diagnostics()
 
     def developer_only_buttons(self) -> list[QWidget]:
         return [
@@ -658,6 +899,23 @@ class BackgroundMonitorPanel(QWidget):
             self.lockdown_assist_test_button,
             self.lockdown_attempt_test_button,
         ]
+
+    def closeEvent(self, event) -> None:
+        if hasattr(self, "refresh_timer"):
+            self.refresh_timer.stop()
+        if self._active_db_cache is not None:
+            self._active_db_cache.close()
+            self._active_db_cache = None
+            self._active_db_cache_path = ""
+        if self._notification_service_cache is not None and self._notification_service_cache.db is not self.db:
+            self._notification_service_cache.db.close()
+            self._notification_service_cache = None
+            self._notification_service_db_path = ""
+        if self._event_service_cache is not None and self._event_service_cache.db is not self.db:
+            self._event_service_cache.db.close()
+            self._event_service_cache = None
+            self._event_service_db_path = ""
+        super().closeEvent(event)
 
     def set_developer_mode(self, enabled: bool) -> None:
         self.developer_mode_enabled = enabled
@@ -1342,6 +1600,22 @@ class BackgroundMonitorPanel(QWidget):
             stale_text = "\nMonitor not healthy. Restart Monitor is recommended."
         if system_mode and not system_status.installed:
             stale_text = "\nSystem Monitor Mode requires /Library/LaunchDaemons/com.mac-audit-agent.monitor.plist. Install System Monitor with administrator approval."
+        alert_health = (
+            notification_manager.alert_system_health()
+            if hasattr(notification_manager, "alert_system_health")
+            else {
+                "authoritative_delivery": "AlertOverlayManager",
+                "alert_overlay_manager_status": monitor_db.get_background_monitor_state("security_overlay_status", "inactive"),
+                "overlay_manager_alive": monitor_db.get_background_monitor_state("overlay_manager_alive", "0") == "1",
+                "queue_length": monitor_db.get_background_monitor_state("alert_queue_length", "0"),
+                "suppressed_alerts_count": monitor_db.get_background_monitor_state("alert_suppressed_total", "0"),
+                "grouped_alerts_count": monitor_db.get_background_monitor_state("alert_grouped_total", "0"),
+                "last_failed_render_reason": monitor_db.get_background_monitor_state("last_overlay_error", ""),
+                "last_failure_stage": monitor_db.get_background_monitor_state("last_alert_failure_stage", ""),
+                "rendering_success_rate": "unknown",
+                "active_cooldown_entries": "unknown",
+            }
+        )
         self.status_label.setText(
             f"Status: {status_text} | Installed: {'yes' if installed else 'no'} | Loaded: {'yes' if loaded else 'no'}\n"
             f"System LaunchDaemon plist: {system_status.plist_path} ({'installed' if system_status.installed else 'missing'})\n"
@@ -1390,6 +1664,15 @@ class BackgroundMonitorPanel(QWidget):
                     f"Last notification error: {monitor_db.get_background_monitor_state('last_notification_error', 'none')}",
                     f"CFAA acknowledgment: {monitor_db.get_background_monitor_state('cfaa_acknowledgment_status', 'not started')}",
                     f"Security overlay: {monitor_db.get_background_monitor_state('security_overlay_status', 'inactive')}",
+                    f"Alert system authority: {alert_health.get('authoritative_delivery', 'AlertOverlayManager')}",
+                    f"AlertOverlayManager status: {alert_health.get('alert_overlay_manager_status', 'inactive')}",
+                    f"AlertQueueManager status: {monitor_db.get_background_monitor_state('alert_queue_manager_status', 'inactive')}",
+                    f"Alert suppressed total: {alert_health.get('suppressed_alerts_count', 0)}",
+                    f"Alert grouped total: {alert_health.get('grouped_alerts_count', 0)}",
+                    f"Alert last failure stage: {alert_health.get('last_failure_stage', '') or 'none'}",
+                    f"Alert last failed render reason: {alert_health.get('last_failed_render_reason', '') or 'none'}",
+                    f"Alert rendering success rate: {alert_health.get('rendering_success_rate', 1.0)}",
+                    f"Active cooldown entries: {alert_health.get('active_cooldown_entries', 0)}",
                     f"Alert overlay enabled: {monitor_db.get_background_monitor_state('show_visible_alerts', '1')}",
                     f"Notifier running: {monitor_db.get_background_monitor_state('notification_status', notification_manager.status())}",
                     f"Notifier health: running={monitor_db.get_background_monitor_state('notifier_running', '0')} pid={monitor_db.get_background_monitor_state('notifier_pid', 'none')} last poll={monitor_db.get_background_monitor_state('notifier_last_poll', 'never')}",
@@ -1436,35 +1719,15 @@ class BackgroundMonitorPanel(QWidget):
                 ]
             )
         )
-        settings = notification_manager.settings()
+        self.monitor_settings = load_settings(self.db)
         self.continuous_monitoring_checkbox.blockSignals(True)
         self.start_at_login_checkbox.blockSignals(True)
         self.continuous_monitoring_checkbox.setChecked(bool(loaded or running or heartbeat_fresh))
         self.start_at_login_checkbox.setChecked(bool(installed))
         self.continuous_monitoring_checkbox.blockSignals(False)
         self.start_at_login_checkbox.blockSignals(False)
-        self.notify_all_checkbox.setChecked(bool(settings["notify_all_events"]))
-        self.notify_important_checkbox.setChecked(bool(settings["notify_important_events"]))
-        self.popup_only_severe_checkbox.setChecked(bool(settings.get("popup_only_severe_events", True)))
-        self.browser_capture_popup_checkbox.setChecked(bool(settings.get("browser_capture_process_popup", False)))
-        self.show_visible_alerts_checkbox.setChecked(bool(settings.get("show_visible_alerts", True)))
-        self.show_physical_session_alerts_checkbox.setChecked(bool(settings.get("show_physical_session_alerts", True)))
-        self.show_usb_bluetooth_alerts_checkbox.setChecked(bool(settings.get("show_usb_bluetooth_alerts", True)))
-        self.show_network_change_alerts_checkbox.setChecked(bool(settings.get("show_network_change_alerts", True)))
-        self.show_admin_persistence_alerts_checkbox.setChecked(bool(settings.get("show_admin_persistence_alerts", True)))
-        self.show_apple_forecast_alerts_checkbox.setChecked(bool(settings.get("show_apple_forecast_alerts", True)))
-        self.idle_warning_minutes_input.setText(str(settings.get("idle_activity_warning_minutes", 2)))
-        self.cfaa_idle_warning_checkbox.setChecked(bool(settings.get("cfaa_idle_warning_enabled", True)))
-        self.cooldown_seconds_input.setText(str(settings.get("cooldown_seconds_per_category", 600)))
-        current_severity = str(settings["notify_min_severity"])
-        index = self.notify_min_severity_combo.findData(current_severity)
-        if index >= 0:
-            self.notify_min_severity_combo.setCurrentIndex(index)
-        mode_index = self.notification_mode_combo.findData(str(settings.get("notification_mode", "notification")))
-        if mode_index >= 0:
-            self.notification_mode_combo.setCurrentIndex(mode_index)
-        self.rate_limit_input.setText(str(settings["duplicate_rate_limit_seconds"]))
-        self.notification_sound_input.setText(str(settings["notification_sound"]))
+        self._set_monitor_settings_controls(self.monitor_settings)
+        self._refresh_settings_diagnostics()
         installed_state = ActionState(
             bool(installed),
             True,
@@ -2171,30 +2434,7 @@ class BackgroundMonitorPanel(QWidget):
         self.refresh()
 
     def save_notification_settings(self) -> None:
-        try:
-            self._notification_service().notifications.update_settings(
-                notify_all_events=self.notify_all_checkbox.isChecked(),
-                notify_important_events=self.notify_important_checkbox.isChecked(),
-                notify_min_severity=str(self.notify_min_severity_combo.currentData() or "info"),
-                notification_sound=self.notification_sound_input.text().strip() or "Glass",
-                duplicate_rate_limit_seconds=int(self.rate_limit_input.text().strip() or "10"),
-                high_priority_alert_style=str(self.notification_mode_combo.currentData() or "dialog"),
-                notification_mode=str(self.notification_mode_combo.currentData() or "dialog"),
-                popup_only_severe_events=self.popup_only_severe_checkbox.isChecked(),
-                browser_capture_process_popup=self.browser_capture_popup_checkbox.isChecked(),
-                show_visible_alerts=self.show_visible_alerts_checkbox.isChecked(),
-                show_physical_session_alerts=self.show_physical_session_alerts_checkbox.isChecked(),
-                show_usb_bluetooth_alerts=self.show_usb_bluetooth_alerts_checkbox.isChecked(),
-                show_network_change_alerts=self.show_network_change_alerts_checkbox.isChecked(),
-                show_admin_persistence_alerts=self.show_admin_persistence_alerts_checkbox.isChecked(),
-                show_apple_forecast_alerts=self.show_apple_forecast_alerts_checkbox.isChecked(),
-                idle_activity_warning_minutes=int(self.idle_warning_minutes_input.text().strip() or "2"),
-                cfaa_idle_warning_enabled=self.cfaa_idle_warning_checkbox.isChecked(),
-                cooldown_seconds_per_category=int(self.cooldown_seconds_input.text().strip() or "600"),
-            )
-            self._active_monitor_db().set_background_monitor_state("notification_status", self._notification_service().notifications.status())
-        except ValueError as exc:
-            QMessageBox.warning(self, "Invalid Notification Settings", str(exc))
+        self.apply_monitor_settings_from_ui()
         self.refresh()
 
     def _suppressed_popup_count(self) -> int:

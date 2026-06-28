@@ -1124,8 +1124,8 @@ def test_notification_manager_notifies_allowlisted_critical_events_by_default_an
     assert sent is True
     assert error == ""
     assert event.notification_returncode == 0
-    assert calls
-    assert calls[0][0] == "/usr/bin/osascript"
+    assert calls == []
+    assert event.visible_alert_shown is True
     repeat = BackgroundMonitorEvent(**{**event.to_dict(), "event_id": "notify-2", "timestamp": "2026-04-24T12:00:05+00:00"})
     assert manager.should_notify(repeat) is False
 
@@ -1158,7 +1158,7 @@ def test_cfaa_acknowledgment_runs_once_per_gui_session_and_records_acceptance(tm
     assert len(popen_calls) == 1
 
 
-def test_high_priority_event_uses_configured_alert_style(tmp_path: Path) -> None:
+def test_high_priority_event_uses_bottom_right_alert_style(tmp_path: Path) -> None:
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
     calls = []
     manager = NotificationManager(db, runner=lambda *args, **kwargs: calls.append(args[0]) or FakeCompletedProcess(returncode=0))
@@ -1177,7 +1177,9 @@ def test_high_priority_event_uses_configured_alert_style(tmp_path: Path) -> None
     sent, error = manager.notify(event)
     assert sent is True
     assert error == ""
-    assert "display dialog" in calls[0][2]
+    assert calls == []
+    assert event.visible_alert_shown is True
+    assert event.alert_style == "high_orange"
 
 
 def test_user_can_change_event_severity(tmp_path: Path) -> None:
@@ -1233,7 +1235,7 @@ def test_input_activity_resumed_after_idle_notifies_by_default(tmp_path: Path) -
     assert manager.should_notify(event) is True
 
 
-def test_input_activity_resumed_after_idle_uses_cfaa_dialog(tmp_path: Path) -> None:
+def test_input_activity_resumed_after_idle_uses_bottom_right_notice(tmp_path: Path) -> None:
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
     calls = []
     manager = NotificationManager(db, runner=lambda *args, **kwargs: calls.append(args[0]) or FakeCompletedProcess(returncode=0))
@@ -1251,8 +1253,8 @@ def test_input_activity_resumed_after_idle_uses_cfaa_dialog(tmp_path: Path) -> N
     sent, error = manager.notify(event)
     assert sent is True
     assert error == ""
-    assert any("display dialog" in command[2] for command in calls)
-    assert any("Authorized use reminder" in command[2] for command in calls)
+    assert calls == []
+    assert event.visible_alert_shown is True
 
 
 @pytest.mark.parametrize(
@@ -1262,7 +1264,7 @@ def test_input_activity_resumed_after_idle_uses_cfaa_dialog(tmp_path: Path) -> N
         "mouse_or_keyboard_activity_after_idle",
     ],
 )
-def test_idle_resume_variants_use_cfaa_dialog(tmp_path: Path, event_type: str) -> None:
+def test_idle_resume_variants_use_bottom_right_notice(tmp_path: Path, event_type: str) -> None:
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
     calls = []
     manager = NotificationManager(db, runner=lambda *args, **kwargs: calls.append(args[0]) or FakeCompletedProcess(returncode=0))
@@ -1280,8 +1282,8 @@ def test_idle_resume_variants_use_cfaa_dialog(tmp_path: Path, event_type: str) -
     sent, error = manager.notify(event)
     assert sent is True
     assert error == ""
-    assert any("display dialog" in command[2] for command in calls)
-    assert any("Authorized use reminder" in command[2] for command in calls)
+    assert calls == []
+    assert event.visible_alert_shown is True
 
 
 def test_visibility_sensitive_physical_and_device_events_notify_by_default(tmp_path: Path) -> None:
@@ -1362,7 +1364,7 @@ def test_visible_alert_decision_and_overlay_payload_restore_bottom_right_styles(
     pid_path = tmp_path / "state" / "security_overlay.pid"
     monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", state_path)
     monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_PID_PATH", pid_path)
-    monkeypatch.setattr(manager, "_ensure_security_overlay_process", lambda: None)
+    monkeypatch.setattr(manager, "_ensure_security_overlay_process", lambda: True)
 
     cases = [
         ("launchdaemon_added", "critical_red"),
@@ -1626,7 +1628,7 @@ def test_unsupported_lockdown_auto_activation_shows_user_action_alert(tmp_path: 
     assert any("Lockdown Mode Requires User Action" in item[1] for item in shown)
 
 
-def test_visible_overlay_plays_configured_sound_for_high_critical(tmp_path: Path, monkeypatch) -> None:
+def test_visible_overlay_is_quiet_by_default_for_high_critical(tmp_path: Path, monkeypatch) -> None:
     calls: list[list[str]] = []
 
     def fake_popen(command, **_kwargs):
@@ -1656,6 +1658,41 @@ def test_visible_overlay_plays_configured_sound_for_high_critical(tmp_path: Path
     )
 
     assert manager.update_security_overlay(event) is True
+    assert calls == []
+    assert db.get_background_monitor_state("last_visible_alert_sound") == ""
+
+
+def test_visible_overlay_plays_configured_sound_when_enabled(tmp_path: Path, monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_popen(command, **_kwargs):
+        calls.append(command)
+
+        class _Process:
+            pid = 123
+
+        return _Process()
+
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    db.set_background_monitor_state("notification_sound", "Submarine")
+    db.set_background_monitor_state("enable_alert_sounds", "1")
+    manager = NotificationManager(db, popen_factory=fake_popen)
+    state_path = tmp_path / "state" / "security_overlay.json"
+    pid_path = tmp_path / "state" / "security_overlay.pid"
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", state_path)
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_PID_PATH", pid_path)
+    monkeypatch.setattr(manager, "_ensure_security_overlay_process", lambda: True)
+    event = BackgroundMonitorEvent(
+        event_id="critical-sound-enabled",
+        timestamp="2026-04-24T12:00:00+00:00",
+        event_type="major_security_event",
+        severity="critical",
+        source="test",
+        evidence="Critical compromise indicator detected.",
+        confidence="high",
+    )
+
+    assert manager.update_security_overlay(event) is True
     assert calls
     assert db.get_background_monitor_state("last_visible_alert_sound") == "Submarine"
 
@@ -1667,7 +1704,7 @@ def test_visible_alert_cooldown_suppresses_repeat_overlay(tmp_path: Path, monkey
     pid_path = tmp_path / "state" / "security_overlay.pid"
     monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", state_path)
     monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_PID_PATH", pid_path)
-    monkeypatch.setattr(manager, "_ensure_security_overlay_process", lambda: None)
+    monkeypatch.setattr(manager, "_ensure_security_overlay_process", lambda: True)
     event = BackgroundMonitorEvent(
         event_id="usb-1",
         timestamp="2026-04-24T12:00:00+00:00",
@@ -1686,7 +1723,7 @@ def test_visible_alert_cooldown_suppresses_repeat_overlay(tmp_path: Path, monkey
     assert manager.update_security_overlay(event) is True
     db.set_background_monitor_state(manager._visible_alert_last_key(event), "2026-04-24T12:00:00+00:00")
     repeat = BackgroundMonitorEvent(
-        **{**event.to_dict(), "event_id": "usb-2", "timestamp": "2026-04-24T12:05:00+00:00"}
+            **{**event.to_dict(), "event_id": "usb-2", "timestamp": "2026-04-24T12:00:30+00:00"}
     )
     decision = manager.should_show_visible_alert(repeat)
     assert decision.show is False
@@ -2187,6 +2224,7 @@ def test_service_alerts_critical_once_for_first_seen_usb_identity(tmp_path: Path
 
 def test_usb_and_moisture_events_use_distinct_sounds(tmp_path: Path) -> None:
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    db.set_background_monitor_state("enable_alert_sounds", "1")
     manager = NotificationManager(db)
     usb = BackgroundMonitorEvent(
         event_id="usb-sound",
@@ -2210,6 +2248,7 @@ def test_usb_and_moisture_events_use_distinct_sounds(tmp_path: Path) -> None:
 
 def test_new_usb_device_uses_critical_alert_and_usb_sound(tmp_path: Path) -> None:
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    db.set_background_monitor_state("enable_alert_sounds", "1")
     manager = NotificationManager(db)
     event = BackgroundMonitorEvent(
         event_id="new-usb",
@@ -2402,7 +2441,7 @@ def test_new_network_connection_event_is_visible_by_default(tmp_path: Path) -> N
     assert decision.style == "high_orange"
 
 
-def test_network_info_alert_uses_overlay_and_bypasses_min_severity(tmp_path: Path, monkeypatch) -> None:
+def test_network_info_alert_respects_min_severity(tmp_path: Path, monkeypatch) -> None:
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
     state_path = tmp_path / "state" / "security_overlay.json"
     pid_path = tmp_path / "state" / "security_overlay.pid"
@@ -2440,13 +2479,11 @@ def test_network_info_alert_uses_overlay_and_bypasses_min_severity(tmp_path: Pat
         rule_name="network_ip_assigned",
         trigger_rule_name="network_ip_assigned",
     )
-    assert manager.should_notify(event) is True
-    sent, error = manager.notify(event)
-    assert sent is True
-    assert error == ""
-    assert manager._sound_for(event, manager.settings()) == ""
-    assert json.loads(state_path.read_text(encoding="utf-8"))["severity"] == "info"
-    assert len(popen_calls) >= 1
+    assert manager.should_notify(event) is False
+    assert event.notification_reason == "below_min_severity"
+    assert event.visible_alert_shown is False
+    assert not state_path.exists()
+    assert popen_calls == []
 
 
 def test_persistence_monitor_detects_new_launchdaemon_and_login_items(monkeypatch) -> None:
@@ -2716,12 +2753,13 @@ def test_security_overlay_groups_critical_events_and_launches_one_process(tmp_pa
     assert len(popen_calls) >= 1
 
 
-def test_security_overlay_ignores_low_severity_events(tmp_path: Path, monkeypatch) -> None:
+def test_security_overlay_renders_low_severity_as_subtle_bottom_right_alert(tmp_path: Path, monkeypatch) -> None:
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
     state_path = tmp_path / "state" / "security_overlay.json"
     monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", state_path)
     db.set_background_monitor_state("security_overlay_enabled", "1")
     manager = NotificationManager(db)
+    monkeypatch.setattr(manager, "_ensure_security_overlay_process", lambda: True)
     event = BackgroundMonitorEvent(
         event_id="overlay-low",
         timestamp="2026-05-31T12:00:00+00:00",
@@ -2731,7 +2769,10 @@ def test_security_overlay_ignores_low_severity_events(tmp_path: Path, monkeypatc
         evidence="USB recognized.",
     )
     assert manager.update_security_overlay(event) is True
-    assert json.loads(state_path.read_text(encoding="utf-8"))["severity"] == "low"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    assert payload["severity"] == "low"
+    assert payload["style"] == "neutral_grey"
+    assert payload["persistent"] is False
 
 
 def test_new_activity_overlay_is_visible_without_optional_overlay_setting(tmp_path: Path, monkeypatch) -> None:
@@ -2739,7 +2780,7 @@ def test_new_activity_overlay_is_visible_without_optional_overlay_setting(tmp_pa
     state_path = tmp_path / "state" / "security_overlay.json"
     monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", state_path)
     manager = NotificationManager(db)
-    monkeypatch.setattr(manager, "_ensure_security_overlay_process", lambda: None)
+    monkeypatch.setattr(manager, "_ensure_security_overlay_process", lambda: True)
     event = BackgroundMonitorEvent(
         event_id="bluetooth-connected-overlay",
         timestamp="2026-06-02T12:00:00+00:00",
@@ -2916,6 +2957,7 @@ def test_send_alert_dialog_timeout_is_converted_to_failure() -> None:
 
 def test_high_event_uses_dialog_fallback_after_notification_failure(tmp_path: Path, monkeypatch) -> None:
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    db.set_background_monitor_state("os_notification_fallback_enabled", "1")
     fallback_path = tmp_path / "monitor.log"
     monkeypatch.setattr("mac_audit_agent.notification_manager.FALLBACK_MONITOR_LOG", fallback_path)
     calls = []
@@ -2927,6 +2969,7 @@ def test_high_event_uses_dialog_fallback_after_notification_failure(tmp_path: Pa
         return FakeCompletedProcess(returncode=0, stdout="dialog ok")
 
     manager = NotificationManager(db, runner=runner)
+    monkeypatch.setattr(manager, "_ensure_security_overlay_process", lambda: False)
     preferences = manager.event_preferences()
     preferences["camera_activity_confirmed"]["notification_mode"] = "notification"
     manager.update_event_preferences(preferences)
@@ -2950,7 +2993,75 @@ def test_high_event_uses_dialog_fallback_after_notification_failure(tmp_path: Pa
     assert "notification attempt" in fallback_path.read_text(encoding="utf-8")
 
 
-def test_visible_alert_candidate_forces_overlay_even_when_notification_gate_is_false(tmp_path: Path, monkeypatch) -> None:
+def test_normal_alert_delivery_uses_overlay_without_osascript_duplicates(tmp_path: Path, monkeypatch) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    calls = []
+
+    def runner(command, **kwargs):
+        calls.append(command)
+        return FakeCompletedProcess(returncode=0)
+
+    manager = NotificationManager(db, runner=runner)
+    state_path = tmp_path / "state" / "security_overlay.json"
+    pid_path = tmp_path / "state" / "security_overlay.pid"
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", state_path)
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_PID_PATH", pid_path)
+    monkeypatch.setattr(manager, "_ensure_security_overlay_process", lambda: True)
+    event = BackgroundMonitorEvent(
+        event_id="overlay-only-1",
+        timestamp="2026-04-24T12:00:00+00:00",
+        event_type="launchdaemon_added",
+        severity="critical",
+        source="test",
+        evidence="LaunchDaemon added.",
+        confidence="high",
+        recommendation="review",
+        metadata_json="{}",
+        rule_id="launchdaemon_added",
+        trigger_rule_id="launchdaemon_added",
+    )
+
+    sent, error = manager.notify(event)
+
+    assert sent is True
+    assert error == ""
+    assert calls == []
+    assert event.visible_alert_shown is True
+    assert db.get_background_monitor_state("alert_delivery_authority") == "AlertOverlayManager"
+
+
+def test_alert_queue_groups_repeat_events_without_second_render(tmp_path: Path, monkeypatch) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    manager = NotificationManager(db)
+    state_path = tmp_path / "state" / "security_overlay.json"
+    pid_path = tmp_path / "state" / "security_overlay.pid"
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", state_path)
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_PID_PATH", pid_path)
+    monkeypatch.setattr(manager, "_ensure_security_overlay_process", lambda: True)
+    first = BackgroundMonitorEvent(
+        event_id="group-1",
+        timestamp="2026-04-24T12:00:00+00:00",
+        event_type="usb_device_connected",
+        severity="info",
+        source="hardware",
+        evidence="USB device connected.",
+        confidence="high",
+        recommendation="review",
+        metadata_json='{"device_id": "usb-serial-1"}',
+        rule_id="usb_device_connected",
+        trigger_rule_id="usb_device_connected",
+    )
+    repeat = BackgroundMonitorEvent(**{**first.to_dict(), "event_id": "group-2", "timestamp": "2026-04-24T12:00:30+00:00"})
+
+    assert manager.update_security_overlay(first) is True
+    assert manager.update_security_overlay(repeat) is False
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    assert payload["suppressed_count"] == 1
+    assert payload["grouped_message"] == "1 similar events suppressed"
+    assert db.get_background_monitor_state("alert_grouped_total") == "1"
+
+
+def test_visible_alert_candidate_respects_min_severity_gate(tmp_path: Path, monkeypatch) -> None:
     service = BackgroundMonitorService(tmp_path / "audit.sqlite", poll_interval_seconds=5)
     service.notifications.update_settings(
         notify_all_events=False,
@@ -2994,11 +3105,11 @@ def test_visible_alert_candidate_forces_overlay_even_when_notification_gate_is_f
 
     monkeypatch.setattr(service, "_notify_event", fake_notify)
     assert service.record_monitor_event(event) == event.event_id
-    assert calls == [False]
+    assert calls == []
     trace = service.db.get_event_alert_trace(event.event_id)
     assert trace is not None
     assert trace.alert_required is False
-    assert trace.notification_policy_result == "sent"
+    assert trace.notification_policy_result == "log_only"
 
 
 def test_process_pending_notifications_survives_notification_timeout(tmp_path: Path, monkeypatch) -> None:
@@ -3137,12 +3248,14 @@ def test_user_preference_can_promote_usb_event_to_popup(tmp_path: Path) -> None:
     sent, error = manager.notify(event)
     assert sent is True
     assert error == ""
-    assert any("display dialog" in command[2] for command in calls)
+    assert calls == []
+    assert event.visible_alert_shown is True
 
 
 def test_notification_failure_does_not_crash_and_logs_error(tmp_path: Path, monkeypatch) -> None:
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
     db.set_background_monitor_state("show_visible_alerts", "0")
+    db.set_background_monitor_state("os_notification_fallback_enabled", "1")
     fallback_path = tmp_path / "monitor.log"
     monkeypatch.setattr("mac_audit_agent.notification_manager.FALLBACK_MONITOR_LOG", fallback_path)
     manager = NotificationManager(db, runner=lambda *args, **kwargs: FakeCompletedProcess(returncode=1, stderr="denied"))
@@ -5239,7 +5352,7 @@ def test_monitor_self_impact_warning_forces_bottom_right_overlay(tmp_path: Path,
     db = AuditDatabase(tmp_path / "audit.sqlite")
     manager = NotificationManager(db)
     monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", state_path)
-    monkeypatch.setattr(manager, "_ensure_security_overlay_process", lambda: None)
+    monkeypatch.setattr(manager, "_ensure_security_overlay_process", lambda: True)
     event = BackgroundMonitorEvent(
         event_id="self-impact-overlay",
         timestamp="2026-06-02T12:00:00+00:00",

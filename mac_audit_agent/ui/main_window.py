@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -48,9 +49,21 @@ from PySide6.QtWidgets import (
 )
 
 from mac_audit_agent.assets import get_asset_path
+from mac_audit_agent.baseline_drift import BaselineDriftEngine
+from mac_audit_agent.cases import CaseManager
 from mac_audit_agent.collectors import CollectorSuite
 from mac_audit_agent.command_registry import build_command_registry
 from mac_audit_agent.config import AuditConfig
+from mac_audit_agent.frameworks import rule_coverage_summary
+from mac_audit_agent.fleet_baseline import (
+    FLEET_BASELINE_FILENAME,
+    build_fleet_baseline,
+    compare_to_fleet_baseline,
+    export_fleet_baseline,
+    export_fleet_drift_report,
+    import_fleet_baseline,
+)
+from mac_audit_agent.ioc_engine import OfflineIOCEngine, export_matches_json, load_ioc_file
 from mac_audit_agent.launch_agent import LaunchAgentManager, default_monitor_db_path
 from mac_audit_agent.models import AuditCommand, RawLogEntry, ScanResult, ScanSummary, utc_now_iso
 from mac_audit_agent.models import Finding, InvestigationNote, NetworkDiscoveryResult, NetworkHostSnapshot
@@ -61,6 +74,14 @@ from mac_audit_agent.network_discovery import (
     detect_network_scope,
     list_local_interfaces as list_network_interfaces,
     sanitize_interface_name as sanitize_network_interface_name,
+)
+from mac_audit_agent.nmap_wrapper import (
+    DEFAULT_SCAN_PROFILE,
+    NMAP_CREDIT_TEXT,
+    NMAP_INSTALL_MESSAGE,
+    SCAN_PROFILES as NMAP_SCAN_PROFILES,
+    find_nmap_binary,
+    run_nmap_scan,
 )
 from mac_audit_agent.packet_capture import (
     MAX_CAPTURE_DURATION_SECONDS,
@@ -84,9 +105,11 @@ from mac_audit_agent.reporting import (
 )
 from mac_audit_agent.investigation_priority import InvestigationPriorityEngine
 from mac_audit_agent.runner import RunnerConfig, SafeCommandRunner
+from mac_audit_agent.rules import RULES
 from mac_audit_agent.storage import AuditDatabase, json_safe
 from mac_audit_agent.cve_radar import CveRadarEngine
 from mac_audit_agent.execution_evidence import ExecutionEvidenceEngine
+from mac_audit_agent.evidence_graph import EvidenceGraphBuilder, export_graph_json
 from mac_audit_agent.family_safety import FamilySafetyAuditor, export_family_safety_html, export_family_safety_json
 from mac_audit_agent.intrusion_correlation import IntrusionCorrelationEngine
 from mac_audit_agent.operational_health import OperationalHealthEngine
@@ -99,6 +122,7 @@ from mac_audit_agent.reliability import (
     TrustDecayEngine,
     export_sarif,
 )
+from mac_audit_agent.security_timeline import SecurityTimelineBuilder, context_window, export_timeline_json, filter_timeline_events
 from mac_audit_agent.ui.action_state import ActionState, apply_action_state
 from mac_audit_agent.ui.family_safety_panel import FamilySafetyPanel
 from mac_audit_agent.ui.investigation_priority_panel import InvestigationPriorityPanel
@@ -117,6 +141,7 @@ from mac_audit_agent.system_monitor_readiness import SystemMonitorReadiness
 from mac_audit_agent.workflow_layer import InvestigatorWorkflowLayer
 from mac_audit_agent.ui.background_monitor_panel import BackgroundMonitorPanel
 from mac_audit_agent.vulnerability_review import AggressiveLocalVulnerabilityReviewer
+from mac_audit_agent.visibility_integrity import VisibilityIntegrityEngine
 from mac_audit_agent.themes import DEFAULT_THEME_NAME, theme_for_name, theme_stylesheet
 
 
@@ -987,6 +1012,18 @@ class MainWindow(QMainWindow):
             system_readiness=SystemMonitorReadiness(default_monitor_db_path("system")),
             cve_radar_engine=self.cve_radar_engine,
         )
+        self.visibility_integrity_engine = VisibilityIntegrityEngine(self.db)
+        self.baseline_drift_engine = BaselineDriftEngine(self.db)
+        self.security_timeline_builder = SecurityTimelineBuilder(self.db)
+        self.security_timeline_events: list[dict] = []
+        self.evidence_graph_builder = EvidenceGraphBuilder()
+        self.current_evidence_graph: dict = {}
+        self.case_manager = CaseManager(self.db)
+        self.ioc_engine = OfflineIOCEngine()
+        self.current_ioc_indicators: list[dict] = []
+        self.current_ioc_report: dict = {}
+        self.current_fleet_baseline: dict = {}
+        self.current_fleet_comparison: dict = {}
         self.alert_pipeline_inspector = AlertPipelineInspector(self.db)
         self.monitoring_coverage_engine = MonitoringCoverageEngine(self.db)
         self.release_readiness_engine = ReleaseReadinessEngine(self.db)
@@ -1017,6 +1054,7 @@ class MainWindow(QMainWindow):
         self._refresh_dashboard()
         self.refresh_operational_health()
         self.refresh_reliability()
+        self.refresh_visibility_integrity()
         self.apply_theme_choice(
             self.db.get_background_monitor_state("selected_theme", DEFAULT_THEME_NAME),
             self.db.get_background_monitor_state("accessibility_high_contrast", "0") == "1",
@@ -1054,6 +1092,8 @@ class MainWindow(QMainWindow):
             "Logs",
             "Reliability",
             "System Recovery",
+            "Visibility Integrity",
+            "Framework Coverage",
             "Settings",
             "Skins",
             "Scan Categories",
@@ -1125,6 +1165,8 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_logs_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_reliability_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_system_recovery_page(), resizable=True))
+        self.pages.addWidget(self._wrap_in_scroll_area(self._build_visibility_integrity_page(), resizable=True))
+        self.pages.addWidget(self._wrap_in_scroll_area(self._build_framework_coverage_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_settings_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_skins_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_categories_page(), resizable=True))
@@ -1262,6 +1304,9 @@ class MainWindow(QMainWindow):
         full_localhost_scan_action = QAction("Full Localhost Port Scan", self)
         full_localhost_scan_action.triggered.connect(self.run_full_localhost_port_scan)
         diagnostics_menu.addAction(full_localhost_scan_action)
+        nmap_local_scan_action = QAction("Nmap Local Scan", self)
+        nmap_local_scan_action.triggered.connect(self.run_nmap_local_scan)
+        diagnostics_menu.addAction(nmap_local_scan_action)
         advanced_evidence_menu = self.menuBar().addMenu("Advanced Evidence")
         packet_capture_action = QAction("Packet Capture Snapshot", self)
         packet_capture_action.triggered.connect(self.run_packet_capture_snapshot)
@@ -1771,7 +1816,231 @@ class MainWindow(QMainWindow):
         self.logs_table = self._make_table(["Collector", "Source", "Timestamp", "Exit", "stderr", "stdout"])
         self.localhost_scan_table = self._make_table(["Field", "Value"])
         self.localhost_full_scan_table = self._make_table(["Field", "Value"])
+        self.nmap_local_scan_page = QWidget()
+        nmap_layout = QVBoxLayout(self.nmap_local_scan_page)
+        nmap_layout.setContentsMargins(8, 8, 8, 8)
+        self.nmap_status_table = self._make_table(["Field", "Value"])
+        self.nmap_profile_combo = QComboBox()
+        for profile_key, profile in NMAP_SCAN_PROFILES.items():
+            self.nmap_profile_combo.addItem(profile.label, profile_key)
+        self.nmap_profile_combo.setCurrentIndex(max(0, self.nmap_profile_combo.findData(DEFAULT_SCAN_PROFILE)))
+        self.nmap_profile_combo.currentIndexChanged.connect(self._refresh_nmap_status_table)
+        self.nmap_target_input = QLineEdit("127.0.0.1")
+        self.nmap_target_input.setReadOnly(True)
+        self.nmap_advanced_mode_checkbox = QCheckBox("Advanced Authorized Scan Mode")
+        self.nmap_advanced_mode_checkbox.setToolTip("Unlocks non-localhost targets only after explicit authorization.")
+        self.nmap_advanced_mode_checkbox.stateChanged.connect(self._toggle_nmap_advanced_mode)
+        self.nmap_run_button = QPushButton("Run Scan")
+        self.nmap_run_button.clicked.connect(self.run_nmap_local_scan)
+        self.nmap_stop_button = QPushButton("Stop Scan")
+        self.nmap_stop_button.setEnabled(False)
+        self.nmap_raw_xml_button = QPushButton("View Raw XML")
+        self.nmap_raw_xml_button.clicked.connect(self.view_nmap_raw_xml)
+        self.nmap_export_button = QPushButton("Export Results")
+        self.nmap_export_button.clicked.connect(self.export_nmap_results)
+        nmap_controls = QHBoxLayout()
+        nmap_controls.addWidget(QLabel("Profile"))
+        nmap_controls.addWidget(self.nmap_profile_combo)
+        nmap_controls.addWidget(QLabel("Target"))
+        nmap_controls.addWidget(self.nmap_target_input)
+        nmap_controls.addWidget(self.nmap_advanced_mode_checkbox)
+        nmap_controls.addWidget(self.nmap_run_button)
+        nmap_controls.addWidget(self.nmap_stop_button)
+        nmap_controls.addWidget(self.nmap_raw_xml_button)
+        nmap_controls.addWidget(self.nmap_export_button)
+        self.nmap_results_table = self._make_table(["Protocol", "Port", "State", "Service", "Product", "Version", "Reason", "Confidence"])
+        nmap_layout.addLayout(nmap_controls)
+        nmap_layout.addWidget(self.nmap_status_table)
+        nmap_layout.addWidget(self.nmap_results_table)
+        self._refresh_nmap_status_table()
         self.packet_capture_table = self._make_table(["Field", "Value"])
+        self.baseline_drift_page = QWidget()
+        baseline_drift_layout = QVBoxLayout(self.baseline_drift_page)
+        baseline_drift_layout.setContentsMargins(8, 8, 8, 8)
+        baseline_controls = QHBoxLayout()
+        self.create_trusted_baseline_button = QPushButton("Create Trusted Baseline")
+        self.create_trusted_baseline_button.clicked.connect(self.create_trusted_baseline)
+        self.compare_baseline_drift_button = QPushButton("Compare Current State")
+        self.compare_baseline_drift_button.clicked.connect(self.compare_current_baseline_drift)
+        self.view_baseline_drift_button = QPushButton("View Drift")
+        self.view_baseline_drift_button.clicked.connect(lambda: self.results_tabs.setCurrentWidget(self.baseline_drift_page))
+        self.mark_expected_drift_button = QPushButton("Mark Expected")
+        self.mark_expected_drift_button.clicked.connect(self.mark_selected_baseline_drift_expected)
+        self.add_baseline_drift_note_button = QPushButton("Add Note")
+        self.add_baseline_drift_note_button.clicked.connect(self.add_selected_baseline_drift_note)
+        for button in [
+            self.create_trusted_baseline_button,
+            self.compare_baseline_drift_button,
+            self.view_baseline_drift_button,
+            self.mark_expected_drift_button,
+            self.add_baseline_drift_note_button,
+        ]:
+            baseline_controls.addWidget(button)
+        baseline_controls.addStretch(1)
+        self.baseline_drift_summary_table = self._make_table(["Field", "Value"])
+        self.baseline_drift_table = self._make_table(["Drift ID", "Category", "Change", "Item", "Severity", "Confidence", "Previous", "Current", "Why It Matters", "Recommended Verification"])
+        baseline_drift_layout.addLayout(baseline_controls)
+        baseline_drift_layout.addWidget(self.baseline_drift_summary_table)
+        baseline_drift_layout.addWidget(self.baseline_drift_table)
+        self.security_timeline_page = QWidget()
+        security_timeline_layout = QVBoxLayout(self.security_timeline_page)
+        security_timeline_layout.setContentsMargins(8, 8, 8, 8)
+        timeline_controls = QHBoxLayout()
+        self.timeline_severity_filter = QComboBox()
+        self.timeline_severity_filter.addItems(["all", "info", "low", "medium", "high", "critical"])
+        self.timeline_severity_filter.currentIndexChanged.connect(self.refresh_security_timeline)
+        self.timeline_source_filter = QComboBox()
+        self.timeline_source_filter.addItem("all")
+        self.timeline_source_filter.currentIndexChanged.connect(self.refresh_security_timeline)
+        self.timeline_category_filter = QComboBox()
+        self.timeline_category_filter.addItem("all")
+        self.timeline_category_filter.currentIndexChanged.connect(self.refresh_security_timeline)
+        self.timeline_search_input = QLineEdit()
+        self.timeline_search_input.setPlaceholderText("Search timeline")
+        self.timeline_search_input.textChanged.connect(self.refresh_security_timeline)
+        self.timeline_context_button = QPushButton("Show Context")
+        self.timeline_context_button.clicked.connect(self.show_selected_timeline_context)
+        self.timeline_export_button = QPushButton("Export Timeline")
+        self.timeline_export_button.clicked.connect(self.export_security_timeline)
+        self.timeline_note_button = QPushButton("Add Note")
+        self.timeline_note_button.clicked.connect(self.add_note_to_selected_timeline_event)
+        for widget in [
+            QLabel("Severity"),
+            self.timeline_severity_filter,
+            QLabel("Source"),
+            self.timeline_source_filter,
+            QLabel("Category"),
+            self.timeline_category_filter,
+            self.timeline_search_input,
+            self.timeline_context_button,
+            self.timeline_export_button,
+            self.timeline_note_button,
+        ]:
+            timeline_controls.addWidget(widget)
+        self.security_timeline_table = self._make_table(["Timestamp", "Severity", "Type", "Source", "Title", "Summary", "Confidence", "Tags", "Event ID"])
+        self.security_timeline_context_table = self._make_table(["Timestamp", "Severity", "Type", "Source", "Title", "Summary"])
+        security_timeline_layout.addLayout(timeline_controls)
+        security_timeline_layout.addWidget(self.security_timeline_table)
+        security_timeline_layout.addWidget(QLabel("Context (+/- 15 minutes)"))
+        security_timeline_layout.addWidget(self.security_timeline_context_table)
+        self.evidence_graph_page = QWidget()
+        evidence_graph_layout = QVBoxLayout(self.evidence_graph_page)
+        evidence_graph_layout.setContentsMargins(8, 8, 8, 8)
+        evidence_graph_controls = QHBoxLayout()
+        self.refresh_evidence_graph_button = QPushButton("Refresh Graph")
+        self.refresh_evidence_graph_button.clicked.connect(self.refresh_evidence_graph)
+        self.evidence_graph_selected_finding_button = QPushButton("Show Selected Finding")
+        self.evidence_graph_selected_finding_button.clicked.connect(self.show_selected_finding_in_evidence_graph)
+        self.export_evidence_graph_button = QPushButton("Export Graph JSON")
+        self.export_evidence_graph_button.clicked.connect(self.export_evidence_graph)
+        for button in [self.refresh_evidence_graph_button, self.evidence_graph_selected_finding_button, self.export_evidence_graph_button]:
+            evidence_graph_controls.addWidget(button)
+        evidence_graph_controls.addStretch(1)
+        self.evidence_graph_summary_table = self._make_table(["Field", "Value"])
+        self.evidence_graph_nodes_table = self._make_table(["Node ID", "Type", "Label", "Summary"])
+        self.evidence_graph_edges_table = self._make_table(["From", "Edge", "To", "Confidence", "Evidence"])
+        self.evidence_graph_related_table = self._make_table(["Node ID", "Type", "Label", "Summary"])
+        self.evidence_graph_chain_table = self._make_table(["Depth", "From", "Edge", "To", "Label", "Evidence"])
+        self.evidence_graph_nodes_table.itemSelectionChanged.connect(self._refresh_selected_graph_node_context)
+        evidence_graph_layout.addLayout(evidence_graph_controls)
+        evidence_graph_layout.addWidget(self.evidence_graph_summary_table)
+        evidence_graph_layout.addWidget(QLabel("Nodes"))
+        evidence_graph_layout.addWidget(self.evidence_graph_nodes_table)
+        evidence_graph_layout.addWidget(QLabel("Edges"))
+        evidence_graph_layout.addWidget(self.evidence_graph_edges_table)
+        evidence_graph_layout.addWidget(QLabel("Related Nodes"))
+        evidence_graph_layout.addWidget(self.evidence_graph_related_table)
+        evidence_graph_layout.addWidget(QLabel("Evidence Chain"))
+        evidence_graph_layout.addWidget(self.evidence_graph_chain_table)
+        self.cases_page = QWidget()
+        cases_layout = QVBoxLayout(self.cases_page)
+        cases_layout.setContentsMargins(8, 8, 8, 8)
+        case_controls = QHBoxLayout()
+        self.new_case_button = QPushButton("New Case")
+        self.new_case_button.clicked.connect(self.create_case)
+        self.add_finding_to_case_button = QPushButton("Add Finding to Case")
+        self.add_finding_to_case_button.clicked.connect(self.add_selected_finding_to_case)
+        self.add_event_to_case_button = QPushButton("Add Event to Case")
+        self.add_event_to_case_button.clicked.connect(self.add_selected_event_to_case)
+        self.add_case_note_button = QPushButton("Add Note")
+        self.add_case_note_button.clicked.connect(self.add_note_to_case)
+        self.export_case_package_button = QPushButton("Export Case Package")
+        self.export_case_package_button.clicked.connect(self.export_case_package)
+        self.archive_case_button = QPushButton("Archive Case")
+        self.archive_case_button.clicked.connect(self.archive_selected_case)
+        for button in [
+            self.new_case_button,
+            self.add_finding_to_case_button,
+            self.add_event_to_case_button,
+            self.add_case_note_button,
+            self.export_case_package_button,
+            self.archive_case_button,
+        ]:
+            case_controls.addWidget(button)
+        case_controls.addStretch(1)
+        self.cases_table = self._make_table(["Case ID", "Title", "Status", "Severity", "Updated", "Findings", "Events", "Snapshots", "Reports"])
+        self.case_notes_table = self._make_table(["Timestamp", "Author", "Note"])
+        self.case_links_table = self._make_table(["Type", "Value"])
+        self.cases_table.itemSelectionChanged.connect(self._refresh_selected_case_details)
+        cases_layout.addLayout(case_controls)
+        cases_layout.addWidget(QLabel("Cases"))
+        cases_layout.addWidget(self.cases_table)
+        cases_layout.addWidget(QLabel("Case Notes"))
+        cases_layout.addWidget(self.case_notes_table)
+        cases_layout.addWidget(QLabel("Case Links"))
+        cases_layout.addWidget(self.case_links_table)
+        self.ioc_matching_page = QWidget()
+        ioc_layout = QVBoxLayout(self.ioc_matching_page)
+        ioc_layout.setContentsMargins(8, 8, 8, 8)
+        ioc_controls = QHBoxLayout()
+        self.import_ioc_button = QPushButton("Import IOC List")
+        self.import_ioc_button.clicked.connect(self.import_ioc_list)
+        self.run_ioc_match_button = QPushButton("Run Local Match")
+        self.run_ioc_match_button.clicked.connect(self.run_ioc_local_match)
+        self.view_ioc_matches_button = QPushButton("View Matches")
+        self.view_ioc_matches_button.clicked.connect(lambda: self.results_tabs.setCurrentWidget(self.ioc_matching_page))
+        self.export_ioc_matches_button = QPushButton("Export Matches")
+        self.export_ioc_matches_button.clicked.connect(self.export_ioc_matches)
+        for button in [self.import_ioc_button, self.run_ioc_match_button, self.view_ioc_matches_button, self.export_ioc_matches_button]:
+            ioc_controls.addWidget(button)
+        ioc_controls.addStretch(1)
+        self.ioc_status_table = self._make_table(["Field", "Value"])
+        self.ioc_matches_table = self._make_table(["Indicator", "Type", "Matched Value", "Source", "Confidence", "Recommended Action"])
+        ioc_layout.addLayout(ioc_controls)
+        ioc_layout.addWidget(QLabel("Offline IOC matching is local-only. MSAA does not upload indicators or artifacts and does not automatically block or remediate matches."))
+        ioc_layout.addWidget(self.ioc_status_table)
+        ioc_layout.addWidget(self.ioc_matches_table)
+        self.fleet_baseline_page = QWidget()
+        fleet_layout = QVBoxLayout(self.fleet_baseline_page)
+        fleet_layout.setContentsMargins(8, 8, 8, 8)
+        fleet_controls = QHBoxLayout()
+        self.export_fleet_baseline_button = QPushButton("Export Baseline")
+        self.export_fleet_baseline_button.clicked.connect(self.export_fleet_baseline_file)
+        self.import_fleet_baseline_button = QPushButton("Import Baseline")
+        self.import_fleet_baseline_button.clicked.connect(self.import_fleet_baseline_file)
+        self.compare_fleet_baseline_button = QPushButton("Compare")
+        self.compare_fleet_baseline_button.clicked.connect(self.compare_fleet_baseline)
+        self.export_fleet_drift_button = QPushButton("Generate Drift Report")
+        self.export_fleet_drift_button.clicked.connect(self.export_fleet_drift_report_file)
+        self.fleet_include_admins_checkbox = QCheckBox("Include admin users")
+        self.fleet_redact_checkbox = QCheckBox("Redact before export")
+        self.fleet_redact_checkbox.setChecked(True)
+        for widget in [
+            self.export_fleet_baseline_button,
+            self.import_fleet_baseline_button,
+            self.compare_fleet_baseline_button,
+            self.export_fleet_drift_button,
+            self.fleet_include_admins_checkbox,
+            self.fleet_redact_checkbox,
+        ]:
+            fleet_controls.addWidget(widget)
+        fleet_controls.addStretch(1)
+        self.fleet_baseline_status_table = self._make_table(["Field", "Value"])
+        self.fleet_baseline_deviations_table = self._make_table(["Category", "Item", "Expected", "Observed", "Severity", "Confidence", "Recommendation"])
+        fleet_layout.addLayout(fleet_controls)
+        fleet_layout.addWidget(QLabel("Fleet baselines are local JSON files for comparing Macs against a known-good reference without cloud management."))
+        fleet_layout.addWidget(self.fleet_baseline_status_table)
+        fleet_layout.addWidget(self.fleet_baseline_deviations_table)
         self.network_discovery_page = QWidget()
         network_layout = QVBoxLayout(self.network_discovery_page)
         network_layout.setContentsMargins(8, 8, 8, 8)
@@ -1820,7 +2089,14 @@ class MainWindow(QMainWindow):
             ("Ports", self.ports_table),
             ("Localhost Port Scan", self.localhost_scan_table),
             ("Full Localhost Port Scan", self.localhost_full_scan_table),
+            ("Nmap Local Scan", self.nmap_local_scan_page),
             ("Packet Capture Snapshot", self.packet_capture_table),
+            ("Baseline Drift", self.baseline_drift_page),
+            ("Security Timeline", self.security_timeline_page),
+            ("Evidence Graph", self.evidence_graph_page),
+            ("Cases", self.cases_page),
+            ("IOC Matching", self.ioc_matching_page),
+            ("Fleet Baseline", self.fleet_baseline_page),
             ("Local Network Device Discovery", self.network_discovery_page),
             ("Workflow Layer", self.workflow_page),
             ("Investigation Priorities", self.investigation_priority_panel),
@@ -1869,6 +2145,94 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.reliability_panel)
         return page
+
+    def _build_visibility_integrity_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+        heading = QLabel("Visibility Integrity")
+        heading.setStyleSheet("font-size: 18px; font-weight: 700;")
+        heading.setWordWrap(True)
+        self.visibility_score_label = QLabel("Visibility Integrity Score: --")
+        self.visibility_score_label.setStyleSheet("font-size: 16px; font-weight: 700;")
+        self.visibility_score_label.setWordWrap(True)
+        self.visibility_component_table = self._make_table(["Component", "Status", "Last Success", "Last Error", "Evidence", "Recommended Fix"])
+        self.visibility_degraded_table = self._make_table(["Component", "Evidence", "Recommended Fix"])
+        self.visibility_failing_table = self._make_table(["Component", "Evidence", "Recommended Fix"])
+        self.visibility_fix_table = self._make_table(["Component", "Recommended Fix"])
+        layout.addWidget(heading)
+        layout.addWidget(self.visibility_score_label)
+        layout.addWidget(QLabel("Component Statuses"))
+        layout.addWidget(self.visibility_component_table)
+        layout.addWidget(QLabel("Degraded Components"))
+        layout.addWidget(self.visibility_degraded_table)
+        layout.addWidget(QLabel("Failing Components"))
+        layout.addWidget(self.visibility_failing_table)
+        layout.addWidget(QLabel("Recommended Fixes"))
+        layout.addWidget(self.visibility_fix_table)
+        self.refresh_visibility_integrity()
+        return page
+
+    def _build_framework_coverage_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+        heading = QLabel("Framework Coverage")
+        heading.setStyleSheet("font-size: 18px; font-weight: 700;")
+        heading.setWordWrap(True)
+        disclaimer = QLabel(
+            "MSAA provides framework mappings for analyst context and reporting support. "
+            "These mappings do not constitute certification, compliance, authorization, or an official assessment."
+        )
+        disclaimer.setWordWrap(True)
+        self.framework_csf_table = self._make_table(["NIST CSF Function", "Mapped Checks"])
+        self.framework_mitre_table = self._make_table(["MITRE ATT&CK macOS Tactic", "Mapped Checks"])
+        self.framework_controls_table = self._make_table(["NIST SP 800-53 Control", "Mapped Checks"])
+        self.framework_unmapped_table = self._make_table(["Rule ID", "Title", "Category"])
+        self.framework_confidence_table = self._make_table(["Mapping Confidence", "Count"])
+        layout.addWidget(heading)
+        layout.addWidget(disclaimer)
+        layout.addWidget(QLabel("NIST CSF 2.0 Coverage"))
+        layout.addWidget(self.framework_csf_table)
+        layout.addWidget(QLabel("MITRE ATT&CK macOS Coverage"))
+        layout.addWidget(self.framework_mitre_table)
+        layout.addWidget(QLabel("NIST SP 800-53 Mapped Controls"))
+        layout.addWidget(self.framework_controls_table)
+        layout.addWidget(QLabel("Checks Without Mappings"))
+        layout.addWidget(self.framework_unmapped_table)
+        layout.addWidget(QLabel("Mapping Confidence"))
+        layout.addWidget(self.framework_confidence_table)
+        self._refresh_framework_coverage()
+        return page
+
+    def _refresh_framework_coverage(self) -> None:
+        if not hasattr(self, "framework_csf_table"):
+            return
+        summary = rule_coverage_summary(RULES)
+        self._populate_table(
+            self.framework_csf_table,
+            [[name, str(count)] for name, count in summary.get("nist_csf", {}).items()] or [["No mappings", "0"]],
+        )
+        self._populate_table(
+            self.framework_mitre_table,
+            [[name, str(count)] for name, count in summary.get("mitre_attack_macos", {}).items()] or [["No mappings", "0"]],
+        )
+        self._populate_table(
+            self.framework_controls_table,
+            [[name, str(count)] for name, count in summary.get("nist_800_53_controls", {}).items()] or [["No mappings", "0"]],
+        )
+        self._populate_table(
+            self.framework_unmapped_table,
+            [
+                [str(item.get("rule_id", "")), str(item.get("title", "")), str(item.get("category", ""))]
+                for item in summary.get("checks_without_mappings", [])
+            ]
+            or [["None", "All registered checks have mappings.", ""]],
+        )
+        self._populate_table(
+            self.framework_confidence_table,
+            [[name, str(count)] for name, count in summary.get("mapping_confidence", {}).items()] or [["No mappings", "0"]],
+        )
 
     def _build_settings_page(self) -> QWidget:
         page = QWidget()
@@ -2108,6 +2472,8 @@ class MainWindow(QMainWindow):
             self.dashboard_header_layout.addWidget(widget, row, column)
 
     def _load_logo_pixmap(self, width: int, height: int, name: str = "logo.png") -> QPixmap:
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return QPixmap()
         path = get_asset_path(name)
         if not path.exists():
             return QPixmap()
@@ -2170,6 +2536,10 @@ class MainWindow(QMainWindow):
         summary.setWordWrap(True)
         summary.setAlignment(Qt.AlignCenter)
         layout.addWidget(summary)
+        nmap_credit = QLabel(f"{NMAP_CREDIT_TEXT}\nhttps://nmap.org/")
+        nmap_credit.setWordWrap(True)
+        nmap_credit.setAlignment(Qt.AlignCenter)
+        layout.addWidget(nmap_credit)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok)
         buttons.accepted.connect(dialog.accept)
         layout.addWidget(buttons)
@@ -3074,6 +3444,9 @@ class MainWindow(QMainWindow):
         self.refresh_flight_recorder()
         self.refresh_logs_page()
         self.refresh_investigation_notes_page()
+        self.refresh_security_timeline()
+        self.refresh_evidence_graph()
+        self.refresh_cases()
         self.refresh_operational_health()
         self.refresh_cve_radar(manual=False)
         self.refresh_system_recovery(manual=False)
@@ -3395,6 +3768,80 @@ class MainWindow(QMainWindow):
                 "configuration_drift": {"changes": []},
                 "incident_mode": self.incident_mode_manager.status(),
             }
+
+    def _current_visibility_integrity_payload(self) -> dict:
+        if self.current_scan_result is not None:
+            existing = self.current_scan_result.artifacts.get("visibility_integrity", {})
+            if isinstance(existing, dict) and existing:
+                return existing
+        if self.current_payload is not None:
+            existing = self.current_payload.get("visibility_integrity", {})
+            if isinstance(existing, dict) and existing:
+                return existing
+        return self.visibility_integrity_engine.build_report().to_dict()
+
+    def _attach_visibility_integrity(self) -> dict:
+        payload = self.visibility_integrity_engine.build_report().to_dict()
+        if self.current_scan_result is not None:
+            self.current_scan_result.collected_artifacts["visibility_integrity"] = payload
+        if self.current_payload is not None:
+            self.current_payload["visibility_integrity"] = payload
+        return payload
+
+    def refresh_visibility_integrity(self) -> None:
+        if not hasattr(self, "visibility_component_table"):
+            return
+        try:
+            payload = self._attach_visibility_integrity()
+        except Exception as exc:
+            payload = {
+                "score": 0,
+                "VisibilityIntegrityScore": 0,
+                "overall_status": "failing",
+                "components": [
+                    {
+                        "component_name": "Visibility Integrity Engine",
+                        "status": "failing",
+                        "last_success": "",
+                        "last_error": str(exc),
+                        "evidence": "Unable to build visibility integrity report.",
+                        "recommended_fix": "Review application logs and repair the failing visibility component.",
+                    }
+                ],
+            }
+        score = payload.get("score", payload.get("VisibilityIntegrityScore", 0))
+        self.visibility_score_label.setText(f"Visibility Integrity Score: {score}/100 ({payload.get('overall_status', 'unknown')})")
+        components = [item for item in payload.get("components", []) if isinstance(item, dict)]
+        self._populate_table(
+            self.visibility_component_table,
+            [
+                [
+                    str(item.get("component_name", "")),
+                    str(item.get("status", "")),
+                    str(item.get("last_success", "")),
+                    str(item.get("last_error", "")),
+                    str(item.get("evidence", "")),
+                    str(item.get("recommended_fix", "")),
+                ]
+                for item in components
+            ]
+            or [["No visibility components recorded.", "", "", "", "", ""]],
+        )
+        degraded = [item for item in components if item.get("status") == "degraded"]
+        failing = [item for item in components if item.get("status") == "failing"]
+        fixes = [item for item in components if item.get("status") in {"degraded", "failing", "disabled"} and item.get("recommended_fix")]
+        self._populate_table(
+            self.visibility_degraded_table,
+            [[str(item.get("component_name", "")), str(item.get("evidence", "")), str(item.get("recommended_fix", ""))] for item in degraded] or [["None", "", ""]],
+        )
+        self._populate_table(
+            self.visibility_failing_table,
+            [[str(item.get("component_name", "")), str(item.get("evidence", "")), str(item.get("recommended_fix", ""))] for item in failing] or [["None", "", ""]],
+        )
+        self._populate_table(
+            self.visibility_fix_table,
+            [[str(item.get("component_name", "")), str(item.get("recommended_fix", ""))] for item in fixes] or [["None", "No action required."]],
+        )
 
     def _current_configuration_drift_payload(self) -> dict:
         snapshot: dict[str, object] = {}
@@ -3969,6 +4416,8 @@ class MainWindow(QMainWindow):
 
     def _persist_completed_scan(self, *, scan_result: ScanResult, started_at: str, scan_mode: str, localhost_protocol: str) -> None:
         self.statusBar().showMessage("collector completed")
+        self.current_scan_result = scan_result
+        self._attach_visibility_integrity()
         completed_at = utc_now_iso()
         score = self.collectors.compute_security_score(scan_result.findings)
         score_label = self.collectors.score_label(score)
@@ -4017,6 +4466,7 @@ class MainWindow(QMainWindow):
         self._load_scan_result(scan_result)
         self._refresh_dashboard()
         self._refresh_command_preview_page()
+        self.refresh_visibility_integrity()
         self.statusBar().showMessage("scan completed", 5000)
         QMessageBox.information(self, "Scan Complete", f"Scan finished with {len(scan_result.findings)} findings.")
 
@@ -4184,6 +4634,764 @@ class MainWindow(QMainWindow):
             ),
         )
 
+    def _toggle_nmap_advanced_mode(self) -> None:
+        enabled = self.nmap_advanced_mode_checkbox.isChecked()
+        self.nmap_target_input.setReadOnly(not enabled)
+        if not enabled:
+            self.nmap_target_input.setText("127.0.0.1")
+        self._refresh_nmap_status_table()
+
+    def _refresh_nmap_status_table(self) -> None:
+        if not hasattr(self, "nmap_status_table"):
+            return
+        nmap_path = find_nmap_binary()
+        profile_key = self.nmap_profile_combo.currentData() if hasattr(self, "nmap_profile_combo") else DEFAULT_SCAN_PROFILE
+        profile = NMAP_SCAN_PROFILES.get(str(profile_key), NMAP_SCAN_PROFILES[DEFAULT_SCAN_PROFILE])
+        self._populate_table(
+            self.nmap_status_table,
+            [
+                ["Nmap installed", "yes" if nmap_path else "no"],
+                ["Nmap path", nmap_path or NMAP_INSTALL_MESSAGE],
+                ["Selected scan profile", profile.label],
+                ["Target", self.nmap_target_input.text() if hasattr(self, "nmap_target_input") else "127.0.0.1"],
+                ["Estimated time", profile.estimated_time],
+                ["Requires sudo", "yes" if profile.requires_sudo else "no"],
+                ["Warning", profile.warning or "none"],
+            ],
+        )
+
+    def _confirm_nmap_scan(self, profile_key: str, target: str) -> bool:
+        profile = NMAP_SCAN_PROFILES[profile_key]
+        message = (
+            "This scan is intended for systems you own or are authorized to assess. "
+            "The default target is 127.0.0.1."
+        )
+        details: list[str] = []
+        if profile_key in {"localhost_tcp_full", "localhost_udp_quick", "localhost_udp_full"}:
+            details.append("This profile requires explicit confirmation.")
+        if profile.requires_sudo:
+            details.append("UDP scans can be slow and may require sudo/root privileges.")
+        if profile_key == "localhost_udp_full":
+            details.append("Full UDP scans may take a long time.")
+        if target not in {"127.0.0.1", "localhost", "::1"}:
+            details.append("The selected target is not localhost. Continue only with explicit authorization.")
+        if details:
+            message = f"{message}\n\n" + "\n".join(details)
+        response = QMessageBox.question(self, "Authorized Local Scan Notice", message)
+        return response == QMessageBox.StandardButton.Yes
+
+    def run_nmap_local_scan(self) -> None:
+        profile_key = str(self.nmap_profile_combo.currentData()) if hasattr(self, "nmap_profile_combo") else DEFAULT_SCAN_PROFILE
+        target = self.nmap_target_input.text().strip() if hasattr(self, "nmap_target_input") else "127.0.0.1"
+        advanced_authorized = bool(self.nmap_advanced_mode_checkbox.isChecked()) if hasattr(self, "nmap_advanced_mode_checkbox") else False
+        if not find_nmap_binary():
+            QMessageBox.information(self, "Nmap Required", NMAP_INSTALL_MESSAGE)
+            self._refresh_nmap_status_table()
+            return
+        if not self._confirm_nmap_scan(profile_key, target):
+            self.statusBar().showMessage("nmap local scan cancelled", 3000)
+            return
+        phases = [
+            "Preparing authorized local Nmap scan.",
+            "Running Nmap with XML output and shell disabled.",
+            "Parsing Nmap XML port findings.",
+            "Updating local-only scan results.",
+        ]
+        progress_dialog = GuidedLongActionDialog("Nmap Local Scan", phases, self)
+
+        def _nmap_action(progress: Callable[[dict], None]) -> dict:
+            progress({"message": phases[0], "completed": 0, "total": len(phases)})
+            progress({"message": phases[1], "completed": 1, "total": len(phases)})
+            result = run_nmap_scan(profile_key, target=target, advanced_authorized=advanced_authorized)
+            progress({"message": phases[2], "completed": 2, "total": len(phases)})
+            return result.to_dict()
+
+        progress_dialog.start_action(_nmap_action)
+        if progress_dialog.exec() != QDialog.Accepted or not isinstance(progress_dialog.result_data, dict):
+            self.statusBar().showMessage("nmap local scan failed", 5000)
+            if progress_dialog.error:
+                QMessageBox.warning(self, "Nmap Local Scan Failed", progress_dialog.error)
+            return
+        nmap_payload = progress_dialog.result_data
+        if self.current_payload is None:
+            self.current_payload = {
+                "findings": [],
+                "ports": {"listening": [], "active_connections": [], "suspicious_review_needed": [], "errors": []},
+                "localhost_scan": {"target": nmap_payload.get("target", "127.0.0.1"), "mode": "nmap", "protocol": "tcp", "open_ports": [], "missing_from_enumeration": [], "errors": [], "scanned_port_count": len(nmap_payload.get("ports", [])), "engine": "nmap", "nmap": nmap_payload},
+                "localhost_full_port_scan": {},
+                "processes": {"all": [], "suspicious": [], "errors": []},
+                "users": [],
+                "history_indicators": [],
+                "permission_snapshots": [],
+                "file_issues": [],
+                "raw_logs": [],
+                "baseline_diff": {},
+                "dashboard": {},
+            }
+        else:
+            self.current_payload.setdefault("localhost_scan", {})["nmap"] = nmap_payload
+            self.current_payload["localhost_scan"]["engine"] = "nmap"
+        if self.current_scan_result is not None:
+            self.current_scan_result.collected_artifacts.setdefault("localhost_scan", {})["nmap"] = nmap_payload
+            self.current_scan_result.collected_artifacts["localhost_scan"]["engine"] = "nmap"
+        self._populate_nmap_results(nmap_payload)
+        self._populate_scan_results(self.current_payload)
+        self.results_tabs.setCurrentWidget(self.nmap_local_scan_page)
+        self.statusBar().showMessage("nmap local scan completed", 5000)
+
+    def view_nmap_raw_xml(self) -> None:
+        payload = ((self.current_payload or {}).get("localhost_scan", {}) or {}).get("nmap", {})
+        raw_xml = payload.get("raw_xml", "") if isinstance(payload, dict) else ""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Nmap Raw XML")
+        layout = QVBoxLayout(dialog)
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setPlainText(raw_xml or "No raw XML available.")
+        layout.addWidget(text)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+        dialog.resize(800, 500)
+        dialog.exec()
+
+    def export_nmap_results(self) -> None:
+        payload = ((self.current_payload or {}).get("localhost_scan", {}) or {}).get("nmap", {})
+        if not isinstance(payload, dict) or not payload:
+            QMessageBox.information(self, "Export Results", "No Nmap results are available to export.")
+            return
+        output_path, _ = QFileDialog.getSaveFileName(self, "Export Nmap Results", str(default_json_report_path()), "JSON Files (*.json)")
+        if not output_path:
+            return
+        Path(output_path).write_text(json.dumps(json_safe(payload), indent=2), encoding="utf-8")
+        self.statusBar().showMessage("nmap results exported", 5000)
+
+    def _populate_nmap_results(self, nmap_payload: dict) -> None:
+        if not hasattr(self, "nmap_results_table"):
+            return
+        self._refresh_nmap_status_table()
+        ports = nmap_payload.get("ports", []) if isinstance(nmap_payload, dict) else []
+        rows = [
+            [
+                str(item.get("protocol", "")),
+                str(item.get("port", "")),
+                str(item.get("state", "")),
+                str(item.get("service", "")),
+                str(item.get("product", "")),
+                str(item.get("version", "")),
+                str(item.get("reason", "")),
+                str(item.get("confidence", "")),
+            ]
+            for item in ports
+            if isinstance(item, dict)
+        ]
+        self._populate_table(self.nmap_results_table, rows or [["", "", "No Nmap port findings recorded.", "", "", "", "", ""]])
+
+    def _attach_security_timeline(self) -> dict:
+        timeline = self.security_timeline_builder.build_from_db(self.current_scan_result) if self.current_scan_result is not None else self.security_timeline_builder.build_from_db(None)
+        if self.current_payload is not None:
+            self.current_payload["security_timeline"] = timeline
+        if self.current_scan_result is not None:
+            self.current_scan_result.collected_artifacts["security_timeline"] = timeline
+        return timeline
+
+    def refresh_security_timeline(self) -> None:
+        if not hasattr(self, "security_timeline_table"):
+            return
+        timeline = {}
+        if self.current_scan_result is not None:
+            timeline = self._attach_security_timeline()
+        elif self.current_payload is not None:
+            timeline = self.current_payload.get("security_timeline", {}) if isinstance(self.current_payload.get("security_timeline", {}), dict) else {}
+        if not timeline:
+            timeline = self.security_timeline_builder.build_from_db(None)
+        events = [item for item in timeline.get("events", []) if isinstance(item, dict)]
+        self.security_timeline_events = events
+        self._sync_timeline_filters(events)
+        severity = self.timeline_severity_filter.currentText()
+        source = self.timeline_source_filter.currentText()
+        category = self.timeline_category_filter.currentText()
+        filtered = filter_timeline_events(
+            events,
+            severity="" if severity == "all" else severity,
+            source="" if source == "all" else source,
+            category="" if category == "all" else category,
+            search=self.timeline_search_input.text(),
+        )
+        self._populate_table(
+            self.security_timeline_table,
+            [
+                [
+                    event.timestamp,
+                    event.severity,
+                    event.event_type,
+                    event.source,
+                    event.title,
+                    event.summary,
+                    event.confidence,
+                    ", ".join(event.tags),
+                    event.event_id,
+                ]
+                for event in filtered
+            ]
+            or [["", "", "", "", "No timeline events match the current filters.", "", "", "", ""]],
+        )
+        if not filtered:
+            self.security_timeline_context_table.setRowCount(0)
+
+    def _sync_timeline_filters(self, events: list[dict]) -> None:
+        if not hasattr(self, "timeline_source_filter"):
+            return
+        current_source = self.timeline_source_filter.currentText()
+        current_category = self.timeline_category_filter.currentText()
+        sources = sorted({str(item.get("source", "")) for item in events if item.get("source")})
+        categories = sorted({str(tag) for item in events for tag in item.get("tags", []) if tag})
+        for combo, values, current in [
+            (self.timeline_source_filter, sources, current_source),
+            (self.timeline_category_filter, categories, current_category),
+        ]:
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("all")
+            for value in values:
+                combo.addItem(value)
+            combo.setCurrentText(current if current in {"all", *values} else "all")
+            combo.blockSignals(False)
+
+    def _selected_timeline_event_id(self) -> str:
+        row = self.security_timeline_table.currentRow()
+        if row < 0:
+            return ""
+        item = self.security_timeline_table.item(row, 8)
+        return item.text().strip() if item is not None else ""
+
+    def show_selected_timeline_context(self) -> None:
+        event_id = self._selected_timeline_event_id()
+        if not event_id:
+            QMessageBox.information(self, "Security Timeline", "Select a timeline event first.")
+            return
+        context = context_window(self.security_timeline_events, event_id, minutes=15)
+        self._populate_table(
+            self.security_timeline_context_table,
+            [
+                [
+                    event.timestamp,
+                    event.severity,
+                    event.event_type,
+                    event.source,
+                    event.title,
+                    event.summary,
+                ]
+                for event in context
+            ]
+            or [["", "", "", "", "No nearby events found.", ""]],
+        )
+
+    def export_security_timeline(self) -> None:
+        timeline = self._attach_security_timeline() if self.current_scan_result is not None else self.security_timeline_builder.build_from_db(None)
+        events = timeline.get("events", []) if isinstance(timeline, dict) else []
+        output_path, _ = QFileDialog.getSaveFileName(self, "Export Security Timeline", str(get_reports_dir() / f"security_timeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"), "JSON Files (*.json)")
+        if not output_path:
+            return
+        try:
+            saved_path = export_timeline_json(events, Path(output_path))
+        except OSError as exc:
+            QMessageBox.warning(self, "Security Timeline Export Failed", f"Failed to export timeline:\n{exc}")
+            return
+        self.statusBar().showMessage("security timeline exported", 5000)
+        QMessageBox.information(self, "Security Timeline Exported", f"Saved timeline JSON to:\n{saved_path}")
+
+    def add_note_to_selected_timeline_event(self) -> None:
+        event_id = self._selected_timeline_event_id()
+        if not event_id:
+            QMessageBox.information(self, "Security Timeline", "Select a timeline event first.")
+            return
+        note, accepted = QInputDialog.getMultiLineText(self, "Add Timeline Note", "Note:")
+        if not accepted or not note.strip():
+            return
+        timestamp = utc_now_iso()
+        self.db.save_investigation_note(
+            InvestigationNote(
+                note_id=f"timeline-note-{timestamp}",
+                created_at=timestamp,
+                updated_at=timestamp,
+                title=f"Timeline note for {event_id}",
+                body=note.strip(),
+                tags=["timeline", event_id],
+                linked_finding_id=event_id,
+                linked_scan_id=self._current_scan_id(),
+            )
+        )
+        self.refresh_security_timeline()
+        self.refresh_investigation_notes_page()
+        self.statusBar().showMessage("timeline note saved", 5000)
+
+    def _attach_evidence_graph(self) -> dict:
+        monitor_events = [item.to_dict() for item in self.db.recent_background_monitor_events(limit=1000)]
+        if self.current_scan_result is not None:
+            graph = self.evidence_graph_builder.build_from_scan_result(self.current_scan_result, monitor_events=monitor_events).to_dict()
+            self.current_scan_result.collected_artifacts["evidence_graph"] = graph
+        else:
+            artifacts = self.current_payload or {}
+            graph = self.evidence_graph_builder.build(artifacts, monitor_events=monitor_events).to_dict()
+        if self.current_payload is not None:
+            self.current_payload["evidence_graph"] = graph
+        self.current_evidence_graph = graph
+        return graph
+
+    def refresh_evidence_graph(self) -> None:
+        if not hasattr(self, "evidence_graph_nodes_table"):
+            return
+        graph = self._attach_evidence_graph()
+        self._populate_evidence_graph(graph)
+
+    def _populate_evidence_graph(self, graph: dict) -> None:
+        nodes = [item for item in graph.get("nodes", []) if isinstance(item, dict)]
+        edges = [item for item in graph.get("edges", []) if isinstance(item, dict)]
+        counts: dict[str, int] = {}
+        for node in nodes:
+            node_type = str(node.get("node_type", ""))
+            counts[node_type] = counts.get(node_type, 0) + 1
+        self._populate_table(
+            self.evidence_graph_summary_table,
+            [
+                ["Nodes", str(graph.get("node_count", len(nodes)))],
+                ["Edges", str(graph.get("edge_count", len(edges)))],
+                ["Generated At", str(graph.get("generated_at", ""))],
+                ["Node Types", ", ".join(f"{key}: {value}" for key, value in sorted(counts.items())) or "none"],
+            ],
+        )
+        self._populate_table(
+            self.evidence_graph_nodes_table,
+            [[str(item.get("node_id", "")), str(item.get("node_type", "")), str(item.get("label", "")), str(item.get("summary", ""))] for item in nodes]
+            or [["", "", "No evidence graph nodes available.", ""]],
+        )
+        self._populate_table(
+            self.evidence_graph_edges_table,
+            [[str(item.get("source_id", "")), str(item.get("edge_type", "")), str(item.get("target_id", "")), str(item.get("confidence", "")), str(item.get("evidence", ""))] for item in edges]
+            or [["", "", "", "", "No evidence graph edges available."]],
+        )
+        self.evidence_graph_related_table.setRowCount(0)
+        self.evidence_graph_chain_table.setRowCount(0)
+
+    def _selected_evidence_graph_node_id(self) -> str:
+        row = self.evidence_graph_nodes_table.currentRow()
+        if row < 0:
+            return ""
+        item = self.evidence_graph_nodes_table.item(row, 0)
+        return item.text().strip() if item is not None else ""
+
+    def _refresh_selected_graph_node_context(self) -> None:
+        node_id = self._selected_evidence_graph_node_id()
+        if not node_id or not self.current_evidence_graph:
+            return
+        nodes = [item for item in self.current_evidence_graph.get("nodes", []) if isinstance(item, dict)]
+        edges = [item for item in self.current_evidence_graph.get("edges", []) if isinstance(item, dict)]
+        related_ids = {node_id}
+        for edge in edges:
+            if edge.get("source_id") == node_id:
+                related_ids.add(str(edge.get("target_id", "")))
+            if edge.get("target_id") == node_id:
+                related_ids.add(str(edge.get("source_id", "")))
+        self._populate_table(
+            self.evidence_graph_related_table,
+            [
+                [str(item.get("node_id", "")), str(item.get("node_type", "")), str(item.get("label", "")), str(item.get("summary", ""))]
+                for item in nodes
+                if item.get("node_id") in related_ids
+            ],
+        )
+        chain = self._evidence_chain_for_node(node_id, nodes, edges)
+        self._populate_table(
+            self.evidence_graph_chain_table,
+            [[str(item.get("depth", "")), str(item.get("from", "")), str(item.get("edge_type", "")), str(item.get("to", "")), str(item.get("label", "")), str(item.get("evidence", ""))] for item in chain]
+            or [["", "", "", "", "", "No evidence chain available for selected node."]],
+        )
+
+    def _evidence_chain_for_node(self, node_id: str, nodes: list[dict], edges: list[dict], max_depth: int = 4) -> list[dict]:
+        node_lookup = {str(item.get("node_id", "")): item for item in nodes}
+        seen = {node_id}
+        frontier = [(node_id, 0)]
+        chain: list[dict] = []
+        while frontier:
+            current, depth = frontier.pop(0)
+            if depth >= max_depth:
+                continue
+            for edge in edges:
+                source = str(edge.get("source_id", ""))
+                target = str(edge.get("target_id", ""))
+                if source == current and target not in seen:
+                    seen.add(target)
+                    chain.append({"depth": depth + 1, "from": source, "edge_type": edge.get("edge_type", ""), "to": target, "label": node_lookup.get(target, {}).get("label", ""), "evidence": edge.get("evidence", "")})
+                    frontier.append((target, depth + 1))
+                elif target == current and source not in seen:
+                    seen.add(source)
+                    chain.append({"depth": depth + 1, "from": source, "edge_type": edge.get("edge_type", ""), "to": target, "label": node_lookup.get(source, {}).get("label", ""), "evidence": edge.get("evidence", "")})
+                    frontier.append((source, depth + 1))
+        return chain
+
+    def show_selected_finding_in_evidence_graph(self) -> None:
+        if not self.current_selected_finding:
+            QMessageBox.information(self, "Evidence Graph", "Select a finding first.")
+            return
+        graph = self._attach_evidence_graph()
+        self._populate_evidence_graph(graph)
+        finding_id = f"finding:{self.current_selected_finding.get('id') or self.current_selected_finding.get('title') or self.current_selected_finding.get('evidence') or ''}"
+        for row in range(self.evidence_graph_nodes_table.rowCount()):
+            item = self.evidence_graph_nodes_table.item(row, 0)
+            if item and item.text() == finding_id:
+                self.evidence_graph_nodes_table.selectRow(row)
+                self._refresh_selected_graph_node_context()
+                break
+        self.results_tabs.setCurrentWidget(self.evidence_graph_page)
+
+    def export_evidence_graph(self) -> None:
+        graph = self._attach_evidence_graph()
+        output_path, _ = QFileDialog.getSaveFileName(self, "Export Evidence Graph", str(get_reports_dir() / f"evidence_graph_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"), "JSON Files (*.json)")
+        if not output_path:
+            return
+        try:
+            saved_path = export_graph_json(graph, Path(output_path))
+        except OSError as exc:
+            QMessageBox.warning(self, "Evidence Graph Export Failed", f"Failed to export evidence graph:\n{exc}")
+            return
+        self.statusBar().showMessage("evidence graph exported", 5000)
+        QMessageBox.information(self, "Evidence Graph Exported", f"Saved evidence graph JSON to:\n{saved_path}")
+
+    def refresh_cases(self) -> None:
+        if not hasattr(self, "cases_table"):
+            return
+        cases = self.case_manager.list_cases(include_archived=True)
+        self._populate_table(
+            self.cases_table,
+            [
+                [
+                    case.case_id,
+                    case.title,
+                    case.status,
+                    case.severity,
+                    case.updated_at,
+                    str(len(case.linked_findings)),
+                    str(len(case.linked_events)),
+                    str(len(case.linked_snapshots)),
+                    str(len(case.linked_reports)),
+                ]
+                for case in cases
+            ]
+            or [["", "No cases recorded.", "", "", "", "", "", "", ""]],
+        )
+        if cases and self.cases_table.currentRow() < 0:
+            self.cases_table.selectRow(0)
+
+    def _selected_case_id(self) -> str:
+        if not hasattr(self, "cases_table"):
+            return ""
+        row = self.cases_table.currentRow()
+        if row < 0:
+            return ""
+        item = self.cases_table.item(row, 0)
+        return item.text().strip() if item is not None else ""
+
+    def _refresh_selected_case_details(self) -> None:
+        if not hasattr(self, "case_notes_table"):
+            return
+        case_id = self._selected_case_id()
+        case = self.case_manager.get_case(case_id) if case_id else None
+        if case is None:
+            self.case_notes_table.setRowCount(0)
+            self.case_links_table.setRowCount(0)
+            return
+        self._populate_table(
+            self.case_notes_table,
+            [[str(item.get("timestamp", "")), str(item.get("author", "")), str(item.get("note", ""))] for item in case.notes]
+            or [["", "", "No case notes recorded."]],
+        )
+        rows: list[list[str]] = []
+        rows.extend([["finding", value] for value in case.linked_findings])
+        rows.extend([["event", value] for value in case.linked_events])
+        rows.extend([["snapshot", value] for value in case.linked_snapshots])
+        rows.extend([["report", value] for value in case.linked_reports])
+        self._populate_table(self.case_links_table, rows or [["", "No linked evidence recorded."]])
+
+    def create_case(self) -> None:
+        title, accepted = QInputDialog.getText(self, "New Case", "Case title:")
+        if not accepted:
+            return
+        description, accepted = QInputDialog.getMultiLineText(self, "New Case", "Description:")
+        if not accepted:
+            description = ""
+        case = self.case_manager.create_case(title=title, description=description)
+        self.refresh_cases()
+        self.statusBar().showMessage("case created", 5000)
+        QMessageBox.information(self, "Case Created", f"Created case:\n{case.case_id}")
+
+    def add_selected_finding_to_case(self) -> None:
+        case_id = self._selected_case_id()
+        if not case_id:
+            QMessageBox.information(self, "Cases", "Select a case first.")
+            return
+        if not self.current_selected_finding:
+            QMessageBox.information(self, "Cases", "Select a finding first.")
+            return
+        finding_id = str(self.current_selected_finding.get("id") or self.current_selected_finding.get("title") or "")
+        if not finding_id:
+            QMessageBox.information(self, "Cases", "Selected finding has no usable identifier.")
+            return
+        self.case_manager.link_finding(case_id, finding_id)
+        self.refresh_cases()
+        self.statusBar().showMessage("finding linked to case", 5000)
+
+    def add_selected_event_to_case(self) -> None:
+        case_id = self._selected_case_id()
+        if not case_id:
+            QMessageBox.information(self, "Cases", "Select a case first.")
+            return
+        event_id = self._selected_timeline_event_id() if hasattr(self, "security_timeline_table") else ""
+        if not event_id:
+            event_id, accepted = QInputDialog.getText(self, "Add Event to Case", "Event ID:")
+            if not accepted:
+                return
+        if not event_id.strip():
+            return
+        self.case_manager.link_event(case_id, event_id.strip())
+        self.refresh_cases()
+        self.statusBar().showMessage("event linked to case", 5000)
+
+    def add_note_to_case(self) -> None:
+        case_id = self._selected_case_id()
+        if not case_id:
+            QMessageBox.information(self, "Cases", "Select a case first.")
+            return
+        note, accepted = QInputDialog.getMultiLineText(self, "Add Case Note", "Note:")
+        if not accepted or not note.strip():
+            return
+        self.case_manager.add_note(case_id, note.strip(), author=self.current_user_label.text() if hasattr(self, "current_user_label") else "")
+        self.refresh_cases()
+        self.statusBar().showMessage("case note saved", 5000)
+
+    def export_case_package(self) -> None:
+        case_id = self._selected_case_id()
+        if not case_id:
+            QMessageBox.information(self, "Cases", "Select a case first.")
+            return
+        output_path, _ = QFileDialog.getSaveFileName(self, "Export Case Package", str(get_reports_dir() / f"{case_id}_package.zip"), "Zip Files (*.zip)")
+        if not output_path:
+            return
+        try:
+            saved_path = self.case_manager.export_case_package(case_id, Path(output_path), scan_result=self.current_scan_result)
+        except (OSError, KeyError) as exc:
+            QMessageBox.warning(self, "Case Package Export Failed", f"Failed to export case package:\n{exc}")
+            return
+        self.statusBar().showMessage("case package exported", 5000)
+        QMessageBox.information(self, "Case Package Exported", f"Saved case package to:\n{saved_path}")
+
+    def archive_selected_case(self) -> None:
+        case_id = self._selected_case_id()
+        if not case_id:
+            QMessageBox.information(self, "Cases", "Select a case first.")
+            return
+        confirm = QMessageBox.question(self, "Archive Case", f"Archive case {case_id}?")
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self.case_manager.archive_case(case_id)
+        self.refresh_cases()
+        self.statusBar().showMessage("case archived", 5000)
+
+    def import_ioc_list(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Import IOC List", str(Path.home()), "IOC Files (*.csv *.json *.txt);;All Files (*)")
+        if not path:
+            return
+        try:
+            indicators = load_ioc_file(Path(path))
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            QMessageBox.warning(self, "Import IOC List Failed", f"Failed to import IOC list:\n{exc}")
+            return
+        self.current_ioc_indicators = [indicator.to_dict() for indicator in indicators]
+        self._populate_ioc_status()
+        self.statusBar().showMessage("ioc list imported", 5000)
+
+    def run_ioc_local_match(self) -> None:
+        if not self.current_ioc_indicators:
+            QMessageBox.information(self, "IOC Matching", "Import an IOC list first.")
+            return
+        artifacts = self.current_scan_result.collected_artifacts if self.current_scan_result is not None else (self.current_payload or {})
+        report = self.ioc_engine.match(self.current_ioc_indicators, artifacts).to_dict()
+        self.current_ioc_report = report
+        if self.current_payload is not None:
+            self.current_payload["ioc_matches"] = report
+        if self.current_scan_result is not None:
+            self.current_scan_result.collected_artifacts["ioc_matches"] = report
+        self._populate_ioc_matches(report)
+        self.results_tabs.setCurrentWidget(self.ioc_matching_page)
+        self.statusBar().showMessage("ioc local match completed", 5000)
+
+    def export_ioc_matches(self) -> None:
+        if not self.current_ioc_report:
+            QMessageBox.information(self, "Export Matches", "No IOC match results are available.")
+            return
+        output_path, _ = QFileDialog.getSaveFileName(self, "Export IOC Matches", str(get_reports_dir() / f"ioc_matches_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"), "JSON Files (*.json)")
+        if not output_path:
+            return
+        try:
+            saved_path = export_matches_json(self.current_ioc_report, Path(output_path))
+        except OSError as exc:
+            QMessageBox.warning(self, "Export Matches Failed", f"Failed to export IOC matches:\n{exc}")
+            return
+        self.statusBar().showMessage("ioc matches exported", 5000)
+        QMessageBox.information(self, "IOC Matches Exported", f"Saved IOC matches to:\n{saved_path}")
+
+    def _populate_ioc_status(self) -> None:
+        if not hasattr(self, "ioc_status_table"):
+            return
+        report = self.current_ioc_report or {}
+        self._populate_table(
+            self.ioc_status_table,
+            [
+                ["Indicators Loaded", str(len(self.current_ioc_indicators))],
+                ["Matches", str(report.get("match_count", 0) if isinstance(report, dict) else 0)],
+                ["Local Only", "yes"],
+                ["Upload Performed", "no"],
+                ["Automatic Blocking", "no"],
+            ],
+        )
+
+    def _populate_ioc_matches(self, report: dict) -> None:
+        if not hasattr(self, "ioc_matches_table"):
+            return
+        self._populate_ioc_status()
+        matches = [item for item in report.get("matches", []) if isinstance(item, dict)]
+        self._populate_table(
+            self.ioc_matches_table,
+            [
+                [
+                    str(item.get("indicator", "")),
+                    str(item.get("indicator_type", "")),
+                    str(item.get("matched_value", "")),
+                    str(item.get("source", "")),
+                    str(item.get("confidence", "")),
+                    str(item.get("recommended_action", "")),
+                ]
+                for item in matches
+            ]
+            or [["", "", "", "", "", "No local IOC matches recorded."]],
+        )
+
+    def _fleet_baseline_source_payload(self) -> dict:
+        if self.current_scan_result is not None:
+            return self.current_scan_result.collected_artifacts
+        return self.current_payload or {}
+
+    def export_fleet_baseline_file(self) -> None:
+        payload = self._fleet_baseline_source_payload()
+        if not payload:
+            QMessageBox.information(self, "Fleet Baseline", "Run or load a scan before exporting a fleet baseline.")
+            return
+        baseline = build_fleet_baseline(
+            payload,
+            include_admin_users=self.fleet_include_admins_checkbox.isChecked(),
+            redact=self.fleet_redact_checkbox.isChecked(),
+        )
+        output_path, _ = QFileDialog.getSaveFileName(self, "Export Fleet Baseline", str(get_reports_dir() / FLEET_BASELINE_FILENAME), "JSON Files (*.json)")
+        if not output_path:
+            return
+        try:
+            saved_path = export_fleet_baseline(baseline, Path(output_path))
+        except OSError as exc:
+            QMessageBox.warning(self, "Export Fleet Baseline Failed", f"Failed to export fleet baseline:\n{exc}")
+            return
+        self.current_fleet_baseline = baseline.to_dict()
+        self._populate_fleet_baseline()
+        self.statusBar().showMessage("fleet baseline exported", 5000)
+        QMessageBox.information(self, "Fleet Baseline Exported", f"Saved fleet baseline to:\n{saved_path}")
+
+    def import_fleet_baseline_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Import Fleet Baseline", str(Path.home()), "JSON Files (*.json);;All Files (*)")
+        if not path:
+            return
+        try:
+            baseline = import_fleet_baseline(Path(path))
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            QMessageBox.warning(self, "Import Fleet Baseline Failed", f"Failed to import fleet baseline:\n{exc}")
+            return
+        self.current_fleet_baseline = baseline.to_dict()
+        self.current_fleet_comparison = {}
+        self._populate_fleet_baseline()
+        self.statusBar().showMessage("fleet baseline imported", 5000)
+
+    def compare_fleet_baseline(self) -> None:
+        if not self.current_fleet_baseline:
+            QMessageBox.information(self, "Fleet Baseline", "Import or export a fleet baseline before comparing.")
+            return
+        payload = self._fleet_baseline_source_payload()
+        if not payload:
+            QMessageBox.information(self, "Fleet Baseline", "Run or load a scan before comparing against a fleet baseline.")
+            return
+        comparison = compare_to_fleet_baseline(payload, self.current_fleet_baseline).to_dict()
+        self.current_fleet_comparison = comparison
+        if self.current_payload is not None:
+            self.current_payload["fleet_baseline_comparison"] = comparison
+        if self.current_scan_result is not None:
+            self.current_scan_result.collected_artifacts["fleet_baseline_comparison"] = comparison
+        self._populate_fleet_baseline()
+        self.results_tabs.setCurrentWidget(self.fleet_baseline_page)
+        self.statusBar().showMessage("fleet baseline comparison completed", 5000)
+
+    def export_fleet_drift_report_file(self) -> None:
+        if not self.current_fleet_comparison:
+            QMessageBox.information(self, "Fleet Baseline", "No fleet baseline comparison is available.")
+            return
+        output_path, _ = QFileDialog.getSaveFileName(self, "Generate Fleet Drift Report", str(get_reports_dir() / f"fleet_drift_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"), "JSON Files (*.json)")
+        if not output_path:
+            return
+        try:
+            saved_path = export_fleet_drift_report(self.current_fleet_comparison, Path(output_path))
+        except OSError as exc:
+            QMessageBox.warning(self, "Fleet Drift Report Failed", f"Failed to export fleet drift report:\n{exc}")
+            return
+        self.statusBar().showMessage("fleet drift report exported", 5000)
+        QMessageBox.information(self, "Fleet Drift Report", f"Saved fleet drift report to:\n{saved_path}")
+
+    def _populate_fleet_baseline(self) -> None:
+        if not hasattr(self, "fleet_baseline_status_table"):
+            return
+        baseline = self.current_fleet_baseline or {}
+        comparison = self.current_fleet_comparison or {}
+        summary = comparison.get("summary", {}) if isinstance(comparison, dict) else {}
+        self._populate_table(
+            self.fleet_baseline_status_table,
+            [
+                ["Baseline Loaded", "yes" if baseline else "no"],
+                ["Baseline ID", str(baseline.get("baseline_id", ""))],
+                ["macOS Version", str(baseline.get("macos_version", ""))],
+                ["Firewall", str(baseline.get("expected_firewall_state", ""))],
+                ["FileVault", str(baseline.get("expected_filevault_state", ""))],
+                ["SSH / Remote Login", str(baseline.get("expected_ssh_state", ""))],
+                ["Allowed LaunchAgents", str(len(baseline.get("allowed_launchagents", [])))],
+                ["Allowed LaunchDaemons", str(len(baseline.get("allowed_launchdaemons", [])))],
+                ["Allowed Apps", str(len(baseline.get("allowed_apps", [])))],
+                ["Admin Users Included", "yes" if baseline.get("include_admin_users") else "no"],
+                ["Redacted", "yes" if baseline.get("redacted", True) else "no"],
+                ["Deviations", str(summary.get("deviation_count", 0))],
+            ],
+        )
+        deviations = [item for item in comparison.get("deviations", []) if isinstance(item, dict)] if isinstance(comparison, dict) else []
+        self._populate_table(
+            self.fleet_baseline_deviations_table,
+            [
+                [
+                    str(item.get("category", "")),
+                    str(item.get("item", "")),
+                    json.dumps(item.get("expected", ""), default=str)[:300],
+                    json.dumps(item.get("observed", ""), default=str)[:300],
+                    str(item.get("severity", "")),
+                    str(item.get("confidence", "")),
+                    str(item.get("recommendation", "")),
+                ]
+                for item in deviations
+            ]
+            or [["", "", "", "", "", "", "No fleet baseline deviations recorded."]],
+        )
+
     def run_network_discovery(self) -> None:
         options_dialog = NetworkDiscoveryOptionsDialog(self)
         if options_dialog.exec() != QDialog.Accepted:
@@ -4290,6 +5498,105 @@ class MainWindow(QMainWindow):
             ),
         )
 
+    def _baseline_drift_source_payload(self) -> dict:
+        if self.current_scan_result is not None:
+            return self.current_scan_result.to_dict()
+        return self.current_payload or {}
+
+    def create_trusted_baseline(self) -> None:
+        payload = self._baseline_drift_source_payload()
+        if not payload:
+            QMessageBox.information(self, "Baseline Drift", "Run or load a scan before creating a trusted baseline.")
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Create Trusted Baseline",
+            "Create a trusted baseline from the currently loaded local evidence? Only do this after reviewing that the current state is expected.",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        snapshot = self.baseline_drift_engine.create_trusted_baseline(payload, note="Created from UI after analyst review.")
+        self._populate_baseline_drift({"baseline_available": True, "baseline_snapshot": snapshot.to_dict(), "findings": [], "summary": {"total": 0, "review_recommended": 0, "suppressed_expected": 0}})
+        QMessageBox.information(self, "Trusted Baseline Created", f"Trusted baseline saved at {snapshot.created_at}.")
+
+    def compare_current_baseline_drift(self) -> None:
+        payload = self._baseline_drift_source_payload()
+        if not payload:
+            QMessageBox.information(self, "Baseline Drift", "Run or load a scan before comparing baseline drift.")
+            return
+        drift = self.baseline_drift_engine.compare_current_state(payload)
+        if self.current_payload is not None:
+            self.current_payload["baseline_drift"] = drift
+        if self.current_scan_result is not None:
+            self.current_scan_result.collected_artifacts["baseline_drift"] = drift
+        self._populate_baseline_drift(drift)
+        self.results_tabs.setCurrentWidget(self.baseline_drift_page)
+        if not drift.get("baseline_available"):
+            QMessageBox.information(self, "Baseline Drift", "No trusted baseline exists yet. Create a trusted baseline after reviewing the current state.")
+
+    def _selected_baseline_drift_id(self) -> str:
+        row = self.baseline_drift_table.currentRow()
+        if row < 0:
+            return ""
+        item = self.baseline_drift_table.item(row, 0)
+        return item.text().strip() if item is not None else ""
+
+    def mark_selected_baseline_drift_expected(self) -> None:
+        drift_id = self._selected_baseline_drift_id()
+        if not drift_id:
+            QMessageBox.information(self, "Baseline Drift", "Select a drift row first.")
+            return
+        self.baseline_drift_engine.mark_expected(drift_id, note="Marked expected in UI.")
+        self.compare_current_baseline_drift()
+        self.statusBar().showMessage("baseline drift marked expected", 5000)
+
+    def add_selected_baseline_drift_note(self) -> None:
+        drift_id = self._selected_baseline_drift_id()
+        if not drift_id:
+            QMessageBox.information(self, "Baseline Drift", "Select a drift row first.")
+            return
+        note, accepted = QInputDialog.getText(self, "Add Baseline Drift Note", "Note:")
+        if not accepted:
+            return
+        self.baseline_drift_engine.add_note(drift_id, note.strip())
+        self.compare_current_baseline_drift()
+        self.statusBar().showMessage("baseline drift note saved", 5000)
+
+    def _populate_baseline_drift(self, drift: dict) -> None:
+        if not hasattr(self, "baseline_drift_table"):
+            return
+        summary = drift.get("summary", {}) if isinstance(drift, dict) else {}
+        self._populate_table(
+            self.baseline_drift_summary_table,
+            [
+                ["Baseline Available", "yes" if drift.get("baseline_available") else "no"],
+                ["Total Drift", str(summary.get("total", 0))],
+                ["Review Recommended", str(summary.get("review_recommended", 0))],
+                ["Suppressed Expected", str(summary.get("suppressed_expected", 0))],
+                ["Categories", ", ".join(str(item) for item in summary.get("categories", [])) or "none"],
+            ],
+        )
+        findings = [item for item in drift.get("findings", []) if isinstance(item, dict)]
+        self._populate_table(
+            self.baseline_drift_table,
+            [
+                [
+                    str(item.get("drift_id", "")),
+                    str(item.get("category", "")),
+                    str(item.get("change_type", "changed")),
+                    str(item.get("item_key", "")),
+                    str(item.get("severity", "")),
+                    str(item.get("confidence", "")),
+                    json.dumps(json_safe(item.get("previous_state", "")), sort_keys=True)[:500],
+                    json.dumps(json_safe(item.get("current_state", "")), sort_keys=True)[:500],
+                    str(item.get("why_it_matters", "")),
+                    str(item.get("recommended_verification", "")),
+                ]
+                for item in findings
+            ]
+            or [["", "", "No baseline drift requiring review.", "", "", "", "", "", "", ""]],
+        )
+
     def closeEvent(self, event) -> None:
         if self.tray_icon is not None and self.tray_icon.isVisible() and not self._force_quit_from_tray and not self._tray_disabled_for_test_session():
             event.ignore()
@@ -4311,6 +5618,8 @@ class MainWindow(QMainWindow):
         if self.tray_icon is not None:
             self.tray_icon.hide()
         super().closeEvent(event)
+        if event.isAccepted():
+            self.db.close()
 
     def run_packet_capture_snapshot(self) -> None:
         if self.config.fresh_baseline_validation_mode or self.config.uat_live_environment_mode or self.config.disable_packet_capture:
@@ -4531,6 +5840,28 @@ class MainWindow(QMainWindow):
                 ["Explanation", "This module scans only 127.0.0.1 across TCP and UDP, performs passive TCP banner grabbing, and does not rely on local process enumeration to decide which ports to check."],
             ],
         )
+        nmap_payload = localhost_scan.get("nmap", {}) if isinstance(localhost_scan, dict) else {}
+        if isinstance(nmap_payload, dict):
+            self._populate_nmap_results(nmap_payload)
+        baseline_drift = payload.get("baseline_drift", {})
+        if isinstance(baseline_drift, dict):
+            self._populate_baseline_drift(baseline_drift)
+        security_timeline = payload.get("security_timeline", {})
+        if isinstance(security_timeline, dict) and hasattr(self, "security_timeline_table"):
+            self.security_timeline_events = [item for item in security_timeline.get("events", []) if isinstance(item, dict)]
+            self.refresh_security_timeline()
+        evidence_graph = payload.get("evidence_graph", {})
+        if isinstance(evidence_graph, dict) and hasattr(self, "evidence_graph_nodes_table"):
+            self.current_evidence_graph = evidence_graph
+            self._populate_evidence_graph(evidence_graph)
+        ioc_matches = payload.get("ioc_matches", {})
+        if isinstance(ioc_matches, dict) and hasattr(self, "ioc_matches_table"):
+            self.current_ioc_report = ioc_matches
+            self._populate_ioc_matches(ioc_matches)
+        fleet_comparison = payload.get("fleet_baseline_comparison", {})
+        if isinstance(fleet_comparison, dict) and hasattr(self, "fleet_baseline_deviations_table"):
+            self.current_fleet_comparison = fleet_comparison
+            self._populate_fleet_baseline()
         packet_captures = payload.get("packet_captures", [])
         latest_capture = packet_captures[-1] if packet_captures else {}
         self._populate_table(
@@ -4914,6 +6245,9 @@ class MainWindow(QMainWindow):
         investigation_audit_trail = [item.to_dict() for item in self.db.list_investigation_audit_trail(limit=1000)] if include_investigation_notes else []
         try:
             investigation_priorities = self.investigation_priority_engine.build_priorities(scan_result=self.current_scan_result).to_dict() if self.current_scan_result else None
+            self._attach_visibility_integrity()
+            self._attach_security_timeline()
+            self._attach_evidence_graph()
             reliability = self._current_reliability_payload()
             saved_path = export_scan_result_json(
                 self.current_scan_result,
@@ -4947,6 +6281,9 @@ class MainWindow(QMainWindow):
         investigation_audit_trail = [item.to_dict() for item in self.db.list_investigation_audit_trail(limit=1000)] if include_investigation_notes else []
         try:
             investigation_priorities = self.investigation_priority_engine.build_priorities(scan_result=self.current_scan_result).to_dict() if self.current_scan_result else None
+            self._attach_visibility_integrity()
+            self._attach_security_timeline()
+            self._attach_evidence_graph()
             reliability = self._current_reliability_payload()
             saved_path = export_scan_result_html(
                 self.current_scan_result,

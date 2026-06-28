@@ -145,7 +145,7 @@ def test_mandatory_alert_policy_gaps_report_disabled_category(tmp_path: Path) ->
     assert "new_network_connection_detected:category_disabled:network" in gaps
 
 
-def test_mandatory_alert_policy_overrides_stale_log_only_preference(tmp_path: Path) -> None:
+def test_mandatory_alert_policy_reports_explicit_disabled_preference(tmp_path: Path) -> None:
     db = _db(tmp_path)
     db.set_background_monitor_state(
         "event_preferences_json",
@@ -163,11 +163,14 @@ def test_mandatory_alert_policy_overrides_stale_log_only_preference(tmp_path: Pa
         ),
     )
 
-    assert "suspicious_process_observed:notify_false" not in mandatory_alert_policy_gaps(db)
-    assert "suspicious_process_observed:notification_mode_none" not in mandatory_alert_policy_gaps(db)
+    gaps = mandatory_alert_policy_gaps(db)
+
+    assert "suspicious_process_observed:disabled_by_preference" in gaps
+    assert "suspicious_process_observed:notify_false" in gaps
+    assert "suspicious_process_observed:notification_mode_none" in gaps
 
 
-def test_stale_preferences_do_not_disable_mandatory_alert_decision(tmp_path: Path) -> None:
+def test_explicit_disabled_preference_disables_mandatory_alert_decision(tmp_path: Path) -> None:
     db = _db(tmp_path)
     db.set_background_monitor_state(
         "event_preferences_json",
@@ -188,9 +191,9 @@ def test_stale_preferences_do_not_disable_mandatory_alert_decision(tmp_path: Pat
 
     decision = NotificationManager(db).evaluate_notification_decision(event)
 
-    assert decision["decision"] in {"sent", "visible_alert", "popup"}
-    assert decision["reason"] != "disabled_by_user"
-    assert decision["alert_suppressed_reason"] == ""
+    assert decision["decision"] == "disabled_by_user"
+    assert decision["reason"] == "event_disabled_by_preference"
+    assert decision["alert_suppressed_reason"] == "event_disabled_by_preference"
 
 
 def test_reliability_panel_shows_recent_alert_trace_rows() -> None:

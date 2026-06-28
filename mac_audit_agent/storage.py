@@ -418,6 +418,7 @@ class AuditDatabase:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.log_retention_days = log_retention_days
         self._db_lock = threading.RLock()
+        self._closed = False
         raw_conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
         self.conn = _LockedConnection(raw_conn, self._db_lock)
         self.conn.row_factory = sqlite3.Row
@@ -426,6 +427,27 @@ class AuditDatabase:
         self.conn.execute("PRAGMA busy_timeout=5000")
         self._init_schema()
         self._ensure_shared_system_db_permissions()
+
+    def close(self) -> None:
+        if getattr(self, "_closed", True):
+            return
+        self._closed = True
+        try:
+            self.conn.close()
+        except Exception:
+            LOGGER.debug("Unable to close audit database %s", self.path, exc_info=True)
+
+    def __enter__(self) -> "AuditDatabase":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _ensure_shared_system_db_permissions(self) -> None:
         if self.path != SYSTEM_MONITOR_DB_PATH:
@@ -588,6 +610,47 @@ class AuditDatabase:
                 scan_id TEXT NOT NULL,
                 item_key TEXT NOT NULL,
                 payload_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS nmap_scans (
+                scan_id TEXT PRIMARY KEY,
+                profile TEXT NOT NULL DEFAULT '',
+                target TEXT NOT NULL DEFAULT '127.0.0.1',
+                timestamp TEXT NOT NULL DEFAULT '',
+                nmap_path TEXT NOT NULL DEFAULT '',
+                command_used TEXT NOT NULL DEFAULT '',
+                warnings_json TEXT NOT NULL DEFAULT '[]',
+                errors_json TEXT NOT NULL DEFAULT '[]',
+                sudo_required INTEGER NOT NULL DEFAULT 0,
+                fallback_used INTEGER NOT NULL DEFAULT 0,
+                raw_xml TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS nmap_scan_ports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scan_id TEXT NOT NULL,
+                host TEXT NOT NULL DEFAULT '',
+                port INTEGER NOT NULL,
+                protocol TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL DEFAULT '',
+                service TEXT NOT NULL DEFAULT '',
+                product TEXT NOT NULL DEFAULT '',
+                version TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                confidence TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS baseline_drift_snapshots (
+                baseline_id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                trusted INTEGER NOT NULL DEFAULT 1,
+                source TEXT NOT NULL DEFAULT '',
+                note TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS baseline_drift_expected (
+                drift_id TEXT PRIMARY KEY,
+                marked_at TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS cve_radar_cache (
                 cache_key TEXT PRIMARY KEY,
@@ -1114,7 +1177,117 @@ class AuditDatabase:
             "INSERT OR REPLACE INTO scan_results (scan_id, payload_json) VALUES (?, ?)",
             (scan_result.scan_id, json.dumps(json_safe(scan_result.to_dict()))),
         )
+        self.record_nmap_scan_result(scan_result.scan_id, scan_result.artifacts.get("localhost_scan", {}).get("nmap", {}), commit=False)
         self.conn.commit()
+
+    def record_nmap_scan_result(self, scan_id: str, nmap_payload: dict[str, Any], *, commit: bool = True) -> None:
+        if not isinstance(nmap_payload, dict) or not nmap_payload:
+            return
+        ports = nmap_payload.get("ports", [])
+        command_used = nmap_payload.get("command_used", "")
+        if isinstance(command_used, list):
+            command_text = " | ".join(str(item) for item in command_used)
+        else:
+            command_text = str(command_used or "")
+        profile = nmap_payload.get("profile", nmap_payload.get("profiles", ""))
+        if isinstance(profile, list):
+            profile_text = ", ".join(str(item) for item in profile)
+        else:
+            profile_text = str(profile or "")
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO nmap_scans
+            (scan_id, profile, target, timestamp, nmap_path, command_used, warnings_json, errors_json, sudo_required, fallback_used, raw_xml, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                scan_id,
+                profile_text,
+                str(nmap_payload.get("target", "127.0.0.1")),
+                str(nmap_payload.get("timestamp", "")),
+                str(nmap_payload.get("path", "")),
+                command_text,
+                json.dumps(json_safe(nmap_payload.get("warnings", []))),
+                json.dumps(json_safe(nmap_payload.get("errors", []))),
+                int(bool(nmap_payload.get("sudo_required", False))),
+                int(bool(nmap_payload.get("fallback_used", False))),
+                str(nmap_payload.get("raw_xml", "")),
+                json.dumps(json_safe(nmap_payload)),
+            ),
+        )
+        self.conn.execute("DELETE FROM nmap_scan_ports WHERE scan_id = ?", (scan_id,))
+        self.conn.executemany(
+            """
+            INSERT INTO nmap_scan_ports
+            (scan_id, host, port, protocol, state, service, product, version, reason, confidence, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    scan_id,
+                    str(item.get("host", "")),
+                    int(item.get("port", 0) or 0),
+                    str(item.get("protocol", "")),
+                    str(item.get("state", "")),
+                    str(item.get("service", "")),
+                    str(item.get("product", "")),
+                    str(item.get("version", "")),
+                    str(item.get("reason", "")),
+                    str(item.get("confidence", "")),
+                    json.dumps(json_safe(item)),
+                )
+                for item in ports
+                if isinstance(item, dict)
+            ],
+        )
+        if commit:
+            self.conn.commit()
+
+    def record_baseline_drift_snapshot(self, payload: dict[str, Any]) -> None:
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO baseline_drift_snapshots
+            (baseline_id, created_at, trusted, source, note, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(payload.get("snapshot_id", "default")),
+                str(payload.get("created_at", utc_now_iso())),
+                int(bool(payload.get("trusted", True))),
+                str(payload.get("source", "")),
+                str(payload.get("note", "")),
+                json.dumps(json_safe(payload)),
+            ),
+        )
+        self.conn.commit()
+
+    def latest_baseline_drift_snapshot(self, baseline_id: str = "default") -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT payload_json FROM baseline_drift_snapshots WHERE baseline_id = ? ORDER BY created_at DESC LIMIT 1",
+            (baseline_id,),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            payload = json.loads(str(row["payload_json"] or "{}"))
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def record_expected_baseline_drift(self, drift_id: str, *, note: str = "") -> None:
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO baseline_drift_expected
+            (drift_id, marked_at, note)
+            VALUES (?, ?, ?)
+            """,
+            (drift_id, utc_now_iso(), note),
+        )
+        self.conn.commit()
+
+    def list_expected_baseline_drift_ids(self) -> list[str]:
+        rows = self.conn.execute("SELECT drift_id FROM baseline_drift_expected ORDER BY marked_at DESC").fetchall()
+        return [str(row["drift_id"]) for row in rows]
 
     def latest_scan_result(self) -> ScanResult | None:
         try:

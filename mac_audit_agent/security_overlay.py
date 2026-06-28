@@ -114,6 +114,7 @@ class SecurityOverlay(QWidget):
             f"{payload.get('details') or payload.get('event_type', 'security_event')}\n"
             f"Detected: {payload.get('timestamp', '')}\n"
             f"Grouped events: {count}"
+            + (f"\n{payload.get('grouped_message')}" if payload.get("grouped_message") else "")
         )
         self.evidence.setText(str(payload.get("summary", "")))
         style = SEVERITY_STYLES.get(severity, SEVERITY_STYLES["neutral_grey"])

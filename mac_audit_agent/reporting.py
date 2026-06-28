@@ -11,8 +11,13 @@ from mac_audit_agent.assets import get_asset_data_uri
 from mac_audit_agent.investigation_priority import build_investigation_priority_report_from_scan
 from mac_audit_agent.cve_radar import group_forecast_cards_for_display
 from mac_audit_agent.execution_evidence import ExecutionEvidenceEngine
+from mac_audit_agent.evidence_graph import EvidenceGraphBuilder
+from mac_audit_agent.explanations import ensure_finding_explanations
+from mac_audit_agent.frameworks import framework_summary_for_findings, mappings_for_finding
 from mac_audit_agent.models import BaselineComparison, Finding, ScanResult, ScanSummary
+from mac_audit_agent.nmap_wrapper import NMAP_CREDIT_TEXT, NMAP_URL
 from mac_audit_agent.privacy import redact_structure, redact_text
+from mac_audit_agent.security_timeline import SecurityTimelineBuilder
 from mac_audit_agent.storage import json_safe
 
 SEVERITY_COLOR_MAP = {
@@ -61,12 +66,33 @@ def get_reports_dir() -> Path:
 
 def finding_to_dict(finding) -> dict:
     if isinstance(finding, dict):
-        return finding
+        return ensure_finding_explanations(finding)
     if hasattr(finding, "to_dict"):
-        return finding.to_dict()
+        return ensure_finding_explanations(finding.to_dict())
     if hasattr(finding, "__dict__"):
-        return dict(finding.__dict__)
+        return ensure_finding_explanations(dict(finding.__dict__))
     return {}
+
+
+def _framework_mapping_summary_text(finding: dict) -> str:
+    mappings = mappings_for_finding(finding)
+    if not mappings:
+        return "Unmapped"
+    grouped: dict[str, list[str]] = {}
+    for mapping in mappings:
+        label = {
+            "NIST_CSF_2_0": "NIST CSF 2.0",
+            "NIST_800_53_REV5": "NIST SP 800-53 Rev. 5",
+            "NIST_800_61_REV3": "NIST SP 800-61 Rev. 3",
+            "MITRE_ATTACK_MACOS": "MITRE ATT&CK macOS",
+            "CISA_KEV": "CISA KEV",
+            "NVD_CVE": "NVD/CVE",
+        }.get(mapping.framework, mapping.framework)
+        value = f"{mapping.id} {mapping.name}".strip()
+        grouped.setdefault(label, [])
+        if value not in grouped[label]:
+            grouped[label].append(value)
+    return "; ".join(f"{framework}: {', '.join(values)}" for framework, values in grouped.items())
 
 
 def default_html_report_path(base_dir: Path | None = None, now: datetime | None = None) -> Path:
@@ -252,10 +278,17 @@ def export_scan_result_json(
     ports = payload.get("collected_artifacts", {}).get("ports", {"listening": [], "active_connections": [], "suspicious_review_needed": [], "errors": []})
     processes = payload.get("collected_artifacts", {}).get("processes", {"all": [], "suspicious": [], "errors": []})
     localhost_scan = payload.get("collected_artifacts", {}).get("localhost_scan", {})
+    nmap_scan = localhost_scan.get("nmap", {}) if isinstance(localhost_scan, dict) else {}
     packet_captures = payload.get("collected_artifacts", {}).get("packet_captures", [])
     network_discovery = payload.get("collected_artifacts", {}).get("network_discovery", {})
     apple_security_forecast = payload.get("collected_artifacts", {}).get("apple_security_forecast", payload.get("collected_artifacts", {}).get("cve_radar", {}))
     reliability = reliability or payload.get("collected_artifacts", {}).get("reliability", payload.get("reliability", {})) or {}
+    visibility_integrity = payload.get("collected_artifacts", {}).get("visibility_integrity", {})
+    baseline_drift = payload.get("collected_artifacts", {}).get("baseline_drift", {})
+    security_timeline = payload.get("collected_artifacts", {}).get("security_timeline", {})
+    system_integrity = payload.get("collected_artifacts", {}).get("system_integrity", {})
+    evidence_graph = payload.get("collected_artifacts", {}).get("evidence_graph", {})
+    ioc_matches = payload.get("collected_artifacts", {}).get("ioc_matches", {})
     if apple_security_forecast:
         production_cards = _production_forecast_cards(apple_security_forecast)
         apple_security_forecast = dict(apple_security_forecast)
@@ -268,11 +301,26 @@ def export_scan_result_json(
     intrusion_correlation = payload.get("collected_artifacts", {}).get("intrusion_correlation", payload.get("intrusion_correlation", {}))
     execution_evidence = execution_evidence_from_scan(scan_result)
     investigation_priorities = investigation_priorities or build_investigation_priority_report_from_scan(scan_result).to_dict()
+    if not security_timeline:
+        security_timeline = SecurityTimelineBuilder().build(
+            scan_result=scan_result,
+            monitor_events=background_monitor_events or [],
+            notes=investigation_notes or [],
+        )
+    if not evidence_graph:
+        evidence_graph = EvidenceGraphBuilder().build_from_scan_result(scan_result, monitor_events=background_monitor_events or []).to_dict()
+    framework_summary = framework_summary_for_findings([finding_to_dict(finding) for finding in scan_result.findings])
     score, score_label = score_from_findings(scan_result.findings)
     payload["security_score"] = score
     payload["score_label"] = score_label
     payload["apple_security_forecast"] = apple_security_forecast
     payload["reliability"] = reliability
+    payload["visibility_integrity"] = visibility_integrity
+    payload["baseline_drift"] = baseline_drift
+    payload["security_timeline"] = security_timeline
+    payload["system_integrity"] = system_integrity
+    payload["evidence_graph"] = evidence_graph
+    payload["ioc_matches"] = ioc_matches
     payload["intrusion_correlation"] = intrusion_correlation
     payload["report_summary"] = {
         "security_score": score,
@@ -287,11 +335,19 @@ def export_scan_result_json(
             "processes": processes.get("errors", []),
         },
         "localhost_scan": localhost_scan,
+        "nmap_scan": nmap_scan,
         "packet_captures": packet_captures,
         "network_discovery": network_discovery,
         "apple_security_forecast": apple_security_forecast,
         "reliability": reliability,
+        "visibility_integrity": visibility_integrity,
+        "baseline_drift": baseline_drift,
+        "security_timeline": security_timeline,
+        "system_integrity": system_integrity,
+        "evidence_graph": evidence_graph,
+        "ioc_matches": ioc_matches,
         "intrusion_correlation": intrusion_correlation,
+        "framework_summary": framework_summary,
         "execution_evidence": execution_evidence,
         "investigation_priorities": investigation_priorities,
         "alert_storm_summaries": [
@@ -307,6 +363,8 @@ def export_scan_result_json(
         ],
         "packet_capture_privacy_warning": "Packet captures may contain sensitive traffic metadata or contents. Reports include only local metadata and file paths, not packet contents.",
     }
+    if nmap_scan and not nmap_scan.get("fallback_used"):
+        payload["report_summary"]["nmap_credit"] = f"{NMAP_CREDIT_TEXT} {NMAP_URL}"
     if execution_evidence:
         payload["report_summary"]["execution_evidence_count"] = len(execution_evidence)
     payload["report_summary"]["investigation_priorities"] = {
@@ -396,6 +454,9 @@ def export_html_report(
           <td>{html.escape(str(finding.get('description', '')))}</td>
           <td>{html.escape(str(finding.get('evidence', '')))}</td>
           <td>{html.escape(str(finding.get('recommended_next_steps', finding.get('remediation_suggestion', ''))))}
+          {"<br><br><strong>Technical Explanation:</strong><br>" + html.escape(str(finding.get('technical_explanation', ''))) if finding.get('technical_explanation') else ""}
+          {"<br><br><strong>Plain-English Explanation:</strong><br>" + html.escape(str(finding.get('plain_english_explanation', ''))) if finding.get('plain_english_explanation') else ""}
+          {"<br><br><strong>Analyst Next Step:</strong><br>" + html.escape(str(finding.get('analyst_next_step', ''))) if finding.get('analyst_next_step') else ""}
           {"<br><br><strong>Business Impact:</strong><br>" + html.escape(str(finding.get('business_impact', ''))) if finding.get('business_impact') else ""}
           {"<br><br><strong>Local Network Impact:</strong><br>" + html.escape(str(finding.get('local_network_impact', ''))) if finding.get('local_network_impact') else ""}
           {"<br><br><strong>Privilege Escalation:</strong><br>" + html.escape(str(finding.get('privilege_escalation_context', ''))) if finding.get('privilege_escalation_context') else ""}
@@ -521,10 +582,17 @@ def export_scan_result_html(
     ports = artifacts.get("ports", {"listening": [], "active_connections": [], "suspicious_review_needed": [], "errors": []})
     processes = artifacts.get("processes", {"all": [], "suspicious": [], "errors": []})
     localhost_scan = artifacts.get("localhost_scan", {})
+    nmap_scan = localhost_scan.get("nmap", {}) if isinstance(localhost_scan, dict) else {}
     packet_captures = artifacts.get("packet_captures", [])
     network_discovery = artifacts.get("network_discovery", {})
     apple_security_forecast = artifacts.get("apple_security_forecast", artifacts.get("cve_radar", {}))
     reliability = reliability or artifacts.get("reliability", {}) or {}
+    visibility_integrity = artifacts.get("visibility_integrity", {}) or {}
+    baseline_drift = artifacts.get("baseline_drift", {}) or {}
+    security_timeline = artifacts.get("security_timeline", {}) or {}
+    system_integrity = artifacts.get("system_integrity", {}) or {}
+    evidence_graph = artifacts.get("evidence_graph", {}) or {}
+    ioc_matches = artifacts.get("ioc_matches", {}) or {}
     if apple_security_forecast:
         production_cards = _production_forecast_cards(apple_security_forecast)
         apple_security_forecast = dict(apple_security_forecast)
@@ -535,6 +603,15 @@ def export_scan_result_html(
     intrusion_correlation = artifacts.get("intrusion_correlation", {})
     execution_evidence = execution_evidence_from_scan(scan_result)
     investigation_priorities = investigation_priorities or build_investigation_priority_report_from_scan(scan_result).to_dict()
+    if not security_timeline:
+        security_timeline = SecurityTimelineBuilder().build(
+            scan_result=scan_result,
+            monitor_events=background_monitor_events or [],
+            notes=investigation_notes or [],
+        )
+    if not evidence_graph:
+        evidence_graph = EvidenceGraphBuilder().build_from_scan_result(scan_result, monitor_events=background_monitor_events or []).to_dict()
+    framework_summary = framework_summary_for_findings(findings)
     score, score_label = score_from_findings(findings)
     severity_counts = summarize_findings_by_severity(findings)
     severity_cards = "".join(
@@ -553,6 +630,150 @@ def export_scan_result_html(
             ("Collector Errors", len(ports.get("errors", [])) + len(processes.get("errors", []))),
         ]
     )
+    visibility_components = visibility_integrity.get("components", []) if isinstance(visibility_integrity, dict) else []
+    visibility_summary_rows = "".join(
+        f"<tr><td>{html.escape(str(label))}</td><td>{html.escape(str(value))}</td></tr>"
+        for label, value in [
+            ("Overall Status", visibility_integrity.get("overall_status", "not recorded") if isinstance(visibility_integrity, dict) else "not recorded"),
+            ("Visibility Integrity Score", visibility_integrity.get("score", visibility_integrity.get("VisibilityIntegrityScore", "not recorded")) if isinstance(visibility_integrity, dict) else "not recorded"),
+            ("Degraded Components", len(visibility_integrity.get("degraded_components", [])) if isinstance(visibility_integrity, dict) else 0),
+            ("Failing Components", len(visibility_integrity.get("failing_components", [])) if isinstance(visibility_integrity, dict) else 0),
+        ]
+    )
+    visibility_component_rows = "".join(
+        f"""
+        <tr class="{severity_css_class('high' if item.get('status') == 'failing' else 'medium' if item.get('status') in {'degraded', 'disabled'} else 'info')}">
+          <td>{html.escape(str(item.get('component_name', '')))}</td>
+          <td>{html.escape(str(item.get('status', '')))}</td>
+          <td>{html.escape(str(item.get('last_success', '')))}</td>
+          <td>{html.escape(str(item.get('last_error', '')))}</td>
+          <td>{html.escape(str(item.get('evidence', '')))}</td>
+          <td>{html.escape(str(item.get('recommended_fix', '')))}</td>
+        </tr>
+        """
+        for item in visibility_components
+        if isinstance(item, dict)
+    ) or '<tr><td colspan="6">Visibility Integrity was not recorded for this report.</td></tr>'
+    baseline_drift_findings = baseline_drift.get("findings", []) if isinstance(baseline_drift, dict) else []
+    baseline_drift_summary_rows = "".join(
+        f"<tr><td>{html.escape(str(label))}</td><td>{html.escape(str(value))}</td></tr>"
+        for label, value in [
+            ("Baseline Available", "yes" if baseline_drift.get("baseline_available") else "no"),
+            ("Total Drift", baseline_drift.get("summary", {}).get("total", 0) if isinstance(baseline_drift.get("summary", {}), dict) else 0),
+            ("Review Recommended", baseline_drift.get("summary", {}).get("review_recommended", 0) if isinstance(baseline_drift.get("summary", {}), dict) else 0),
+            ("Suppressed Expected", baseline_drift.get("summary", {}).get("suppressed_expected", 0) if isinstance(baseline_drift.get("summary", {}), dict) else 0),
+        ]
+    )
+    baseline_drift_rows = "".join(
+        f"""
+        <tr class="{severity_css_class(str(item.get('severity', 'info')))}">
+          <td>{html.escape(str(item.get('category', '')))}</td>
+          <td>{html.escape(str(item.get('change_type', 'changed')))}</td>
+          <td>{html.escape(str(item.get('item_key', '')))}</td>
+          <td>{html.escape(json.dumps(json_safe(item.get('previous_state', '')), sort_keys=True)[:500])}</td>
+          <td>{html.escape(json.dumps(json_safe(item.get('current_state', '')), sort_keys=True)[:500])}</td>
+          <td>{html.escape(str(item.get('severity', '')))}</td>
+          <td>{html.escape(str(item.get('confidence', '')))}</td>
+          <td>{html.escape(str(item.get('why_it_matters', '')))}</td>
+          <td>{html.escape(str(item.get('recommended_verification', '')))}</td>
+        </tr>
+        """
+        for item in baseline_drift_findings
+        if isinstance(item, dict)
+    ) or '<tr><td colspan="9">No baseline drift requiring review was recorded.</td></tr>'
+    timeline_events = security_timeline.get("events", []) if isinstance(security_timeline, dict) else []
+    timeline_summary = security_timeline.get("summary", {}) if isinstance(security_timeline, dict) else {}
+    timeline_summary_rows = "".join(
+        f"<tr><td>{html.escape(str(label))}</td><td>{html.escape(str(value))}</td></tr>"
+        for label, value in [
+            ("Event Count", security_timeline.get("event_count", len(timeline_events)) if isinstance(security_timeline, dict) else 0),
+            ("First Event", timeline_summary.get("first_event", "") if isinstance(timeline_summary, dict) else ""),
+            ("Last Event", timeline_summary.get("last_event", "") if isinstance(timeline_summary, dict) else ""),
+            ("Sources", ", ".join(f"{key}: {value}" for key, value in sorted((timeline_summary.get("by_source", {}) if isinstance(timeline_summary, dict) else {}).items()))),
+        ]
+    )
+    timeline_rows = "".join(
+        f"""
+        <tr class="{severity_css_class(str(item.get('severity', 'info')))}">
+          <td>{html.escape(str(item.get('timestamp', '')))}</td>
+          <td>{html.escape(str(item.get('severity', '')))}</td>
+          <td>{html.escape(str(item.get('event_type', '')))}</td>
+          <td>{html.escape(str(item.get('source', '')))}</td>
+          <td>{html.escape(str(item.get('title', '')))}</td>
+          <td>{html.escape(str(item.get('summary', ''))[:700])}</td>
+          <td>{html.escape(', '.join(str(tag) for tag in item.get('tags', [])))}</td>
+        </tr>
+        """
+        for item in timeline_events
+        if isinstance(item, dict)
+    ) or '<tr><td colspan="7">No security timeline events recorded.</td></tr>'
+    system_integrity_findings = system_integrity.get("findings", []) if isinstance(system_integrity, dict) else []
+    system_integrity_summary_rows = "".join(
+        f"<tr><td>{html.escape(str(label))}</td><td>{html.escape(str(value))}</td></tr>"
+        for label, value in [
+            ("Finding Count", system_integrity.get("finding_count", len(system_integrity_findings)) if isinstance(system_integrity, dict) else 0),
+            ("Checks Run", ", ".join(str(item) for item in system_integrity.get("checks_run", [])) if isinstance(system_integrity, dict) else ""),
+            ("Generated At", system_integrity.get("generated_at", "") if isinstance(system_integrity, dict) else ""),
+        ]
+    )
+    system_integrity_rows = "".join(
+        f"""
+        <tr class="{severity_css_class(str(item.get('severity', 'info')))}">
+          <td>{html.escape(str(item.get('severity', '')))}</td>
+          <td>{html.escape(str(item.get('title', '')))}</td>
+          <td>{html.escape(str(item.get('confidence', '')))}</td>
+          <td>{html.escape(str(item.get('evidence', ''))[:700])}</td>
+          <td>{html.escape(str(item.get('false_positive_notes', '')))}</td>
+          <td>{html.escape(str(item.get('recommended_next_steps', item.get('remediation_suggestion', ''))))}</td>
+        </tr>
+        """
+        for item in system_integrity_findings
+        if isinstance(item, dict)
+    ) or '<tr><td colspan="6">No system integrity anomalies recorded.</td></tr>'
+    graph_nodes = evidence_graph.get("nodes", []) if isinstance(evidence_graph, dict) else []
+    graph_edges = evidence_graph.get("edges", []) if isinstance(evidence_graph, dict) else []
+    graph_summary_rows = "".join(
+        f"<tr><td>{html.escape(str(label))}</td><td>{html.escape(str(value))}</td></tr>"
+        for label, value in [
+            ("Nodes", evidence_graph.get("node_count", len(graph_nodes)) if isinstance(evidence_graph, dict) else 0),
+            ("Edges", evidence_graph.get("edge_count", len(graph_edges)) if isinstance(evidence_graph, dict) else 0),
+            ("Generated At", evidence_graph.get("generated_at", "") if isinstance(evidence_graph, dict) else ""),
+        ]
+    )
+    graph_node_rows = "".join(
+        f"<tr><td>{html.escape(str(item.get('node_type', '')))}</td><td>{html.escape(str(item.get('label', '')))}</td><td>{html.escape(str(item.get('summary', ''))[:500])}</td></tr>"
+        for item in graph_nodes[:100]
+        if isinstance(item, dict)
+    ) or '<tr><td colspan="3">No evidence graph nodes recorded.</td></tr>'
+    graph_edge_rows = "".join(
+        f"<tr><td>{html.escape(str(item.get('source_id', '')))}</td><td>{html.escape(str(item.get('edge_type', '')))}</td><td>{html.escape(str(item.get('target_id', '')))}</td><td>{html.escape(str(item.get('evidence', ''))[:500])}</td></tr>"
+        for item in graph_edges[:150]
+        if isinstance(item, dict)
+    ) or '<tr><td colspan="4">No evidence graph edges recorded.</td></tr>'
+    ioc_match_rows = "".join(
+        f"""
+        <tr>
+          <td>{html.escape(str(item.get('indicator', '')))}</td>
+          <td>{html.escape(str(item.get('indicator_type', '')))}</td>
+          <td>{html.escape(str(item.get('matched_value', '')))}</td>
+          <td>{html.escape(str(item.get('source', '')))}</td>
+          <td>{html.escape(str(item.get('confidence', '')))}</td>
+          <td>{html.escape(str(item.get('recommended_action', '')))}</td>
+        </tr>
+        """
+        for item in (ioc_matches.get("matches", []) if isinstance(ioc_matches, dict) else [])
+        if isinstance(item, dict)
+    ) or '<tr><td colspan="6">No offline IOC matches recorded.</td></tr>'
+    ioc_summary_rows = "".join(
+        f"<tr><td>{html.escape(str(label))}</td><td>{html.escape(str(value))}</td></tr>"
+        for label, value in [
+            ("Indicators Loaded", ioc_matches.get("indicators_loaded", 0) if isinstance(ioc_matches, dict) else 0),
+            ("Match Count", ioc_matches.get("match_count", 0) if isinstance(ioc_matches, dict) else 0),
+            ("Local Only", "yes" if (ioc_matches.get("local_only", True) if isinstance(ioc_matches, dict) else True) else "no"),
+            ("Upload Performed", "yes" if (ioc_matches.get("upload_performed", False) if isinstance(ioc_matches, dict) else False) else "no"),
+            ("Automatic Blocking", "yes" if (ioc_matches.get("blocking_performed", False) if isinstance(ioc_matches, dict) else False) else "no"),
+        ]
+    )
     findings_rows = "".join(
         f"""
         <tr class="{severity_css_class(finding.get('severity', 'info'))}">
@@ -563,6 +784,10 @@ def export_scan_result_html(
           <td>{html.escape(str(finding.get('evidence', '')))}</td>
           <td>{html.escape(str(finding.get('command_or_source', finding.get('command_used', ''))))}</td>
           <td>{html.escape(str(finding.get('recommended_next_steps', finding.get('remediation_suggestion', ''))))}
+          <br><br><strong>Framework Mappings:</strong><br>{html.escape(_framework_mapping_summary_text(finding))}
+          {"<br><br><strong>Technical Explanation:</strong><br>" + html.escape(str(finding.get('technical_explanation', ''))) if finding.get('technical_explanation') else ""}
+          {"<br><br><strong>Plain-English Explanation:</strong><br>" + html.escape(str(finding.get('plain_english_explanation', ''))) if finding.get('plain_english_explanation') else ""}
+          {"<br><br><strong>Analyst Next Step:</strong><br>" + html.escape(str(finding.get('analyst_next_step', ''))) if finding.get('analyst_next_step') else ""}
           {"<br><br><strong>Business Impact:</strong><br>" + html.escape(str(finding.get('business_impact', ''))) if finding.get('business_impact') else ""}
           {"<br><br><strong>Local Network Impact:</strong><br>" + html.escape(str(finding.get('local_network_impact', ''))) if finding.get('local_network_impact') else ""}
           {"<br><br><strong>Privilege Escalation:</strong><br>" + html.escape(str(finding.get('privilege_escalation_context', ''))) if finding.get('privilege_escalation_context') else ""}
@@ -589,6 +814,20 @@ def export_scan_result_html(
         """
         for finding in findings
     ) or '<tr><td colspan="10">No provenance data recorded.</td></tr>'
+    framework_summary_rows = "".join(
+        f"<tr><td>{html.escape(str(section))}</td><td>{html.escape(str(name))}</td><td>{html.escape(str(count))}</td></tr>"
+        for section, values in [
+            ("NIST CSF 2.0", framework_summary.get("nist_csf", {})),
+            ("MITRE ATT&CK macOS", framework_summary.get("mitre_attack_macos", {})),
+            ("NIST SP 800-53 Rev. 5", framework_summary.get("nist_800_53_controls", {})),
+            ("Top MITRE Techniques", framework_summary.get("top_mitre_techniques", {})),
+        ]
+        for name, count in (values or {}).items()
+    ) or '<tr><td colspan="3">No framework mappings recorded.</td></tr>'
+    unmapped_rows = "".join(
+        f"<tr><td>{html.escape(str(item.get('category', '')))}</td><td>{html.escape(str(item.get('title', '')))}</td></tr>"
+        for item in framework_summary.get("unmapped_findings", [])
+    ) or '<tr><td colspan="2">No unmapped findings.</td></tr>'
     investigation_priority_summary_rows = "".join(
         f"<tr><td>{html.escape(str(label))}</td><td>{html.escape(str(value))}</td></tr>"
         for label, value in [
@@ -698,6 +937,37 @@ def export_scan_result_html(
             ("Explanation", "This does not scan your network. It only attempts TCP/UDP localhost traffic to 127.0.0.1."),
         ]
     )
+    nmap_ports = nmap_scan.get("ports", []) if isinstance(nmap_scan, dict) else []
+    nmap_summary_rows = "".join(
+        f"<tr><td>{html.escape(label)}</td><td>{html.escape(value)}</td></tr>"
+        for label, value in [
+            ("Nmap Installed", "yes" if nmap_scan.get("installed") else "no"),
+            ("Nmap Path", str(nmap_scan.get("path", "")) or "unavailable"),
+            ("Scan Profile", str(nmap_scan.get("profile", "")) or str(nmap_scan.get("profiles", "")) or "not run"),
+            ("Target", str(nmap_scan.get("target", localhost_scan.get("target", "127.0.0.1")))),
+            ("Command Used", " | ".join(str(item) for item in nmap_scan.get("command_used", [])) if isinstance(nmap_scan.get("command_used"), list) else str(nmap_scan.get("command_used", ""))),
+            ("Sudo Required", "yes" if nmap_scan.get("sudo_required") else "no"),
+            ("Fallback Used", "yes" if nmap_scan.get("fallback_used") else "no"),
+            ("Warnings", "; ".join(str(item) for item in nmap_scan.get("warnings", [])) or "none"),
+            ("Errors", "; ".join(str(item) for item in nmap_scan.get("errors", [])) or "none"),
+        ]
+    )
+    nmap_port_rows = "".join(
+        f"""
+        <tr>
+          <td>{html.escape(str(item.get('protocol', '')))}</td>
+          <td>{html.escape(str(item.get('port', '')))}</td>
+          <td>{html.escape(str(item.get('state', '')))}</td>
+          <td>{html.escape(str(item.get('service', '')))}</td>
+          <td>{html.escape(str(item.get('product', '')))}</td>
+          <td>{html.escape(str(item.get('version', '')))}</td>
+          <td>{html.escape(str(item.get('reason', '')))}</td>
+          <td>{html.escape(str(item.get('confidence', '')))}</td>
+        </tr>
+        """
+        for item in nmap_ports
+    ) or '<tr><td colspan="8">No Nmap port findings recorded.</td></tr>'
+    nmap_credit = f"<p>{html.escape(NMAP_CREDIT_TEXT)} <a href=\"{html.escape(NMAP_URL)}\">{html.escape(NMAP_URL)}</a></p>" if nmap_scan and not nmap_scan.get("fallback_used") else ""
     packet_capture_rows = "".join(
         f"""
         <tr>
@@ -954,10 +1224,119 @@ def export_scan_result_html(
     <div class="metrics">{overview_cards}</div>
   </div>
   <div class="card">
+    <h2>Visibility Integrity</h2>
+    <p>This section reports whether MSAA could verify its own monitoring visibility when the report was generated. Failures are shown explicitly.</p>
+    <table>
+      <thead><tr><th>Field</th><th>Value</th></tr></thead>
+      <tbody>{visibility_summary_rows}</tbody>
+    </table>
+    <h3>Component Statuses</h3>
+    <table>
+      <thead><tr><th>Component</th><th>Status</th><th>Last Success</th><th>Last Error</th><th>Evidence</th><th>Recommended Fix</th></tr></thead>
+      <tbody>{visibility_component_rows}</tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h2>Baseline Drift</h2>
+    <p>Baseline drift reports what changed since the trusted baseline. Changes are review signals only and are not labeled malicious.</p>
+    <table>
+      <thead><tr><th>Field</th><th>Value</th></tr></thead>
+      <tbody>{baseline_drift_summary_rows}</tbody>
+    </table>
+    <h3>Drift Findings</h3>
+    <table>
+      <thead><tr><th>Category</th><th>Change</th><th>Item</th><th>Previous State</th><th>Current State</th><th>Severity</th><th>Confidence</th><th>Why It Matters</th><th>Recommended Verification</th></tr></thead>
+      <tbody>{baseline_drift_rows}</tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h2>Security Timeline</h2>
+    <p>Chronological analyst timeline built from monitor events, findings, baseline drift, exposure updates, evidence snapshots, notes, and alert pipeline failures.</p>
+    <table>
+      <thead><tr><th>Field</th><th>Value</th></tr></thead>
+      <tbody>{timeline_summary_rows}</tbody>
+    </table>
+    <h3>Events</h3>
+    <table>
+      <thead><tr><th>Timestamp</th><th>Severity</th><th>Type</th><th>Source</th><th>Title</th><th>Summary</th><th>Tags</th></tr></thead>
+      <tbody>{timeline_rows}</tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h2>System Integrity</h2>
+    <p>Evidence-based visibility and system integrity anomaly checks. This section does not claim malware or root-level compromise.</p>
+    <table>
+      <thead><tr><th>Field</th><th>Value</th></tr></thead>
+      <tbody>{system_integrity_summary_rows}</tbody>
+    </table>
+    <h3>Review Items</h3>
+    <table>
+      <thead><tr><th>Severity</th><th>Title</th><th>Confidence</th><th>Evidence</th><th>False Positive Notes</th><th>Next Verification Steps</th></tr></thead>
+      <tbody>{system_integrity_rows}</tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h2>Evidence Graph</h2>
+    <p>List-based relationship graph connecting findings, users, processes, persistence, files, devices, network endpoints, events, and snapshots.</p>
+    <table>
+      <thead><tr><th>Field</th><th>Value</th></tr></thead>
+      <tbody>{graph_summary_rows}</tbody>
+    </table>
+    <h3>Nodes</h3>
+    <table>
+      <thead><tr><th>Type</th><th>Label</th><th>Summary</th></tr></thead>
+      <tbody>{graph_node_rows}</tbody>
+    </table>
+    <h3>Edges</h3>
+    <table>
+      <thead><tr><th>From</th><th>Relationship</th><th>To</th><th>Evidence</th></tr></thead>
+      <tbody>{graph_edge_rows}</tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h2>Offline IOC Matching</h2>
+    <p>Local-only indicator matching. No telemetry upload, automatic blocking, or destructive remediation is performed.</p>
+    <table>
+      <thead><tr><th>Field</th><th>Value</th></tr></thead>
+      <tbody>{ioc_summary_rows}</tbody>
+    </table>
+    <h3>Matches</h3>
+    <table>
+      <thead><tr><th>Indicator</th><th>Type</th><th>Matched Value</th><th>Source</th><th>Confidence</th><th>Recommended Action</th></tr></thead>
+      <tbody>{ioc_match_rows}</tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h2>Nmap Local Scan</h2>
+    <table>
+      <thead><tr><th>Field</th><th>Value</th></tr></thead>
+      <tbody>{nmap_summary_rows}</tbody>
+    </table>
+    <h3>Parsed Ports</h3>
+    <table>
+      <thead><tr><th>Protocol</th><th>Port</th><th>State</th><th>Service</th><th>Product</th><th>Version</th><th>Reason</th><th>Confidence</th></tr></thead>
+      <tbody>{nmap_port_rows}</tbody>
+    </table>
+    {nmap_credit}
+  </div>
+  <div class="card">
     <h2>Findings</h2>
     <table>
       <thead><tr><th>Severity</th><th>Category</th><th>Title</th><th>Description</th><th>Evidence</th><th>Command/Source</th><th>Recommendations</th><th>What Can Go Wrong</th></tr></thead>
       <tbody>{findings_rows}</tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h2>Framework Summary</h2>
+    <p>Mappings are for analyst context and reporting support. They do not constitute certification, compliance, authorization, or an official assessment.</p>
+    <table>
+      <thead><tr><th>Framework</th><th>Mapping</th><th>Findings</th></tr></thead>
+      <tbody>{framework_summary_rows}</tbody>
+    </table>
+    <h3>Unmapped Findings</h3>
+    <table>
+      <thead><tr><th>Category</th><th>Finding</th></tr></thead>
+      <tbody>{unmapped_rows}</tbody>
     </table>
   </div>
   <div class="card">

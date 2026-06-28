@@ -1126,6 +1126,8 @@ class IncidentModeManager:
 
 
 def export_sarif(findings: list[Finding | dict[str, Any]], path: Path, *, redact_paths: bool = True) -> Path:
+    from mac_audit_agent.frameworks import mappings_for_finding
+
     rules: dict[str, dict[str, Any]] = {}
     results = []
     for finding in findings:
@@ -1150,6 +1152,7 @@ def export_sarif(findings: list[Finding | dict[str, Any]], path: Path, *, redact
         evidence = _sarif_text(payload.get("evidence", ""), redact_paths=redact_paths)
         recommendation = _sarif_text(payload.get("recommended_next_steps") or payload.get("remediation_suggestion") or "", redact_paths=redact_paths)
         source_detector = _sarif_text(payload.get("trigger_source") or payload.get("source_detector") or payload.get("command_used") or "", redact_paths=redact_paths)
+        framework_mappings = [mapping.to_dict() for mapping in mappings_for_finding(payload)]
         results.append(
             {
                 "ruleId": rule_id,
@@ -1160,6 +1163,10 @@ def export_sarif(findings: list[Finding | dict[str, Any]], path: Path, *, redact
                     "severity": severity,
                     "confidence": str(payload.get("confidence", "")),
                     "MITRE mapping": payload.get("mitre_mapping", payload.get("mitre", "")),
+                    "framework_mappings": framework_mappings,
+                    "nist_csf_functions": payload.get("nist_csf_functions", []),
+                    "nist_800_53_controls": payload.get("nist_800_53_controls", []),
+                    "mitre_attack_techniques": payload.get("mitre_attack_techniques", []),
                     "evidence": evidence,
                     "recommendation": recommendation,
                     "source_detector": source_detector,

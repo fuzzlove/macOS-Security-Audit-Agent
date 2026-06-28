@@ -77,6 +77,31 @@ def make_scan_result() -> ScanResult:
                 "missing_from_enumeration": [5353],
                 "errors": [],
                 "scanned_port_count": 12,
+                "engine": "nmap",
+                "nmap": {
+                    "installed": True,
+                    "path": "/opt/homebrew/bin/nmap",
+                    "profile": "Localhost TCP Quick",
+                    "target": "127.0.0.1",
+                    "command_used": ["nmap -sT -Pn -n --top-ports 1000 127.0.0.1 -oX -"],
+                    "ports": [
+                        {
+                            "host": "127.0.0.1",
+                            "port": 7000,
+                            "protocol": "tcp",
+                            "state": "open",
+                            "service": "http",
+                            "product": "dev server",
+                            "version": "1",
+                            "reason": "syn-ack",
+                            "confidence": "high",
+                        }
+                    ],
+                    "warnings": [],
+                    "errors": [],
+                    "sudo_required": False,
+                    "fallback_used": False,
+                },
             },
             "packet_captures": [
                 {
@@ -348,6 +373,10 @@ def test_scan_result_exports_include_logs_and_history(tmp_path: Path) -> None:
     assert "Report Summary" in html_content
     assert "macOS Security Audit Report" not in html_content
     assert "Johns-MacBook-Pro.local" in html_content
+    assert '"nmap_scan"' in json_content
+    assert "Nmap Project" in json_content
+    assert "Nmap Local Scan" in html_content
+    assert "https://nmap.org/" in html_content
     assert "likely_hostname" in json_content
     assert "Johns-MacBook-Pro.local" in json_content
     assert '"subnet": "192.168.1.0/24"' in json_content

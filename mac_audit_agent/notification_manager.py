@@ -382,6 +382,96 @@ class AlertDecision:
     persistent: bool
 
 
+@dataclass(frozen=True)
+class AlertQueueDecision:
+    allowed: bool
+    reason: str
+    cooldown_remaining: int = 0
+    grouped_count: int = 0
+
+
+class AlertQueueManager:
+    """Global grouping and cooldown gate for visible security alerts."""
+
+    DEFAULT_COOLDOWNS = {"info": 60, "low": 60, "medium": 30, "high": 30, "critical": 90}
+
+    def __init__(self, owner: "NotificationManager") -> None:
+        self.owner = owner
+        self.db = owner.db
+
+    def key_for(self, event: BackgroundMonitorEvent) -> str:
+        device_id = ""
+        try:
+            metadata = json.loads(event.metadata_json or "{}")
+            if isinstance(metadata, dict):
+                device_id = str(metadata.get("device_id") or metadata.get("serial") or metadata.get("address") or "")
+        except json.JSONDecodeError:
+            device_id = ""
+        source = getattr(event, "trigger_source", "") or event.source or ""
+        raw = f"{self.owner._canonical_event_type(event)}:{source}:{device_id or self.owner._alert_signature(event)}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def cooldown_for(self, event: BackgroundMonitorEvent) -> int:
+        severity = str(getattr(event, "severity", "info")).lower()
+        return self.DEFAULT_COOLDOWNS.get(severity, 60)
+
+    def evaluate(self, event: BackgroundMonitorEvent, *, force: bool = False) -> AlertQueueDecision:
+        self.db.set_background_monitor_state("alert_queue_manager_status", "active")
+        self.db.set_background_monitor_state("alert_queue_length", "1")
+        if force:
+            return AlertQueueDecision(True, "forced")
+        key = self.key_for(event)
+        now = datetime.fromisoformat(event.timestamp)
+        last_raw = self.db.get_background_monitor_state(f"alert_queue_last:{key}", "")
+        if not last_raw:
+            self.db.set_background_monitor_state(f"alert_queue_last:{key}", event.timestamp)
+            return AlertQueueDecision(True, "first_event")
+        try:
+            last = datetime.fromisoformat(last_raw)
+        except ValueError:
+            self.db.set_background_monitor_state(f"alert_queue_last:{key}", event.timestamp)
+            return AlertQueueDecision(True, "invalid_last_timestamp")
+        cooldown = self.cooldown_for(event)
+        elapsed = int((now - last).total_seconds())
+        if elapsed >= cooldown:
+            self.db.set_background_monitor_state(f"alert_queue_last:{key}", event.timestamp)
+            return AlertQueueDecision(True, "cooldown_elapsed")
+        count_key = f"alert_queue_grouped:{key}"
+        grouped = int(self.db.get_background_monitor_state(count_key, "0") or "0") + 1
+        self.db.set_background_monitor_state(count_key, str(grouped))
+        self.owner._increment_state_counter("alert_suppressed_total")
+        self.owner._increment_state_counter("alert_grouped_total")
+        self.owner._record_grouped_suppression(event, grouped)
+        return AlertQueueDecision(False, "grouped_within_cooldown", max(0, cooldown - elapsed), grouped)
+
+
+class AlertOverlayManager:
+    """Authoritative bottom-right alert renderer."""
+
+    def __init__(self, owner: "NotificationManager") -> None:
+        self.owner = owner
+
+    def render(self, event: BackgroundMonitorEvent, decision: AlertDecision, *, force: bool = False) -> bool:
+        queue_decision = self.owner.alert_queue.evaluate(event, force=force)
+        if not queue_decision.allowed:
+            event.cooldown_suppressed = True
+            event.last_suppression_reason = queue_decision.reason
+            event.cooldown_remaining_seconds = queue_decision.cooldown_remaining
+            self.owner._update_event_alert_trace(
+                event,
+                alert_required=bool(decision.show),
+                alert_suppressed=True,
+                alert_suppression_reason=queue_decision.reason,
+                overlay_dispatch_attempted=False,
+                overlay_dispatch_result="grouped",
+                overlay_error="",
+            )
+            self.owner.db.set_background_monitor_state("overlay_dispatch_result", "grouped")
+            self.owner.db.set_background_monitor_state("last_alert_failure_stage", f"rate_limiter:{queue_decision.reason}")
+            return False
+        return self.owner._dispatch_visible_alert(event, decision)
+
+
 def applescript_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
@@ -423,6 +513,8 @@ class NotificationManager:
         self.db = db
         self.runner = runner or subprocess.run
         self.popen_factory = popen_factory or subprocess.Popen
+        self.alert_queue = AlertQueueManager(self)
+        self.alert_overlay_manager = AlertOverlayManager(self)
         self._cfaa_ack_process = None
         self._cfaa_ack_session_key = ""
         self._cfaa_ack_last_attempt = 0.0
@@ -448,6 +540,10 @@ class NotificationManager:
             "popup_only_severe_events": self.db.get_background_monitor_state("popup_only_severe_events", "1") != "0",
             "browser_capture_process_popup": self.db.get_background_monitor_state("browser_capture_process_popup", "0") == "1",
             "show_visible_alerts": self.db.get_background_monitor_state("show_visible_alerts", "1") != "0",
+            "persistent_alerts": self.db.get_background_monitor_state("persistent_alerts", "1") != "0",
+            "critical_overlay_enabled": self.db.get_background_monitor_state("critical_overlay_enabled", "1") != "0",
+            "enable_alert_sounds": self.db.get_background_monitor_state("enable_alert_sounds", "0") == "1",
+            "os_notification_fallback_enabled": self.db.get_background_monitor_state("os_notification_fallback_enabled", "0") == "1",
             "show_physical_session_alerts": self.db.get_background_monitor_state("show_physical_session_alerts", "1") != "0",
             "show_usb_bluetooth_alerts": self.db.get_background_monitor_state("show_usb_bluetooth_alerts", "1") != "0",
             "show_network_change_alerts": self.db.get_background_monitor_state("show_network_change_alerts", "1") != "0",
@@ -472,6 +568,10 @@ class NotificationManager:
         popup_only_severe_events: bool = True,
         browser_capture_process_popup: bool = False,
         show_visible_alerts: bool = True,
+        persistent_alerts: bool = True,
+        critical_overlay_enabled: bool = True,
+        enable_alert_sounds: bool = False,
+        os_notification_fallback_enabled: bool = False,
         show_physical_session_alerts: bool = True,
         show_usb_bluetooth_alerts: bool = True,
         show_network_change_alerts: bool = True,
@@ -491,6 +591,10 @@ class NotificationManager:
         self.db.set_background_monitor_state("popup_only_severe_events", "1" if popup_only_severe_events else "0")
         self.db.set_background_monitor_state("browser_capture_process_popup", "1" if browser_capture_process_popup else "0")
         self.db.set_background_monitor_state("show_visible_alerts", "1" if show_visible_alerts else "0")
+        self.db.set_background_monitor_state("persistent_alerts", "1" if persistent_alerts else "0")
+        self.db.set_background_monitor_state("critical_overlay_enabled", "1" if critical_overlay_enabled else "0")
+        self.db.set_background_monitor_state("enable_alert_sounds", "1" if enable_alert_sounds else "0")
+        self.db.set_background_monitor_state("os_notification_fallback_enabled", "1" if os_notification_fallback_enabled else "0")
         self.db.set_background_monitor_state("show_physical_session_alerts", "1" if show_physical_session_alerts else "0")
         self.db.set_background_monitor_state("show_usb_bluetooth_alerts", "1" if show_usb_bluetooth_alerts else "0")
         self.db.set_background_monitor_state("show_network_change_alerts", "1" if show_network_change_alerts else "0")
@@ -516,6 +620,12 @@ class NotificationManager:
         preferences = self.event_preferences()
         default_cooldown = {"critical": 300, "high": 600, "medium": 0, "low": 0, "info": 0}
         preference = dict(preferences.get(event_type, {}))
+        if preference.get("enabled") is False:
+            preference.setdefault("severity", "low")
+            preference["notify"] = False
+            preference["notification_mode"] = "none"
+            preference.setdefault("cooldown_seconds", 0)
+            return preference
         mandatory = self._is_mandatory_visible_event(event_type)
         if mandatory:
             preference["severity"] = str(preference.get("severity") or ("critical" if event_type in {self._canonical_event_type(item) for item in MANDATORY_CRITICAL_EVENT_TYPES} else "high"))
@@ -534,11 +644,11 @@ class NotificationManager:
 
     def status(self) -> str:
         capabilities = self.capabilities()
-        if capabilities.overlay_available or capabilities.applescript_dialog_available:
-            if capabilities.notification_center_available:
-                return "security alerts ready (overlay, dialog, notification center)"
-            return "security alerts ready (overlay/dialog; notification center optional)"
-        return "security alerts unavailable"
+        if capabilities.overlay_available:
+            if self.db.get_background_monitor_state("os_notification_fallback_enabled", "0") == "1":
+                return "security alerts ready (AlertOverlayManager; OS fallback enabled)"
+            return "security alerts ready (AlertOverlayManager)"
+        return "security alerts degraded: AlertOverlayManager unavailable"
 
     def _notification_readiness_path(self) -> Path:
         return NOTIFICATION_READINESS_PATH
@@ -873,7 +983,9 @@ class NotificationManager:
             return "high_orange"
         if event_type in {"apple_security_forecast_elevated", "cve_forecast_level_increased"}:
             return "high_orange" if event.severity in {"high", "critical"} else "neutral_grey"
-        if category == "device" and event.severity in {"info", "medium"}:
+        if category == "device" and event.severity in {"info", "low"}:
+            return "neutral_grey"
+        if category == "device" and event.severity == "medium":
             return "high_orange"
         if category == "device":
             return "high_orange" if event_type != "new_usb_device_detected" else "critical_red"
@@ -899,6 +1011,8 @@ class NotificationManager:
             return AlertDecision(True, style, "forced_visible_alert", 0, bool(event.severity == "critical"))
         if not bool(settings.get("show_visible_alerts", True)):
             return AlertDecision(False, "neutral_grey", "visible alerts disabled", 0, False)
+        if event.severity == "critical" and not bool(settings.get("critical_overlay_enabled", True)):
+            return AlertDecision(False, "critical_red", "critical overlay disabled", 0, False)
         if not (getattr(event, "rule_id", "") or getattr(event, "trigger_rule_id", "")) and event.severity not in {"high", "critical"}:
             return AlertDecision(False, "neutral_grey", "missing rule_id", 0, False)
         if self._is_browser_helper_process(event) and not settings.get("browser_capture_process_popup", False):
@@ -926,49 +1040,52 @@ class NotificationManager:
             return AlertDecision(False, self._style_for_visible_alert(event, category=category), "log-only by default", 0, False)
 
         if self._is_idle_notice_event(event_type):
+            persistent = bool(settings.get("persistent_alerts", True))
             if not bool(settings.get("cfaa_idle_warning_enabled", True)):
-                return AlertDecision(False, "high_orange", "idle activity warning disabled", 0, True)
+                return AlertDecision(False, "high_orange", "idle activity warning disabled", 0, persistent)
             style = self._style_for_visible_alert(event, category=category)
-            cooldown = 600
+            cooldown = self.alert_queue.cooldown_for(event)
             last_timestamp = self.db.get_background_monitor_state(self._visible_alert_last_key(event), "")
             if last_timestamp:
                 try:
                     remaining = max(0, cooldown - int((datetime.fromisoformat(event.timestamp) - datetime.fromisoformat(last_timestamp)).total_seconds()))
                     if remaining > 0:
-                        return AlertDecision(False, style, "within_cooldown", remaining, True)
+                        return AlertDecision(False, style, "within_cooldown", remaining, persistent)
                 except ValueError:
                     pass
-            return AlertDecision(True, style, "idle activity after inactivity", cooldown, True)
+            return AlertDecision(True, style, "idle activity after inactivity", cooldown, persistent)
 
         if self._is_mandatory_visible_event(event_type):
+            persistent = event.severity == "critical" and bool(settings.get("persistent_alerts", True))
             style = self._style_for_visible_alert(event, category=category)
-            cooldown = int(settings.get("cooldown_seconds_per_category", 600) or 600)
+            cooldown = self.alert_queue.cooldown_for(event)
             last_timestamp = self.db.get_background_monitor_state(self._visible_alert_last_key(event), "")
             if last_timestamp:
                 try:
                     remaining = max(0, cooldown - int((datetime.fromisoformat(event.timestamp) - datetime.fromisoformat(last_timestamp)).total_seconds()))
                     if remaining > 0:
-                        return AlertDecision(False, style, "within_cooldown", remaining, event.severity == "critical")
+                        return AlertDecision(False, style, "within_cooldown", remaining, persistent)
                 except ValueError:
                     pass
-            return AlertDecision(True, style, f"{category} mandatory visible alert", cooldown, event.severity == "critical")
+            return AlertDecision(True, style, f"{category} mandatory visible alert", cooldown, persistent)
 
         if event.severity in {"medium", "high", "critical"}:
+            persistent = event.severity == "critical" and bool(settings.get("persistent_alerts", True))
             style = self._style_for_visible_alert(event, category=category)
-            cooldown = int(settings.get("cooldown_seconds_per_category", 600) or 600)
+            cooldown = self.alert_queue.cooldown_for(event)
             last_timestamp = self.db.get_background_monitor_state(self._visible_alert_last_key(event), "")
             if last_timestamp:
                 try:
                     remaining = max(0, cooldown - int((datetime.fromisoformat(event.timestamp) - datetime.fromisoformat(last_timestamp)).total_seconds()))
                     if remaining > 0:
-                        return AlertDecision(False, style, "within_cooldown", remaining, event.severity == "critical")
+                        return AlertDecision(False, style, "within_cooldown", remaining, persistent)
                 except ValueError:
                     pass
-            return AlertDecision(True, style, f"{category} severity alert", cooldown, event.severity == "critical")
+            return AlertDecision(True, style, f"{category} severity alert", cooldown, persistent)
 
         if event_type in VISIBLE_ALERT_CATEGORY_EVENT_TYPES["advisory"]:
             style = self._style_for_visible_alert(event, category=category)
-            cooldown = int(settings.get("cooldown_seconds_per_category", 600) or 600)
+            cooldown = self.alert_queue.cooldown_for(event)
             last_timestamp = self.db.get_background_monitor_state(self._visible_alert_last_key(event), "")
             if last_timestamp:
                 try:
@@ -981,7 +1098,7 @@ class NotificationManager:
 
         if category in {"physical_session", "device", "network", "persistence_admin"} and event.severity in {"info", "medium"}:
             style = self._style_for_visible_alert(event, category=category)
-            cooldown = int(settings.get("cooldown_seconds_per_category", 600) or 600)
+            cooldown = self.alert_queue.cooldown_for(event)
             last_timestamp = self.db.get_background_monitor_state(self._visible_alert_last_key(event), "")
             if last_timestamp:
                 try:
@@ -994,7 +1111,7 @@ class NotificationManager:
 
         if event_type in VISIBLE_ALERT_CATEGORY_EVENT_TYPES["physical_session"] | VISIBLE_ALERT_CATEGORY_EVENT_TYPES["device"] | VISIBLE_ALERT_CATEGORY_EVENT_TYPES["network"] | VISIBLE_ALERT_CATEGORY_EVENT_TYPES["persistence_admin"]:
             style = self._style_for_visible_alert(event, category=category)
-            cooldown = int(settings.get("cooldown_seconds_per_category", 600) or 600)
+            cooldown = self.alert_queue.cooldown_for(event)
             last_timestamp = self.db.get_background_monitor_state(self._visible_alert_last_key(event), "")
             if last_timestamp:
                 try:
@@ -1144,7 +1261,12 @@ class NotificationManager:
         explicit_preference = event.event_type in dict(settings.get("event_preferences", {}))
         severity_before_policy = str(event.severity)
         setattr(event, "_original_severity_for_alert", severity_before_policy)
-        effective_severity = str(preference.get("severity", event.severity))
+        preferred_severity = str(preference.get("severity", event.severity))
+        effective_severity = (
+            preferred_severity
+            if SEVERITY_LEVELS.get(preferred_severity, 0) >= SEVERITY_LEVELS.get(severity_before_policy, 0)
+            else severity_before_policy
+        )
         event.severity = effective_severity
         visible_alert = self.should_show_visible_alert(event, settings)
         event.visible_alert_shown = False
@@ -1349,8 +1471,7 @@ class NotificationManager:
             self._write_decision(decision)
             return decision
         min_level = SEVERITY_LEVELS.get(str(settings["notify_min_severity"]), 0)
-        allow_default_info = event.event_type in DEFAULT_EVENT_PREFERENCES and preference.get("notify", False) and preference.get("notification_mode", "none") != "none"
-        if SEVERITY_LEVELS.get(effective_severity, 0) < min_level and not allow_default_info:
+        if SEVERITY_LEVELS.get(effective_severity, 0) < min_level:
             event.notification_decision = "log_only"
             event.notification_reason = "below_min_severity"
             event.cooldown_remaining_seconds = 0
@@ -1481,23 +1602,28 @@ class NotificationManager:
         event.event_type = self._canonical_event_type(event)
         event.normalized_event_type = event.event_type
         if self._is_idle_notice_event(event):
-            self.show_visible_security_alert(event, reason="authorized_use_notice")
-            return self.notify_cfaa_idle_reminder(event, require_dialog=True)
+            overlay_shown = self.show_visible_security_alert(event, reason="authorized_use_notice", force=force)
+            return self.notify_cfaa_idle_reminder(event, require_dialog=False) if overlay_shown else (False, "alert delivery degraded: overlay unavailable")
         settings = self.settings()
         preference = self.preference_for(event.event_type)
         message = self._message(event)
         subtitle = "Security Event"
         priority = str(preference.get("severity", event.severity))
-        notification_mode = str(preference.get("notification_mode", settings.get("notification_mode", "notification")))
         attempts: list[tuple[list[str], object]] = []
-        self.show_visible_security_alert(event, reason=event.notification_reason or "policy")
-        if notification_mode in {"notification", "both"}:
+        overlay_shown = self.show_visible_security_alert(event, reason=event.notification_reason or "policy", force=force)
+        overlay_attempted = True
+        overlay_success = bool(getattr(event, "visible_alert_shown", False))
+        notification_mode = str(preference.get("notification_mode", settings.get("notification_mode", "none")))
+        fallback_enabled = bool(settings.get("os_notification_fallback_enabled", False))
+        if fallback_enabled and not overlay_shown and notification_mode in {"notification", "both"}:
             script = (
                 f'display notification "{applescript_escape(message)}" '
                 f'with title "{applescript_escape("Mac Audit Agent")}" '
                 f'subtitle "{applescript_escape(subtitle)}" '
-                f'sound name "{applescript_escape(self._sound_for(event, settings))}"'
             )
+            sound = self._sound_for(event, settings)
+            if sound:
+                script += f' sound name "{applescript_escape(sound)}"'
             command = [OSASCRIPT_BIN, "-e", script]
             result = _run_osascript_command(command, runner=self.runner, timeout=5)
             attempts.append((command, result))
@@ -1509,19 +1635,17 @@ class NotificationManager:
                 dialog_command, dialog_result = self._run_dialog_attempt(message)
                 attempts.append((dialog_command, dialog_result))
                 self._log_attempt(event, priority, dialog_command, dialog_result, getattr(dialog_result, "returncode", 1) == 0)
-        if notification_mode in {"dialog", "both"}:
+        if fallback_enabled and not overlay_shown and notification_mode in {"dialog", "both"}:
             dialog_command, dialog_result = self._run_dialog_attempt(message)
             attempts.append((dialog_command, dialog_result))
             self._log_attempt(event, priority, dialog_command, dialog_result, getattr(dialog_result, "returncode", 1) == 0)
-        overlay_attempted = True
-        overlay_success = bool(getattr(event, "visible_alert_shown", False))
         dialog_attempted = any("display dialog" in " ".join(command) for command, _result in attempts)
         dialog_success = any("display dialog" in " ".join(command) and getattr(result, "returncode", 1) == 0 for command, result in attempts)
         notification_attempted = any("display notification" in " ".join(command) for command, _result in attempts)
         notification_success = any("display notification" in " ".join(command) and getattr(result, "returncode", 1) == 0 for command, result in attempts)
         delivery_method_used = "overlay" if overlay_success else ("dialog" if dialog_success else ("notification_center" if notification_success else "none"))
         success = any(getattr(result, "returncode", 1) == 0 for _command, result in attempts)
-        if success:
+        if overlay_success or success:
             event.notification_sent = True
             event.notification_error = ""
             event.notification_returncode = 0
@@ -1529,28 +1653,8 @@ class NotificationManager:
                 self.db.set_background_monitor_state(self._last_key(event), event.timestamp)
                 self.db.set_background_monitor_state(self._legacy_last_key(event), event.timestamp)
                 self.db.set_background_monitor_state("notification_status", self.status())
-            self._record_alert_delivery(
-                event,
-                overlay_attempted=overlay_attempted,
-                overlay_success=overlay_success,
-                dialog_attempted=dialog_attempted,
-                dialog_success=dialog_success,
-                notification_attempted=notification_attempted,
-                notification_success=notification_success,
-                delivery_method_used=delivery_method_used,
-            )
-            return True, ""
-        if getattr(event, "visible_alert_shown", False):
-            event.notification_sent = True
-            event.notification_error = ""
-            event.notification_returncode = 0
-            if not force:
-                self.db.set_background_monitor_state(self._last_key(event), event.timestamp)
-                self.db.set_background_monitor_state(self._legacy_last_key(event), event.timestamp)
-                self.db.set_background_monitor_state("notification_status", self.status())
-            self._write_fallback_log(
-                f"notification fallback: type={event.event_type} detail=visible alert shown; OS notification path unavailable"
-            )
+            if overlay_success:
+                self.db.set_background_monitor_state("last_alert_failure_stage", "")
             self._record_alert_delivery(
                 event,
                 overlay_attempted=overlay_attempted,
@@ -1563,8 +1667,8 @@ class NotificationManager:
             )
             return True, ""
         result = attempts[-1][1] if attempts else None
-        detail = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "notification failed").strip()
-        if priority in {"high", "critical"}:
+        detail = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "alert delivery degraded: overlay unavailable").strip()
+        if priority in {"high", "critical"} and fallback_enabled:
             detail = (
                 f"{detail}\nmacOS notification may be disabled. Check System Settings > Notifications for Terminal/Python/osascript or the packaged app."
             ).strip()
@@ -1572,6 +1676,7 @@ class NotificationManager:
         event.notification_error = detail
         event.notification_returncode = getattr(result, "returncode", None)
         self.db.set_background_monitor_state("notification_status", f"failed: {detail}")
+        self.db.set_background_monitor_state("last_alert_failure_stage", "overlay_render")
         self.db.set_background_monitor_state("last_error", f"Notification failed for {event.event_type}: {detail}")
         self._write_fallback_log(f"notification error: type={event.event_type} detail={detail}")
         self._record_alert_delivery(
@@ -1588,16 +1693,17 @@ class NotificationManager:
 
     def update_security_overlay(self, event: BackgroundMonitorEvent) -> bool:
         decision = self.should_show_visible_alert(event)
-        return self._dispatch_visible_alert(event, decision)
+        return self.alert_overlay_manager.render(event, decision)
 
     def show_visible_security_alert(self, event: BackgroundMonitorEvent, reason: str = "", *, force: bool = False) -> bool:
         if reason:
             event.notification_reason = reason
         decision = self.should_show_visible_alert(event, force=force)
-        return self._dispatch_visible_alert(event, decision)
+        return self.alert_overlay_manager.render(event, decision, force=force)
 
     def _dispatch_visible_alert(self, event: BackgroundMonitorEvent, decision: AlertDecision) -> bool:
         self.db.set_background_monitor_state("overlay_dispatch_attempted", "1" if decision.show else "0")
+        self.db.set_background_monitor_state("alert_delivery_authority", "AlertOverlayManager")
         if not decision.show:
             event.visible_alert_shown = False
             self.db.set_background_monitor_state("overlay_dispatch_result", "skipped")
@@ -1630,6 +1736,7 @@ class NotificationManager:
             return False
         state_path = self._overlay_state_path()
         state_path.parent.mkdir(parents=True, exist_ok=True)
+        event.alert_style = decision.style
         previous = {}
         try:
             previous = json.loads(state_path.read_text(encoding="utf-8"))
@@ -1664,8 +1771,10 @@ class NotificationManager:
         except OSError as exc:
             event.visible_alert_shown = False
             self.db.set_background_monitor_state("overlay_dispatch_result", "FAILED")
+            self._increment_state_counter("overlay_render_attempts")
             self.db.set_background_monitor_state("last_overlay_exception", str(exc))
             self.db.set_background_monitor_state("last_overlay_error", str(exc))
+            self.db.set_background_monitor_state("last_alert_failure_stage", "overlay_state_write")
             self._record_alert_delivery(
                 event,
                 overlay_attempted=True,
@@ -1699,6 +1808,7 @@ class NotificationManager:
         self.db.set_background_monitor_state("suppressed_alert_count", self.db.get_background_monitor_state("suppressed_alert_count", "0"))
         self.db.set_background_monitor_state("last_suppression_reason", event.last_suppression_reason or decision.reason)
         launched = self._ensure_security_overlay_process()
+        self._increment_state_counter("overlay_render_attempts")
         event.visible_alert_shown = bool(launched)
         self.db.set_background_monitor_state("overlay_dispatch_result", "SUCCESS" if launched else "FAILED")
         self.db.set_background_monitor_state("overlay_manager_alive", "1" if launched or self._security_overlay_pid_alive() else "0")
@@ -1707,8 +1817,11 @@ class NotificationManager:
             self.db.set_background_monitor_state("overlay_error_count", str(count))
             self.db.set_background_monitor_state("last_overlay_exception", "overlay manager not running or failed to launch")
             self.db.set_background_monitor_state("last_overlay_error", "overlay manager not running or failed to launch")
+            self.db.set_background_monitor_state("last_alert_failure_stage", "overlay_process_launch")
         else:
+            self._increment_state_counter("overlay_render_successes")
             self.db.set_background_monitor_state("last_overlay_error", "")
+            self.db.set_background_monitor_state("last_alert_failure_stage", "")
             self.db.set_background_monitor_state("last_alert_displayed_at", event.timestamp)
             self.db.set_background_monitor_state(self._visible_alert_last_key(event), event.timestamp)
             self._play_visible_alert_sound(event)
@@ -1738,7 +1851,7 @@ class NotificationManager:
             overlay_dispatch_result="SUCCESS" if launched else "FAILED",
             overlay_error="" if launched else "overlay manager not running or failed to launch",
         )
-        return True
+        return bool(launched)
 
     def reconcile_security_overlay(self) -> bool:
         if self.db.get_background_monitor_state("security_overlay_enabled", "0") != "1":
@@ -1840,6 +1953,8 @@ class NotificationManager:
         )
 
     def _sound_for(self, event: BackgroundMonitorEvent, settings: dict[str, object]) -> str:
+        if not bool(settings.get("enable_alert_sounds", False)):
+            return ""
         if event.event_type in {"network_ip_assigned", "vpn_connected"}:
             return ""
         if event.event_type in {"usb_device_connected", "new_usb_device_detected"}:
@@ -1851,7 +1966,11 @@ class NotificationManager:
     def _play_visible_alert_sound(self, event: BackgroundMonitorEvent) -> None:
         if event.severity not in {"high", "critical"}:
             return
-        sound = self._sound_for(event, self.settings()).strip()
+        settings = self.settings()
+        if not bool(settings.get("enable_alert_sounds", False)):
+            self.db.set_background_monitor_state("last_visible_alert_sound", "")
+            return
+        sound = self._sound_for(event, settings).strip()
         if not sound:
             return
         sound_path = Path("/System/Library/Sounds") / f"{sound}.aiff"
@@ -1891,6 +2010,49 @@ class NotificationManager:
             f"overlay_dispatch_result={overlay_dispatch_result or 'unknown'} "
             f"overlay_error={overlay_error or ''}"
         )
+
+    def _increment_state_counter(self, key: str) -> int:
+        try:
+            value = int(self.db.get_background_monitor_state(key, "0") or "0") + 1
+        except ValueError:
+            value = 1
+        self.db.set_background_monitor_state(key, str(value))
+        return value
+
+    def _record_grouped_suppression(self, event: BackgroundMonitorEvent, grouped_count: int) -> None:
+        self.db.set_background_monitor_state("last_alert_grouped_event_type", event.event_type)
+        self.db.set_background_monitor_state("last_alert_grouped_at", event.timestamp)
+        self.db.set_background_monitor_state("last_alert_grouped_count", str(grouped_count))
+        try:
+            state_path = self._overlay_state_path()
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            if payload.get("active") and payload.get("event_type") == event.event_type:
+                payload["suppressed_count"] = int(payload.get("suppressed_count", 0) or 0) + 1
+                payload["grouped_message"] = f"{payload['suppressed_count']} similar events suppressed"
+                state_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        except (OSError, json.JSONDecodeError, ValueError):
+            return
+
+    def alert_system_health(self) -> dict[str, object]:
+        attempts = int(self.db.get_background_monitor_state("overlay_render_attempts", "0") or "0")
+        successes = int(self.db.get_background_monitor_state("overlay_render_successes", "0") or "0")
+        try:
+            active_cooldowns = int(self.db.conn.execute("SELECT COUNT(*) FROM background_monitor_state WHERE key LIKE 'alert_queue_last:%'").fetchone()[0])
+        except Exception:
+            active_cooldowns = 0
+        return {
+            "alert_overlay_manager_status": self.db.get_background_monitor_state("security_overlay_status", "inactive"),
+            "overlay_manager_alive": self.db.get_background_monitor_state("overlay_manager_alive", "0") == "1",
+            "queue_length": int(self.db.get_background_monitor_state("alert_queue_length", "0") or "0"),
+            "suppressed_alerts_count": int(self.db.get_background_monitor_state("alert_suppressed_total", "0") or "0"),
+            "grouped_alerts_count": int(self.db.get_background_monitor_state("alert_grouped_total", "0") or "0"),
+            "last_alert_rendered": self.db.get_background_monitor_state("last_alert_displayed_at", "never"),
+            "last_failed_render_reason": self.db.get_background_monitor_state("last_overlay_error", ""),
+            "last_failure_stage": self.db.get_background_monitor_state("last_alert_failure_stage", ""),
+            "active_cooldown_entries": active_cooldowns,
+            "rendering_success_rate": (successes / attempts) if attempts else 1.0,
+            "authoritative_delivery": "AlertOverlayManager",
+        }
 
     def _run_dialog_attempt(self, message: str) -> tuple[list[str], object]:
         script = (

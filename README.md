@@ -106,6 +106,10 @@ Adds more evidence detail without changing system state.
 
 Targets localhost-only port enumeration and related local checks. This is intentionally opt-in because it can be noisy.
 
+TCP/UDP scan functionality can optionally use Nmap as an external scanning engine. Nmap is a separate open-source project maintained by the Nmap Project. MSAA invokes Nmap locally as a wrapper when available.
+
+https://nmap.org/
+
 ## Evidence Preservation
 
 The platform prefers evidence preservation over cleanup.
