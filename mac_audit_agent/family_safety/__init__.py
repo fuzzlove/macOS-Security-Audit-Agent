@@ -7,21 +7,18 @@ import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 
+from mac_audit_agent.family_safety.categories import (
+    FamilySafetyCategory,
+    canonical_family_safety_categories,
+    category_score,
+    lockdown_plus_status,
+)
 
-SAFETY_CATEGORIES = [
-    "Account Safety",
-    "Screen Time",
-    "Content Restrictions",
-    "Privacy",
-    "Downloads",
-    "Messaging",
-    "Web Safety",
-    "Location Sharing",
-    "App Permissions",
-    "System Security",
-]
+
+SAFETY_CATEGORIES = [category.title for category in canonical_family_safety_categories()]
 
 STATUSES = {"configured", "partially_configured", "not_configured"}
 
@@ -74,6 +71,14 @@ class FamilySafetyReport:
     caregiver_dashboard: dict[str, Any]
     family_security_forecast: list[SafetyEducationCard]
     privacy_notice: list[str]
+    category_definitions: list[FamilySafetyCategory] = field(default_factory=list)
+    category_scores: dict[str, int] = field(default_factory=dict)
+    government_lockdown_score: int = 0
+    lockdown_plus_score: int = 0
+    lockdown_plus_status: str = "Review Required"
+    user_notes: dict[str, str] = field(default_factory=dict)
+    completed_actions: dict[str, list[str]] = field(default_factory=dict)
+    limitations: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -89,6 +94,14 @@ class FamilySafetyReport:
             "caregiver_dashboard": self.caregiver_dashboard,
             "family_security_forecast": [item.to_dict() for item in self.family_security_forecast],
             "privacy_notice": self.privacy_notice,
+            "category_definitions": [item.to_dict() for item in self.category_definitions],
+            "category_scores": self.category_scores,
+            "government_lockdown_score": self.government_lockdown_score,
+            "lockdown_plus_score": self.lockdown_plus_score,
+            "lockdown_plus_status": self.lockdown_plus_status,
+            "user_notes": self.user_notes,
+            "completed_actions": self.completed_actions,
+            "limitations": self.limitations,
         }
 
 
@@ -104,6 +117,10 @@ class FamilySafetyAuditor:
         app_review = self._app_review()
         all_scored = findings + accessibility + safe_browsing + app_review
         score = self._score(all_scored)
+        category_definitions = self._category_definitions(all_scored)
+        category_scores = {category.category_id: category_score(category, self._statuses_for_category(category, all_scored)) for category in category_definitions}
+        government_score = category_scores.get("government_nist_lockdown", 0)
+        lockdown_score = category_scores.get("lockdown_mode_plus", 0)
         return FamilySafetyReport(
             generated_at=datetime.now().isoformat(timespec="seconds"),
             score=score,
@@ -117,7 +134,89 @@ class FamilySafetyAuditor:
             caregiver_dashboard=self._caregiver_dashboard(score, findings, app_review),
             family_security_forecast=self.family_security_forecast(),
             privacy_notice=self.privacy_notice(),
+            category_definitions=category_definitions,
+            category_scores=category_scores,
+            government_lockdown_score=government_score,
+            lockdown_plus_score=lockdown_score,
+            lockdown_plus_status=lockdown_plus_status(lockdown_score),
+            completed_actions=self._completed_actions_by_category(all_scored),
+            limitations=[
+                "Family Control Center is defensive, local-first guidance. It does not inspect private messages, browser history, screenshots, keystrokes, camera feeds, microphone audio, or private browsing data.",
+                "NIST entries are mapped hardening guidance for review support only. This report does not claim compliance, certification, authorization, or approval for government use.",
+                "Lockdown Mode Plus does not replace Apple Lockdown Mode and cannot guarantee protection.",
+            ],
         )
+
+    def _category_definitions(self, findings: list[FamilySafetyFinding]) -> list[FamilySafetyCategory]:
+        categories = canonical_family_safety_categories()
+        status_by_title: dict[str, str] = {}
+        last_reviewed = datetime.now().isoformat(timespec="seconds")
+        for finding in findings:
+            status_by_title.setdefault(finding.category, finding.status)
+        aliases = {
+            "Screen Time": "Screen Time and Usage Controls",
+            "Content Restrictions": "Screen Time and Usage Controls",
+            "Privacy": "Privacy Permissions",
+            "Downloads": "Downloads and File Safety",
+            "Messaging": "Communication and Messaging Safety",
+            "Web Safety": "Web and Browser Safety",
+            "Location Sharing": "Privacy Permissions",
+            "App Permissions": "Privacy Permissions",
+            "Application Review": "App Store and Application Controls",
+            "Accessibility": "Special Needs and Accessibility Safety",
+            "System Security": "Government / NIST Lockdown Profile",
+        }
+        for category in categories:
+            statuses = self._statuses_for_category(category, findings, aliases)
+            if statuses:
+                category.current_status = self._rollup_status(statuses)
+                category.last_reviewed_at = last_reviewed
+            elif category.category_id in {"government_nist_lockdown", "lockdown_mode_plus"}:
+                category.current_status = "manual_verification_required"
+                category.last_reviewed_at = last_reviewed
+        return categories
+
+    def _statuses_for_category(
+        self,
+        category: FamilySafetyCategory,
+        findings: list[FamilySafetyFinding],
+        aliases: dict[str, str] | None = None,
+    ) -> list[str]:
+        aliases = aliases or {
+            "Screen Time": "Screen Time and Usage Controls",
+            "Content Restrictions": "Screen Time and Usage Controls",
+            "Privacy": "Privacy Permissions",
+            "Downloads": "Downloads and File Safety",
+            "Messaging": "Communication and Messaging Safety",
+            "Web Safety": "Web and Browser Safety",
+            "Location Sharing": "Privacy Permissions",
+            "App Permissions": "Privacy Permissions",
+            "Application Review": "App Store and Application Controls",
+            "Accessibility": "Special Needs and Accessibility Safety",
+            "System Security": "Government / NIST Lockdown Profile",
+        }
+        statuses = []
+        for finding in findings:
+            mapped_title = aliases.get(finding.category, finding.category)
+            if mapped_title == category.title:
+                statuses.append(finding.status)
+        if category.category_id == "lockdown_mode_plus":
+            statuses.append("manual_verification_required")
+        return statuses
+
+    def _rollup_status(self, statuses: list[str]) -> str:
+        if any(status == "not_configured" for status in statuses):
+            return "needs_review"
+        if any(status in {"partially_configured", "manual_verification_required"} for status in statuses):
+            return "manual_verification_required"
+        return "configured"
+
+    def _completed_actions_by_category(self, findings: list[FamilySafetyFinding]) -> dict[str, list[str]]:
+        completed: dict[str, list[str]] = {}
+        for finding in findings:
+            if finding.status == "configured":
+                completed.setdefault(finding.category, []).append(finding.title)
+        return completed
 
     def _child_safety_findings(self) -> list[FamilySafetyFinding]:
         return [
@@ -359,6 +458,9 @@ def export_family_safety_html(report: FamilySafetyReport, output_path: Path | No
     completed = [item for item in findings if item.get("status") == "configured"]
     education = payload["education_cards"]
     privacy = payload["privacy_notice"]
+    categories = payload.get("category_definitions", [])
+    category_scores = payload.get("category_scores", {})
+    limitations = payload.get("limitations", [])
 
     def rows(items: list[dict[str, Any]], fields: list[str]) -> str:
         rendered = []
@@ -392,6 +494,23 @@ def export_family_safety_html(report: FamilySafetyReport, output_path: Path | No
   </div>
   <h2>Recommended Improvements</h2>
   <ul>{''.join(f'<li>{html.escape(str(item))}</li>' for item in score.get("recommended_improvements", []))}</ul>
+  <h2>Family Control Center Categories</h2>
+  <p>These sections are plain-language local review guidance. NIST references are NIST-aligned mappings for review support only.</p>
+  <table><tr><th>Category</th><th>Score</th><th>Status</th><th>Description</th><th>Why It Matters</th><th>Recommended Changes</th></tr>{rows([
+      {
+          "title": item.get("title", ""),
+          "score": category_scores.get(item.get("category_id", ""), ""),
+          "current_status": item.get("current_status", ""),
+          "short_description": item.get("short_description", ""),
+          "why_it_matters": item.get("why_it_matters", ""),
+          "what_the_user_can_change": "; ".join(item.get("what_the_user_can_change", [])),
+      }
+      for item in categories
+  ], ["title", "score", "current_status", "short_description", "why_it_matters", "what_the_user_can_change"])}</table>
+  <h2>Government / NIST Lockdown Profile</h2>
+  <p>Government Lockdown Score: {html.escape(str(payload.get("government_lockdown_score", 0)))}/100. This is hardening guidance mapped to NIST references and does not claim compliance or certification.</p>
+  <h2>Lockdown Mode Plus</h2>
+  <p>Lockdown Plus Score: {html.escape(str(payload.get("lockdown_plus_score", 0)))}/100. Status: {html.escape(str(payload.get("lockdown_plus_status", "")))}. Lockdown Mode Plus complements Apple Lockdown Mode guidance but does not replace it.</p>
   <h2>Completed Actions</h2>
   <ul>{''.join(f'<li>{html.escape(str(item.get("title", "")))}</li>' for item in completed)}</ul>
   <h2>Missing or Needs Review</h2>
@@ -400,9 +519,125 @@ def export_family_safety_html(report: FamilySafetyReport, output_path: Path | No
   <table><tr><th>Category</th><th>Check</th><th>Status</th><th>Guidance</th></tr>{rows(findings, ["category", "title", "status", "recommendation"])}</table>
   <h2>Online Safety Guidance</h2>
   <table><tr><th>Topic</th><th>Guidance</th><th>Action</th></tr>{rows(education, ["topic", "guidance", "action"])}</table>
+  <h2>Limitations</h2>
+  <ul>{''.join(f'<li>{html.escape(str(item))}</li>' for item in limitations)}</ul>
 </body>
 </html>
 """,
         encoding="utf-8",
     )
+    return output_path
+
+
+def export_family_safety_word(report: FamilySafetyReport, output_path: Path | None = None) -> Path:
+    try:
+        from docx import Document
+    except ImportError as exc:
+        raise RuntimeError("Word export requires python-docx. Install project dependencies including python-docx to create .docx reports.") from exc
+    output_path = output_path or default_family_safety_report_path(suffix="docx")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = report.to_dict()
+    doc = Document()
+    doc.add_heading("Family Safety Report", 0)
+    doc.add_paragraph(f"Generated locally: {payload.get('generated_at', '')}")
+    doc.add_paragraph(f"Family Safety Score: {payload.get('score', {}).get('score', '--')}/100")
+    doc.add_heading("Privacy Notice", 1)
+    for item in payload.get("privacy_notice", []):
+        doc.add_paragraph(str(item), style="List Bullet")
+    doc.add_heading("Family Control Center Categories", 1)
+    for category in payload.get("category_definitions", []):
+        doc.add_heading(str(category.get("title", "")), 2)
+        doc.add_paragraph(str(category.get("short_description", "")))
+        doc.add_paragraph(f"Status: {category.get('current_status', '')}")
+        doc.add_paragraph(f"Why this matters: {category.get('why_it_matters', '')}")
+        doc.add_paragraph("Recommended changes:")
+        for item in category.get("what_the_user_can_change", []):
+            doc.add_paragraph(str(item), style="List Bullet")
+    doc.add_heading("Government / NIST Lockdown Profile", 1)
+    doc.add_paragraph(
+        f"Government Lockdown Score: {payload.get('government_lockdown_score', 0)}/100. "
+        "This is NIST-aligned hardening guidance for review support only."
+    )
+    doc.add_heading("Lockdown Mode Plus", 1)
+    doc.add_paragraph(
+        f"Lockdown Plus Score: {payload.get('lockdown_plus_score', 0)}/100. "
+        f"Status: {payload.get('lockdown_plus_status', '')}. "
+        "This complements Apple Lockdown Mode guidance but does not replace it."
+    )
+    doc.add_heading("Limitations", 1)
+    for item in payload.get("limitations", []):
+        doc.add_paragraph(str(item), style="List Bullet")
+    with NamedTemporaryFile(prefix=output_path.stem, suffix=".tmp.docx", dir=output_path.parent, delete=False) as handle:
+        temp_path = Path(handle.name)
+    try:
+        doc.save(temp_path)
+        temp_path.replace(output_path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+    return output_path
+
+
+def export_family_safety_excel(report: FamilySafetyReport, output_path: Path | None = None) -> Path:
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font, PatternFill
+    except ImportError as exc:
+        raise RuntimeError("Excel export requires openpyxl. Install project dependencies including openpyxl to create .xlsx reports.") from exc
+    output_path = output_path or default_family_safety_report_path(suffix="xlsx")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = report.to_dict()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Family Summary"
+    ws.append(["Field", "Value"])
+    ws.append(["Family Safety Score", payload.get("score", {}).get("score", "")])
+    ws.append(["Government Lockdown Score", payload.get("government_lockdown_score", 0)])
+    ws.append(["Lockdown Plus Score", payload.get("lockdown_plus_score", 0)])
+    ws.append(["Lockdown Plus Status", payload.get("lockdown_plus_status", "")])
+    categories_ws = wb.create_sheet("Categories")
+    columns = ["category_id", "title", "current_status", "score", "short_description", "why_it_matters", "recommended_changes", "nist_mappings"]
+    categories_ws.append(columns)
+    scores = payload.get("category_scores", {})
+    for category in payload.get("category_definitions", []):
+        categories_ws.append(
+            [
+                category.get("category_id", ""),
+                category.get("title", ""),
+                category.get("current_status", ""),
+                scores.get(category.get("category_id", ""), ""),
+                category.get("short_description", ""),
+                category.get("why_it_matters", ""),
+                "; ".join(category.get("what_the_user_can_change", [])),
+                "; ".join(category.get("nist_mappings", [])),
+            ]
+        )
+    checklist_ws = wb.create_sheet("Checklist")
+    checklist_ws.append(["Category", "Checklist Item"])
+    for category in payload.get("category_definitions", []):
+        for item in category.get("checklist_items", []):
+            checklist_ws.append([category.get("title", ""), item])
+    limitations_ws = wb.create_sheet("Limitations")
+    limitations_ws.append(["Limitation"])
+    for item in payload.get("limitations", []):
+        limitations_ws.append([item])
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    for sheet in wb.worksheets:
+        for cell in sheet[1]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = header_fill
+        for row in sheet.iter_rows():
+            for cell in row:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+        for column_cells in sheet.columns:
+            width = min(60, max(12, max(len(str(cell.value or "")) for cell in column_cells[:100]) + 2))
+            sheet.column_dimensions[column_cells[0].column_letter].width = width
+    with NamedTemporaryFile(prefix=output_path.stem, suffix=".tmp.xlsx", dir=output_path.parent, delete=False) as handle:
+        temp_path = Path(handle.name)
+    try:
+        wb.save(temp_path)
+        temp_path.replace(output_path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
     return output_path

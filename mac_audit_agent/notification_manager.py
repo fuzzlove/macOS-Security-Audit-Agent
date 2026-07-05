@@ -11,11 +11,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from mac_audit_agent.alert_styles import get_alert_style, validate_alert_styles
 from mac_audit_agent.models import AlertDeliveryRecord, BackgroundMonitorEvent, EventAlertTrace, NotificationCapabilities, utc_now_iso
 from mac_audit_agent.rules import canonical_event_type, rule_for_event
 
 
 SEVERITY_LEVELS = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+ALERT_SEVERITIES = {"info", "low", "medium", "high", "critical"}
 OSASCRIPT_BIN = "/usr/bin/osascript"
 NOTIFICATION_PATH_ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}
 IMPORTANT_EVENT_TYPES = {
@@ -51,6 +53,10 @@ IMPORTANT_EVENT_TYPES = {
     "major_security_event",
     "monitor_self_impact_warning",
     "monitor_self_test",
+    "user_notifier_integrity_mismatch",
+    "integrity_modified",
+    "integrity_missing_files",
+    "integrity_extra_files",
 }
 ACTIVITY_OVERLAY_EVENT_TYPES = {
     "bluetooth_device_connected",
@@ -69,6 +75,7 @@ ACTIVITY_OVERLAY_EVENT_TYPES = {
     "possible_lid_closed",
     "possible_lid_opened",
     "protected_monitor_tamper_detected",
+    "user_notifier_integrity_mismatch",
     "screen_locked",
     "screen_unlocked",
     "system_moisture_detected",
@@ -97,6 +104,21 @@ MANDATORY_VISIBLE_ALERT_EVENT_TYPES = {
     "usb_device_removed",
     "new_usb_device_detected",
     "usb_inventory_changed",
+    "trusted_usb_device_connected",
+    "untrusted_usb_device_connected",
+    "usb_device_reconnected",
+    "usb_device_changed",
+    "usb_storage_device_connected",
+    "usb_hid_device_connected",
+    "usb_keyboard_connected",
+    "usb_mouse_connected",
+    "usb_trackpad_connected",
+    "usb_network_adapter_connected",
+    "usb_camera_connected",
+    "usb_microphone_connected",
+    "usb_unknown_class_connected",
+    "physical_device_connected",
+    "physical_device_removed",
     "bluetooth_device_connected",
     "bluetooth_device_disconnected",
     "bluetooth_activity_started",
@@ -104,6 +126,7 @@ MANDATORY_VISIBLE_ALERT_EVENT_TYPES = {
     "bluetooth_inventory_changed",
     "unknown_hid_device_detected",
     "new_network_connection_detected",
+    "new_network_connection",
     "network_interface_connected",
     "network_interface_disconnected",
     "new_outbound_connection_detected",
@@ -113,7 +136,12 @@ MANDATORY_VISIBLE_ALERT_EVENT_TYPES = {
     "vpn_connected",
     "vpn_disconnected",
     "new_gateway_detected",
+    "gateway_changed",
     "new_dns_server_detected",
+    "dns_changed",
+    "vpn_changed",
+    "proxy_changed",
+    "network_visibility_mismatch",
     "remote_login_enabled",
     "screen_sharing_enabled",
     "new_admin_user_detected",
@@ -125,6 +153,10 @@ MANDATORY_VISIBLE_ALERT_EVENT_TYPES = {
     "login_item_added",
     "persistence_item_created_high_risk",
     "protected_monitor_tamper_detected",
+    "user_notifier_integrity_mismatch",
+    "integrity_modified",
+    "integrity_missing_files",
+    "integrity_extra_files",
     "mitre_persistence_method_detected",
     "possible_shellcode_memory_detected",
     "unexpected_process_execution",
@@ -141,6 +173,7 @@ MANDATORY_VISIBLE_ALERT_EVENT_TYPES = {
     "localhost_hidden_port_detected",
     "port_open_no_process_owner",
     "new_listener_detected",
+    "new_listening_port",
     "reverse_shell_pattern_detected",
     "persistence_after_execution",
     "admin_change_after_execution",
@@ -194,6 +227,19 @@ MANDATORY_CRITICAL_EVENT_TYPES = {
     "db_not_updating",
     "notifier_not_running",
 }
+MANDATORY_USB_VISIBLE_EVENT_TYPES = {
+    "new_usb_device_detected",
+    "untrusted_usb_device_connected",
+    "usb_storage_device_connected",
+    "usb_hid_device_connected",
+    "usb_keyboard_connected",
+    "usb_mouse_connected",
+    "usb_trackpad_connected",
+    "usb_network_adapter_connected",
+    "usb_camera_connected",
+    "usb_microphone_connected",
+    "usb_unknown_class_connected",
+}
 CRITICAL_POPUP_ALLOWLIST = {
     "camera_activity_confirmed",
     "camera_activity_started",
@@ -232,56 +278,76 @@ BROWSER_HELPER_KEYWORDS = {
     "audio service",
 }
 DEFAULT_EVENT_PREFERENCES: dict[str, dict[str, object]] = {
-    "new_admin_user_detected": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "both"},
-    "startup_daemon_added_system": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "both"},
-    "persistence_item_created_high_risk": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "both"},
-    "hidden_localhost_port_detected": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "both"},
-    "suspicious_root_process_observed": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "both"},
-    "launchdaemon_added": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "both"},
-    "alert_storm_detected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 300, "notification_mode": "dialog"},
-    "camera_activity_confirmed": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "dialog"},
+    "new_admin_user_detected": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "startup_daemon_added_system": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "persistence_item_created_high_risk": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "hidden_localhost_port_detected": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "suspicious_root_process_observed": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "launchdaemon_added": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "alert_storm_detected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "camera_activity_confirmed": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
     "camera_activity_stopped": {"enabled": True, "severity": "info", "notify": False, "cooldown_seconds": 60, "notification_mode": "none"},
     "camera_activity_suspected": {"enabled": True, "severity": "medium", "notify": False, "cooldown_seconds": 120, "notification_mode": "none"},
     "microphone_activity_suspected": {"enabled": True, "severity": "medium", "notify": False, "cooldown_seconds": 120, "notification_mode": "none"},
-    "possible_lid_opened": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "dialog"},
-    "possible_lid_closed": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "dialog"},
-    "lid_opened": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "dialog"},
-    "lid_closed": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "dialog"},
-    "user_logged_in": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "dialog"},
-    "user_logged_out": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "dialog"},
-    "screen_unlocked": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "dialog"},
-    "screen_locked": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "dialog"},
-    "remote_login_enabled": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "dialog"},
-    "screen_sharing_enabled": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "dialog"},
+    "possible_lid_opened": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "possible_lid_closed": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "lid_opened": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "lid_closed": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "user_logged_in": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "user_logged_out": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "screen_unlocked": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "screen_locked": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "remote_login_enabled": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "screen_sharing_enabled": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
     "suspicious_process_observed": {"enabled": True, "severity": "high", "notify": False, "cooldown_seconds": 600, "notification_mode": "none"},
-    "launchagent_added": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "dialog"},
-    "persistence_item_created": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "dialog"},
-    "major_security_event": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "dialog"},
-    "display_sleep": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 120, "notification_mode": "notification"},
-    "display_wake": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 120, "notification_mode": "notification"},
+    "launchagent_added": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "persistence_item_created": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "major_security_event": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "display_sleep": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 120, "notification_mode": "overlay"},
+    "display_wake": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 120, "notification_mode": "overlay"},
     "screen_locked_state_changed": {"enabled": True, "severity": "medium", "notify": False, "cooldown_seconds": 0, "notification_mode": "none"},
     "file_sharing_enabled": {"enabled": True, "severity": "medium", "notify": False, "cooldown_seconds": 0, "notification_mode": "none"},
-    "input_activity_resumed_after_idle": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 300, "notification_mode": "dialog"},
-    "idle_resume_detected": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 300, "notification_mode": "dialog"},
-    "mouse_or_keyboard_activity_after_idle": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 300, "notification_mode": "dialog"},
-    "input_activity_after_idle": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 300, "notification_mode": "dialog"},
-    "hid_activity_after_idle": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 300, "notification_mode": "dialog"},
+    "input_activity_resumed_after_idle": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "idle_resume_detected": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "mouse_or_keyboard_activity_after_idle": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "input_activity_after_idle": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "hid_activity_after_idle": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
     "input_activity_idle_started": {"enabled": True, "severity": "info", "notify": False, "cooldown_seconds": 120, "notification_mode": "none"},
-    "usb_device_connected": {"enabled": True, "severity": "info", "notify": True, "cooldown_seconds": 0, "notification_mode": "notification"},
-    "usb_device_removed": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 60, "notification_mode": "notification"},
-    "new_usb_device_detected": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 0, "notification_mode": "both"},
-    "system_moisture_detected": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "both"},
-    "protected_monitor_tamper_detected": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "dialog"},
-    "mitre_persistence_method_detected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 300, "notification_mode": "dialog"},
-    "possible_shellcode_memory_detected": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "dialog"},
-    "monitor_self_impact_warning": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 900, "notification_mode": "dialog"},
-    "network_ip_assigned": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 0, "notification_mode": "notification"},
-    "network_interface_connected": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 0, "notification_mode": "notification"},
-    "network_interface_disconnected": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 0, "notification_mode": "notification"},
-    "vpn_connected": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 0, "notification_mode": "notification"},
-    "bluetooth_device_connected": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 60, "notification_mode": "notification"},
-    "bluetooth_device_disconnected": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 60, "notification_mode": "notification"},
-    "unknown_hid_device_detected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 60, "notification_mode": "dialog"},
+    "usb_device_connected": {"enabled": True, "severity": "info", "notify": True, "cooldown_seconds": 0, "notification_mode": "overlay"},
+    "usb_device_removed": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 60, "notification_mode": "overlay"},
+    "usb_inventory_changed": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 120, "notification_mode": "overlay"},
+    "trusted_usb_device_connected": {"enabled": True, "severity": "info", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "untrusted_usb_device_connected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 120, "notification_mode": "overlay"},
+    "usb_device_reconnected": {"enabled": True, "severity": "info", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "usb_device_changed": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 120, "notification_mode": "overlay"},
+    "new_usb_device_detected": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "usb_storage_device_connected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "usb_hid_device_connected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "usb_keyboard_connected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "usb_mouse_connected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "usb_trackpad_connected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "usb_network_adapter_connected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 120, "notification_mode": "overlay"},
+    "usb_camera_connected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "usb_microphone_connected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "usb_unknown_class_connected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "system_moisture_detected": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "protected_monitor_tamper_detected": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "user_notifier_integrity_mismatch": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "integrity_verified": {"enabled": True, "severity": "info", "notify": False, "cooldown_seconds": 300, "notification_mode": "none"},
+    "integrity_modified": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "integrity_missing_files": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "integrity_extra_files": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "integrity_stale_manifest": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 900, "notification_mode": "overlay"},
+    "mitre_persistence_method_detected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "possible_shellcode_memory_detected": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "monitor_self_impact_warning": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 900, "notification_mode": "overlay"},
+    "network_ip_assigned": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 0, "notification_mode": "overlay"},
+    "network_interface_connected": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 0, "notification_mode": "overlay"},
+    "network_interface_disconnected": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 0, "notification_mode": "overlay"},
+    "vpn_connected": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 0, "notification_mode": "overlay"},
+    "bluetooth_device_connected": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 60, "notification_mode": "overlay"},
+    "bluetooth_device_disconnected": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 60, "notification_mode": "overlay"},
+    "unknown_hid_device_detected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 60, "notification_mode": "overlay"},
     "capture_capable_process_observed": {"enabled": True, "severity": "medium", "notify": False, "cooldown_seconds": 120, "notification_mode": "none"},
     "capture_capable_process_closed": {"enabled": True, "severity": "info", "notify": False, "cooldown_seconds": 60, "notification_mode": "none"},
 }
@@ -296,7 +362,7 @@ CFAA_ACK_MESSAGE = (
     "Security indicators are logged locally. This reminder is not legal advice or a legal determination.\n\n"
     "Click Acknowledge to confirm that you understand this authorized-use reminder."
 )
-OVERLAY_SEVERITIES = {"info", "medium", "high", "critical"}
+OVERLAY_SEVERITIES = ALERT_SEVERITIES
 OVERLAY_STATE_PATH = Path.home() / ".mac_audit_agent" / "state" / "security_overlay.json"
 OVERLAY_PID_PATH = Path.home() / ".mac_audit_agent" / "state" / "security_overlay.pid"
 NOTIFICATION_READINESS_PATH = Path.home() / "Library" / "Application Support" / "MacAuditAgent" / "notification_readiness.json"
@@ -329,26 +395,55 @@ VISIBLE_ALERT_CATEGORY_EVENT_TYPES = {
         "usb_device_removed",
         "new_usb_device_detected",
         "usb_inventory_changed",
+        "trusted_usb_device_connected",
+        "untrusted_usb_device_connected",
+        "usb_device_reconnected",
+        "usb_device_changed",
+        "usb_storage_device_connected",
+        "usb_hid_device_connected",
+        "usb_keyboard_connected",
+        "usb_mouse_connected",
+        "usb_trackpad_connected",
+        "usb_network_adapter_connected",
+        "usb_camera_connected",
+        "usb_microphone_connected",
+        "usb_unknown_class_connected",
+        "physical_device_connected",
+        "physical_device_removed",
         "current_usb_device_inventory_changed",
         "bluetooth_device_connected",
         "bluetooth_device_disconnected",
         "bluetooth_activity_started",
         "bluetooth_activity_stopped",
         "bluetooth_inventory_changed",
+        "unknown_bluetooth_device_detected",
         "unknown_hid_device_detected",
     },
     "network": {
         "new_network_connection_detected",
+        "new_network_connection",
         "network_interface_connected",
         "network_interface_disconnected",
         "network_ip_assigned",
         "new_ip_assigned",
         "new_outbound_connection_detected",
         "new_inbound_connection_detected",
+        "suspicious_network_connection_detected",
+        "suspicious_connection_detected",
+        "hidden_localhost_port_detected",
+        "localhost_hidden_port_detected",
+        "localhost_visibility_mismatch_detected",
+        "network_visibility_mismatch",
         "vpn_connected",
         "vpn_disconnected",
+        "vpn_changed",
+        "proxy_changed",
         "new_gateway_detected",
+        "gateway_changed",
         "new_dns_server_detected",
+        "dns_changed",
+        "new_listener_detected",
+        "new_listening_port",
     },
     "persistence_admin": {
         "new_admin_user_detected",
@@ -362,6 +457,11 @@ VISIBLE_ALERT_CATEGORY_EVENT_TYPES = {
         "mitre_persistence_method_detected",
         "possible_shellcode_memory_detected",
         "protected_monitor_tamper_detected",
+        "user_notifier_integrity_mismatch",
+        "integrity_modified",
+        "integrity_missing_files",
+        "integrity_extra_files",
+        "integrity_stale_manifest",
         "screen_sharing_enabled",
         "remote_login_enabled",
     },
@@ -401,46 +501,70 @@ class AlertQueueManager:
 
     def key_for(self, event: BackgroundMonitorEvent) -> str:
         device_id = ""
+        trust_status = ""
+        location_id = ""
         try:
             metadata = json.loads(event.metadata_json or "{}")
             if isinstance(metadata, dict):
-                device_id = str(metadata.get("device_id") or metadata.get("serial") or metadata.get("address") or "")
+                device_id = str(metadata.get("device_id") or metadata.get("serial") or metadata.get("serial_number") or metadata.get("address") or "")
+                trust_status = str(metadata.get("trust_status") or "")
+                location_id = str(metadata.get("location_id") or "")
         except json.JSONDecodeError:
             device_id = ""
+            trust_status = ""
+            location_id = ""
         source = getattr(event, "trigger_source", "") or event.source or ""
-        raw = f"{self.owner._canonical_event_type(event)}:{source}:{device_id or self.owner._alert_signature(event)}"
+        raw = f"{self.owner._canonical_event_type(event)}:{source}:{device_id or self.owner._alert_signature(event)}:{trust_status}:{location_id}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def cooldown_for(self, event: BackgroundMonitorEvent) -> int:
         severity = str(getattr(event, "severity", "info")).lower()
+        try:
+            metadata = json.loads(getattr(event, "metadata_json", "") or "{}")
+        except json.JSONDecodeError:
+            metadata = {}
+        if isinstance(metadata, dict) and str(metadata.get("trust_status", "")) == "trusted":
+            return 300
+        if self.owner._canonical_event_type(event) in {"usb_device_changed", "usb_inventory_changed"}:
+            return 120
+        if self.owner._canonical_event_type(event).startswith("usb_") and severity == "critical":
+            return 120
+        if self.owner._canonical_event_type(event).startswith("usb_") and severity == "high":
+            return 600
         return self.DEFAULT_COOLDOWNS.get(severity, 60)
 
     def evaluate(self, event: BackgroundMonitorEvent, *, force: bool = False) -> AlertQueueDecision:
         self.db.set_background_monitor_state("alert_queue_manager_status", "active")
         self.db.set_background_monitor_state("alert_queue_length", "1")
-        if force:
-            return AlertQueueDecision(True, "forced")
         key = self.key_for(event)
+        if force:
+            self.db.set_background_monitor_state(f"alert_queue_last:{key}", event.timestamp)
+            self.db.set_background_monitor_state("alert_rate_limiter_decision", "forced")
+            return AlertQueueDecision(True, "forced")
         now = datetime.fromisoformat(event.timestamp)
         last_raw = self.db.get_background_monitor_state(f"alert_queue_last:{key}", "")
         if not last_raw:
             self.db.set_background_monitor_state(f"alert_queue_last:{key}", event.timestamp)
+            self.db.set_background_monitor_state("alert_rate_limiter_decision", "first_event")
             return AlertQueueDecision(True, "first_event")
         try:
             last = datetime.fromisoformat(last_raw)
         except ValueError:
             self.db.set_background_monitor_state(f"alert_queue_last:{key}", event.timestamp)
+            self.db.set_background_monitor_state("alert_rate_limiter_decision", "invalid_last_timestamp")
             return AlertQueueDecision(True, "invalid_last_timestamp")
         cooldown = self.cooldown_for(event)
         elapsed = int((now - last).total_seconds())
         if elapsed >= cooldown:
             self.db.set_background_monitor_state(f"alert_queue_last:{key}", event.timestamp)
+            self.db.set_background_monitor_state("alert_rate_limiter_decision", "cooldown_elapsed")
             return AlertQueueDecision(True, "cooldown_elapsed")
         count_key = f"alert_queue_grouped:{key}"
         grouped = int(self.db.get_background_monitor_state(count_key, "0") or "0") + 1
         self.db.set_background_monitor_state(count_key, str(grouped))
         self.owner._increment_state_counter("alert_suppressed_total")
         self.owner._increment_state_counter("alert_grouped_total")
+        self.db.set_background_monitor_state("alert_rate_limiter_decision", f"grouped_within_cooldown:{grouped}")
         self.owner._record_grouped_suppression(event, grouped)
         return AlertQueueDecision(False, "grouped_within_cooldown", max(0, cooldown - elapsed), grouped)
 
@@ -467,9 +591,18 @@ class AlertOverlayManager:
                 overlay_error="",
             )
             self.owner.db.set_background_monitor_state("overlay_dispatch_result", "grouped")
-            self.owner.db.set_background_monitor_state("last_alert_failure_stage", f"rate_limiter:{queue_decision.reason}")
+            self.owner.db.set_background_monitor_state("last_alert_failure_stage", "")
             return False
-        return self.owner._dispatch_visible_alert(event, decision)
+        rendered = self.owner._dispatch_visible_alert(event, decision)
+        if not rendered:
+            try:
+                key = self.owner.alert_queue.key_for(event)
+                self.owner.db.conn.execute("DELETE FROM background_monitor_state WHERE key = ?", (f"alert_queue_last:{key}",))
+                self.owner.db.conn.commit()
+                self.owner.db.set_background_monitor_state("alert_rate_limiter_decision", "render_failed_cooldown_not_started")
+            except Exception:
+                pass
+        return rendered
 
 
 def applescript_escape(value: str) -> str:
@@ -536,24 +669,54 @@ class NotificationManager:
             "notification_sound": self.db.get_background_monitor_state("notification_sound", "Glass"),
             "duplicate_rate_limit_seconds": max(0, int(self.db.get_background_monitor_state("duplicate_rate_limit_seconds", "10") or "10")),
             "high_priority_alert_style": self.db.get_background_monitor_state("high_priority_alert_style", "notification"),
-            "notification_mode": self.db.get_background_monitor_state("notification_mode", "notification"),
+            "notification_mode": self.db.get_background_monitor_state("notification_mode", "overlay"),
             "popup_only_severe_events": self.db.get_background_monitor_state("popup_only_severe_events", "1") != "0",
             "browser_capture_process_popup": self.db.get_background_monitor_state("browser_capture_process_popup", "0") == "1",
             "show_visible_alerts": self.db.get_background_monitor_state("show_visible_alerts", "1") != "0",
+            "persistent_local_edr_enabled": self.db.get_background_monitor_state("persistent_local_edr_enabled", "1") != "0",
+            "persistent_local_edr_alerts_enabled": self.db.get_background_monitor_state("persistent_local_edr_alerts_enabled", self.db.get_background_monitor_state("show_visible_alerts", "1")) != "0",
+            "persistent_local_edr_mode": self.db.get_background_monitor_state("persistent_local_edr_mode", "user_agent"),
+            "settings_version": self.db.get_background_monitor_state("settings_version", "0"),
             "persistent_alerts": self.db.get_background_monitor_state("persistent_alerts", "1") != "0",
             "critical_overlay_enabled": self.db.get_background_monitor_state("critical_overlay_enabled", "1") != "0",
             "enable_alert_sounds": self.db.get_background_monitor_state("enable_alert_sounds", "0") == "1",
             "os_notification_fallback_enabled": self.db.get_background_monitor_state("os_notification_fallback_enabled", "0") == "1",
             "show_physical_session_alerts": self.db.get_background_monitor_state("show_physical_session_alerts", "1") != "0",
             "show_usb_bluetooth_alerts": self.db.get_background_monitor_state("show_usb_bluetooth_alerts", "1") != "0",
+            "usb_monitoring_enabled": self.db.get_background_monitor_state("usb_monitoring_enabled", "1") != "0",
+            "bluetooth_monitoring_enabled": self.db.get_background_monitor_state("bluetooth_monitoring_enabled", "1") != "0",
+            "usb_alerts_enabled": self.db.get_background_monitor_state("usb_alerts_enabled", "1") != "0",
+            "bluetooth_alerts_enabled": self.db.get_background_monitor_state("bluetooth_alerts_enabled", "1") != "0",
+            "usb_new_device_alerts_enabled": self.db.get_background_monitor_state("usb_new_device_alerts_enabled", "1") != "0",
+            "usb_trusted_device_alerts_enabled": self.db.get_background_monitor_state("usb_trusted_device_alerts_enabled", "1") != "0",
+            "usb_hid_alerts_enabled": self.db.get_background_monitor_state("usb_hid_alerts_enabled", "1") != "0",
+            "usb_storage_alerts_enabled": self.db.get_background_monitor_state("usb_storage_alerts_enabled", "1") != "0",
+            "usb_network_adapter_alerts_enabled": self.db.get_background_monitor_state("usb_network_adapter_alerts_enabled", "1") != "0",
+            "usb_unknown_device_alerts_enabled": self.db.get_background_monitor_state("usb_unknown_device_alerts_enabled", "1") != "0",
+            "bluetooth_new_device_alerts_enabled": self.db.get_background_monitor_state("bluetooth_new_device_alerts_enabled", "1") != "0",
+            "bluetooth_trusted_device_alerts_enabled": self.db.get_background_monitor_state("bluetooth_trusted_device_alerts_enabled", "1") != "0",
+            "bluetooth_inventory_alerts_enabled": self.db.get_background_monitor_state("bluetooth_inventory_alerts_enabled", "1") != "0",
+            "bluetooth_unknown_device_alerts_enabled": self.db.get_background_monitor_state("bluetooth_unknown_device_alerts_enabled", "1") != "0",
             "show_network_change_alerts": self.db.get_background_monitor_state("show_network_change_alerts", "1") != "0",
             "show_admin_persistence_alerts": self.db.get_background_monitor_state("show_admin_persistence_alerts", "1") != "0",
+            "admin_persistence_monitoring_enabled": self.db.get_background_monitor_state("admin_persistence_monitoring_enabled", "1") != "0",
+            "network_activity_monitoring_enabled": self.db.get_background_monitor_state("network_activity_monitoring_enabled", "1") != "0",
+            "network_new_connection_alerts_enabled": self.db.get_background_monitor_state("network_new_connection_alerts_enabled", "1") != "0",
+            "network_new_listener_alerts_enabled": self.db.get_background_monitor_state("network_new_listener_alerts_enabled", "1") != "0",
+            "network_dns_gateway_alerts_enabled": self.db.get_background_monitor_state("network_dns_gateway_alerts_enabled", "1") != "0",
+            "network_vpn_alerts_enabled": self.db.get_background_monitor_state("network_vpn_alerts_enabled", "1") != "0",
+            "network_suspicious_connection_alerts_enabled": self.db.get_background_monitor_state("network_suspicious_connection_alerts_enabled", "1") != "0",
+            "network_localhost_visibility_alerts_enabled": self.db.get_background_monitor_state("network_localhost_visibility_alerts_enabled", "1") != "0",
             "show_apple_forecast_alerts": self.db.get_background_monitor_state("show_apple_forecast_alerts", "1") != "0",
             "idle_activity_warning_minutes": int(self.db.get_background_monitor_state("idle_activity_warning_minutes", "2") or "2"),
             "cfaa_idle_warning_enabled": self.db.get_background_monitor_state("cfaa_idle_warning_enabled", "1") != "0",
             "cooldown_seconds_per_category": int(self.db.get_background_monitor_state("cooldown_seconds_per_category", "600") or "600"),
             "event_preferences": event_preferences,
         }
+
+    def _normalize_alert_severity(self, severity: object) -> str:
+        value = str(severity or "info").lower()
+        return value if value in ALERT_SEVERITIES else "info"
 
     def update_settings(
         self,
@@ -564,7 +727,7 @@ class NotificationManager:
         notification_sound: str,
         duplicate_rate_limit_seconds: int,
         high_priority_alert_style: str = "notification",
-        notification_mode: str = "notification",
+        notification_mode: str = "overlay",
         popup_only_severe_events: bool = True,
         browser_capture_process_popup: bool = False,
         show_visible_alerts: bool = True,
@@ -576,6 +739,8 @@ class NotificationManager:
         show_usb_bluetooth_alerts: bool = True,
         show_network_change_alerts: bool = True,
         show_admin_persistence_alerts: bool = True,
+        admin_persistence_monitoring_enabled: bool = True,
+        network_activity_monitoring_enabled: bool = True,
         show_apple_forecast_alerts: bool = True,
         idle_activity_warning_minutes: int = 2,
         cfaa_idle_warning_enabled: bool = True,
@@ -587,7 +752,7 @@ class NotificationManager:
         self.db.set_background_monitor_state("notification_sound", notification_sound or "Glass")
         self.db.set_background_monitor_state("duplicate_rate_limit_seconds", str(max(0, duplicate_rate_limit_seconds)))
         self.db.set_background_monitor_state("high_priority_alert_style", high_priority_alert_style or "notification")
-        self.db.set_background_monitor_state("notification_mode", notification_mode or "notification")
+        self.db.set_background_monitor_state("notification_mode", notification_mode or "overlay")
         self.db.set_background_monitor_state("popup_only_severe_events", "1" if popup_only_severe_events else "0")
         self.db.set_background_monitor_state("browser_capture_process_popup", "1" if browser_capture_process_popup else "0")
         self.db.set_background_monitor_state("show_visible_alerts", "1" if show_visible_alerts else "0")
@@ -599,6 +764,8 @@ class NotificationManager:
         self.db.set_background_monitor_state("show_usb_bluetooth_alerts", "1" if show_usb_bluetooth_alerts else "0")
         self.db.set_background_monitor_state("show_network_change_alerts", "1" if show_network_change_alerts else "0")
         self.db.set_background_monitor_state("show_admin_persistence_alerts", "1" if show_admin_persistence_alerts else "0")
+        self.db.set_background_monitor_state("admin_persistence_monitoring_enabled", "1" if admin_persistence_monitoring_enabled else "0")
+        self.db.set_background_monitor_state("network_activity_monitoring_enabled", "1" if network_activity_monitoring_enabled else "0")
         self.db.set_background_monitor_state("show_apple_forecast_alerts", "1" if show_apple_forecast_alerts else "0")
         self.db.set_background_monitor_state("idle_activity_warning_minutes", str(max(1, idle_activity_warning_minutes)))
         self.db.set_background_monitor_state("cfaa_idle_warning_enabled", "1" if cfaa_idle_warning_enabled else "0")
@@ -628,18 +795,21 @@ class NotificationManager:
             return preference
         mandatory = self._is_mandatory_visible_event(event_type)
         if mandatory:
-            preference["severity"] = str(preference.get("severity") or ("critical" if event_type in {self._canonical_event_type(item) for item in MANDATORY_CRITICAL_EVENT_TYPES} else "high"))
+            preference["severity"] = self._normalize_alert_severity(preference.get("severity") or ("critical" if event_type in {self._canonical_event_type(item) for item in MANDATORY_CRITICAL_EVENT_TYPES} else "high"))
             preference["enabled"] = True
             preference["notify"] = True
             if str(preference.get("notification_mode", "")).lower() in {"", "none"}:
-                preference["notification_mode"] = "dialog" if str(preference.get("severity", "high")) in {"high", "critical"} else "notification"
-            preference.setdefault("cooldown_seconds", 0 if event_type in {"usb_device_connected", "new_usb_device_detected", "bluetooth_device_connected", "network_ip_assigned", "vpn_connected"} else 600)
-        severity = str(preference.get("severity", "low"))
+                preference["notification_mode"] = "overlay"
+            preference.setdefault("cooldown_seconds", self.alert_queue.DEFAULT_COOLDOWNS.get(str(preference["severity"]), 60))
+        severity = self._normalize_alert_severity(preference.get("severity", "info"))
+        preference["severity"] = severity
         preference.setdefault("enabled", True)
         preference.setdefault("notify", event_type in CRITICAL_POPUP_ALLOWLIST)
         preference.setdefault("cooldown_seconds", default_cooldown.get(severity, 1800))
-        default_mode = "dialog" if severity in {"critical", "high"} and event_type in CRITICAL_POPUP_ALLOWLIST else ("notification" if severity == "medium" else "none")
+        default_mode = "overlay" if severity in ALERT_SEVERITIES and (severity != "info" or self._is_mandatory_visible_event(event_type)) else "none"
         preference.setdefault("notification_mode", preference.get("alert_style", default_mode))
+        if str(preference.get("notification_mode", "")).lower() in {"notification", "dialog", "both"}:
+            preference["notification_mode"] = "overlay"
         return preference
 
     def status(self) -> str:
@@ -731,29 +901,19 @@ class NotificationManager:
         overlay_ok = False
         overlay_error = ""
         try:
-            overlay_ok = bool(self.show_visible_security_alert(overlay_event, reason="notification_readiness", force=True))
+            overlay_event.notification_reason = "notification_readiness"
+            probe_preferences = dict(self.settings())
+            probe_preferences["show_visible_alerts"] = True
+            probe_preferences["persistent_local_edr_alerts_enabled"] = True
+            decision = self.should_show_visible_alert(overlay_event, preferences=probe_preferences, force=True)
+            overlay_ok = bool(self.alert_overlay_manager.render(overlay_event, decision, force=True))
         except Exception as exc:
             overlay_error = str(exc)
-        dialog_result = self._run_dialog_readiness_attempt(
-            "Mac Audit Agent - Notification Readiness",
-            "Dialog readiness test. You may close this automatically dismissing alert.",
-        ) if capabilities.applescript_dialog_available else None
-        dialog_ok = bool(dialog_result is not None and getattr(dialog_result, "returncode", 1) == 0)
-        dialog_error = ""
-        if dialog_result is not None and getattr(dialog_result, "returncode", 1) != 0:
-            dialog_error = (getattr(dialog_result, "stderr", "") or getattr(dialog_result, "stdout", "") or "dialog failed").strip()
-        notification_result = send_notification(
-            "Mac Audit Agent",
-            "Notification Readiness",
-            "Notification Center readiness test.",
-            sound="",
-            runner=self.runner,
-        ) if capabilities.notification_center_available else None
-        notification_ok = bool(notification_result is not None and getattr(notification_result, "returncode", 1) == 0)
-        notification_error = ""
-        if notification_result is not None and getattr(notification_result, "returncode", 1) != 0:
-            notification_error = (getattr(notification_result, "stderr", "") or getattr(notification_result, "stdout", "") or "notification failed").strip()
-        overall_pass = bool(overlay_ok or dialog_ok)
+        dialog_ok = False
+        dialog_error = "disabled: AlertOverlayManager is the authoritative alert delivery path"
+        notification_ok = False
+        notification_error = "disabled: Notification Center fallback is opt-in and not used for readiness"
+        overall_pass = bool(overlay_ok)
         result = {
             "updated_at": now,
             "overlay": {
@@ -764,20 +924,21 @@ class NotificationManager:
             },
             "dialog": {
                 "available": bool(capabilities.applescript_dialog_available),
-                "attempted": bool(dialog_result is not None),
+                "attempted": False,
                 "success": dialog_ok,
                 "error": dialog_error,
             },
             "notification_center": {
                 "available": bool(capabilities.notification_center_available),
-                "attempted": bool(notification_result is not None),
+                "attempted": False,
                 "success": notification_ok,
                 "error": notification_error,
             },
             "overall_status": "PASS" if overall_pass else "FAIL",
-            "reason": "Security alerts remain operational." if overall_pass else "All alert mechanisms failed.",
+            "reason": "AlertOverlayManager rendered successfully." if overall_pass else "AlertOverlayManager failed to render.",
             "security_alerting_ready": overall_pass,
             "notification_center_optional": True,
+            "authoritative_delivery": "AlertOverlayManager",
             "last_test_time": now,
             "last_test_result": "PASS" if overall_pass else "FAIL",
             "capabilities": capabilities.to_dict(),
@@ -940,10 +1101,17 @@ class NotificationManager:
             self.db.set_background_monitor_state("overlay_state_path_fallback_reason", "")
             return OVERLAY_STATE_PATH
         fallback = self.db.logs_dir / "state" / "security_overlay.json"
+        fallback_writable, fallback_reason = self._path_parent_writable(fallback)
+        if not fallback_writable:
+            fallback = self.db.path.parent / "logs" / "state" / "security_overlay.json"
+            local_writable, local_reason = self._path_parent_writable(fallback)
+            if not local_writable:
+                fallback_reason = f"{fallback_reason}; database-local fallback is not writable: {local_reason}"
         self.db.set_background_monitor_state("overlay_state_path", str(fallback))
         self.db.set_background_monitor_state(
             "overlay_state_path_fallback_reason",
-            f"Default overlay state path is not writable: {reason}",
+            f"Default overlay state path is not writable: {reason}"
+            + (f"; configured log fallback is not writable: {fallback_reason}" if not fallback_writable else ""),
         )
         return fallback
 
@@ -973,31 +1141,65 @@ class NotificationManager:
             return "advisory"
         return "other"
 
+    def _monitoring_disabled_reason(self, event_type: str, settings: dict[str, object]) -> str:
+        category = self._alert_category_for_event(event_type)
+        canonical = self._canonical_event_type(event_type)
+        if category in {"physical_session", "device", "network", "persistence_admin", "advisory"} and not bool(settings.get("persistent_local_edr_enabled", True)):
+            self.db.set_background_monitor_state("last_suppression_reason", "persistent_local_edr_disabled")
+            return "persistent_local_edr_disabled"
+        if category in {"physical_session", "device", "network", "persistence_admin", "advisory"} and not bool(settings.get("persistent_local_edr_alerts_enabled", True)):
+            self.db.set_background_monitor_state("last_suppression_reason", "persistent_local_edr_alerts_disabled")
+            return "persistent_local_edr_alerts_disabled"
+        if (
+            canonical.startswith("usb_")
+            or canonical in {"new_usb_device_detected", "trusted_usb_device_connected", "untrusted_usb_device_connected", "physical_device_connected", "physical_device_removed", "current_usb_device_inventory_changed"}
+        ) and not bool(settings.get("usb_monitoring_enabled", True)):
+            self.db.set_background_monitor_state("last_suppressed_usb_alert_reason", "usb_monitoring_disabled")
+            return "usb_monitoring_disabled"
+        if canonical.startswith("bluetooth_") and not bool(settings.get("bluetooth_monitoring_enabled", True)):
+            self.db.set_background_monitor_state("last_suppressed_bluetooth_alert_reason", "bluetooth_monitoring_disabled")
+            return "bluetooth_monitoring_disabled"
+        if category == "persistence_admin" and not bool(settings.get("admin_persistence_monitoring_enabled", True)):
+            return "admin_persistence_monitoring_disabled"
+        if category == "network" and not bool(settings.get("network_activity_monitoring_enabled", True)):
+            self.db.set_background_monitor_state("last_suppressed_network_alert_reason", "network_activity_monitoring_disabled")
+            return "network_activity_monitoring_disabled"
+        return ""
+
     def _style_for_visible_alert(self, event: BackgroundMonitorEvent, *, category: str) -> str:
         event_type = self._canonical_event_type(event)
+        severity = self._normalize_alert_severity(event.severity)
         if event_type in {self._canonical_event_type(item) for item in MANDATORY_CRITICAL_EVENT_TYPES}:
             return "critical_red"
         if event_type in {"mouse_or_keyboard_activity_after_idle", "idle_resume_detected", "input_activity_resumed_after_idle", "input_activity_after_idle", "hid_activity_after_idle"}:
-            return "critical_red"
+            return "medium_blue" if severity == "medium" else ("critical_red" if severity == "critical" else "high_orange")
         if event_type in {"lid_opened", "lid_closed", "screen_unlocked", "screen_locked", "user_logged_in", "user_logged_out"}:
             return "high_orange"
+        if event_type in {"bluetooth_device_connected", "bluetooth_device_disconnected"}:
+            return "high_orange" if severity != "critical" else "critical_red"
         if event_type in {"apple_security_forecast_elevated", "cve_forecast_level_increased"}:
-            return "high_orange" if event.severity in {"high", "critical"} else "neutral_grey"
-        if category == "device" and event.severity in {"info", "low"}:
-            return "neutral_grey"
-        if category == "device" and event.severity == "medium":
-            return "high_orange"
+            return "high_orange" if severity in {"high", "critical"} else ("medium_blue" if severity == "medium" else "info_grey")
+        if category == "device" and severity == "info":
+            return "info_grey"
+        if category == "device" and severity == "low":
+            return "low"
+        if category == "device" and severity == "medium":
+            return "medium_blue"
         if category == "device":
-            return "high_orange" if event_type != "new_usb_device_detected" else "critical_red"
-        if category in {"physical_session", "device", "network", "persistence_admin"} and event.severity in {"high", "critical"}:
-            return "critical_red" if event.severity == "critical" else "high_orange"
+            return "critical_red" if severity == "critical" else "high_orange"
+        if category in {"physical_session", "device", "network", "persistence_admin"} and severity in {"high", "critical"}:
+            return "critical_red" if severity == "critical" else "high_orange"
         if category == "advisory":
-            return "neutral_grey" if event.severity in {"info", "medium"} else "high_orange"
-        if event.severity == "critical":
+            return "info_grey" if severity == "info" else ("medium_blue" if severity == "medium" else "high_orange")
+        if severity == "critical":
             return "critical_red"
-        if event.severity == "high":
+        if severity == "high":
             return "high_orange"
-        return "neutral_grey"
+        if severity == "medium":
+            return "medium_blue"
+        if severity == "low":
+            return "low"
+        return "info_grey"
 
     def should_show_visible_alert(self, event: BackgroundMonitorEvent, preferences: dict[str, object] | None = None, *, force: bool = False) -> AlertDecision:
         settings = preferences if preferences is not None else self.settings()
@@ -1005,12 +1207,18 @@ class NotificationManager:
         event.original_event_type = getattr(event, "original_event_type", "") or event.event_type
         event.normalized_event_type = event_type
         event.event_type = event_type
+        if not hasattr(event, "_original_severity_for_alert"):
+            setattr(event, "_original_severity_for_alert", str(event.severity))
+        category = self._alert_category_for_event(event_type)
+        monitoring_disabled_reason = self._monitoring_disabled_reason(event_type, settings)
+        if monitoring_disabled_reason:
+            return AlertDecision(False, self._style_for_visible_alert(event, category=category), monitoring_disabled_reason, 0, False)
         if force:
-            category = self._alert_category_for_event(event_type)
             style = self._style_for_visible_alert(event, category=category)
             return AlertDecision(True, style, "forced_visible_alert", 0, bool(event.severity == "critical"))
         if not bool(settings.get("show_visible_alerts", True)):
-            return AlertDecision(False, "neutral_grey", "visible alerts disabled", 0, False)
+            return AlertDecision(False, "neutral_grey", "bottom_right_alerts_disabled", 0, False)
+        event.severity = self._normalize_alert_severity(event.severity)
         if event.severity == "critical" and not bool(settings.get("critical_overlay_enabled", True)):
             return AlertDecision(False, "critical_red", "critical overlay disabled", 0, False)
         if not (getattr(event, "rule_id", "") or getattr(event, "trigger_rule_id", "")) and event.severity not in {"high", "critical"}:
@@ -1018,7 +1226,6 @@ class NotificationManager:
         if self._is_browser_helper_process(event) and not settings.get("browser_capture_process_popup", False):
             return AlertDecision(False, "neutral_grey", "browser helper event is log-only by default", 0, False)
 
-        category = self._alert_category_for_event(event_type)
         category_enabled = {
             "physical_session": bool(settings.get("show_physical_session_alerts", True)),
             "device": bool(settings.get("show_usb_bluetooth_alerts", True)),
@@ -1128,14 +1335,19 @@ class NotificationManager:
         settings = preferences if preferences is not None else self.settings()
         event.event_type = self._canonical_event_type(event)
         preference = self.preference_for(event.event_type)
+        monitoring_disabled_reason = self._monitoring_disabled_reason(event.event_type, settings)
+        if monitoring_disabled_reason:
+            return False, monitoring_disabled_reason
         explicit_preferences = dict(settings.get("event_preferences", {}))
         explicit_preference = event.event_type in explicit_preferences
-        severity = str(preference.get("severity", event.severity))
+        preferred_severity = self._normalize_alert_severity(preference.get("severity", event.severity))
+        current_severity = self._normalize_alert_severity(event.severity)
+        severity = preferred_severity if SEVERITY_LEVELS.get(preferred_severity, 0) > SEVERITY_LEVELS.get(current_severity, 0) else current_severity
         event.severity = severity
         if not (getattr(event, "rule_id", "") or getattr(event, "trigger_rule_id", "")):
             return False, "missing rule_id"
         if not preference.get("enabled", True):
-            return False, "disabled_by_user"
+            return False, str(preference.get("suppression_reason") or "disabled_by_user")
         if self._is_browser_helper_process(event) and not settings.get("browser_capture_process_popup", False):
             return False, "browser helper process logged silently"
         if event.event_type in DEFAULT_EVENT_PREFERENCES and preference.get("notify", False) and preference.get("notification_mode", "none") != "none":
@@ -1143,7 +1355,7 @@ class NotificationManager:
         if explicit_preference and (
             not preference.get("notify", False) or str(preference.get("notification_mode", "none")) == "none"
         ):
-            return False, "disabled_by_user"
+            return False, str(preference.get("suppression_reason") or "disabled_by_user")
         if explicit_preference and preference.get("notify", False) and preference.get("notification_mode", "none") != "none":
             return True, "user preference popup enabled"
         if event.event_type == "usb_device_connected" and preference.get("notify", False):
@@ -1187,7 +1399,7 @@ class NotificationManager:
 
     def notify_cfaa_idle_reminder(self, event: BackgroundMonitorEvent, *, require_dialog: bool = False) -> tuple[bool, str]:
         overlay_shown = bool(getattr(event, "visible_alert_shown", False))
-        if overlay_shown and not require_dialog:
+        if overlay_shown:
             event.notification_sent = True
             event.notification_error = ""
             event.notification_returncode = 0
@@ -1209,43 +1421,18 @@ class NotificationManager:
                 delivery_method_used="overlay",
             )
             return True, ""
-        command, result = self._run_dialog_attempt(CFAA_ACK_MESSAGE)
-        self._log_attempt(event, str(event.severity), command, result, getattr(result, "returncode", 1) == 0)
-        if getattr(result, "returncode", 1) == 0:
-            event.notification_sent = True
-            event.notification_error = ""
-            event.notification_returncode = 0
-            event.notification_decision = "sent"
-            event.notification_reason = "cfaa_idle_reminder"
-            event.popup_allowed = True
-            event.visible_alert_shown = True
-            event.alert_style = "critical_red"
-            self.db.set_background_monitor_state("cfaa_idle_reminder_at", datetime.now().astimezone().isoformat())
-            self.db.set_background_monitor_state("notification_status", self.status())
-            self._record_alert_delivery(
-                event,
-                overlay_attempted=True,
-                overlay_success=overlay_shown,
-                dialog_attempted=True,
-                dialog_success=True,
-                notification_attempted=False,
-                notification_success=False,
-                delivery_method_used="dialog",
-            )
-            return True, ""
-        detail = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "notification failed").strip()
+        detail = "alert delivery degraded: AlertOverlayManager did not render authorized-use notice"
         event.notification_sent = False
         event.notification_error = detail
-        event.notification_returncode = getattr(result, "returncode", None)
+        event.notification_returncode = None
         self.db.set_background_monitor_state("notification_status", f"failed: {detail}")
         self.db.set_background_monitor_state("last_error", f"Notification failed for {event.event_type}: {detail}")
+        self.db.set_background_monitor_state("last_alert_failure_stage", "overlay_render")
         self._write_fallback_log(f"notification error: type={event.event_type} detail={detail}")
         self._record_alert_delivery(
             event,
             overlay_attempted=overlay_shown,
             overlay_success=overlay_shown,
-            dialog_attempted=True,
-            dialog_success=False,
             notification_attempted=False,
             notification_success=False,
             delivery_method_used="overlay" if overlay_shown else "none",
@@ -1259,9 +1446,9 @@ class NotificationManager:
         event.normalized_event_type = event.event_type
         preference = self.preference_for(event.event_type)
         explicit_preference = event.event_type in dict(settings.get("event_preferences", {}))
-        severity_before_policy = str(event.severity)
+        severity_before_policy = self._normalize_alert_severity(event.severity)
         setattr(event, "_original_severity_for_alert", severity_before_policy)
-        preferred_severity = str(preference.get("severity", event.severity))
+        preferred_severity = self._normalize_alert_severity(preference.get("severity", event.severity))
         effective_severity = (
             preferred_severity
             if SEVERITY_LEVELS.get(preferred_severity, 0) >= SEVERITY_LEVELS.get(severity_before_policy, 0)
@@ -1273,6 +1460,9 @@ class NotificationManager:
         event.alert_style = visible_alert.style
         event.cooldown_suppressed = visible_alert.reason == "within_cooldown"
         event.last_suppression_reason = visible_alert.reason
+        monitoring_disabled_reason = self._monitoring_disabled_reason(event.event_type, settings)
+        if monitoring_disabled_reason:
+            force = False
         if not (getattr(event, "rule_id", "") or getattr(event, "trigger_rule_id", "")):
             event.notification_decision = "invalid_incomplete"
             event.notification_reason = "missing_rule_id"
@@ -1389,6 +1579,45 @@ class NotificationManager:
             )
             self._write_decision(decision)
             return decision
+        if monitoring_disabled_reason:
+            event.notification_decision = "log_only"
+            event.notification_reason = monitoring_disabled_reason
+            event.cooldown_remaining_seconds = 0
+            event.popup_allowed = False
+            decision = {
+                "event_id": event.event_id,
+                "event_type": event.event_type,
+                "severity": effective_severity,
+                "priority": effective_severity,
+                "user_preference_loaded": explicit_preference,
+                "notify": False,
+                "alert_style": visible_alert.style,
+                "cooldown_suppressed": False,
+                "cooldown_remaining_seconds": 0,
+                "decision": "log_only",
+                "reason": monitoring_disabled_reason,
+                "command": "",
+                "returncode": "",
+                "stderr": "",
+                "notification_sent": False,
+                "popup_allowed": False,
+                "visible_alert_shown": False,
+                "alert_suppressed_reason": monitoring_disabled_reason,
+            }
+            self.db.set_background_monitor_state("last_suppression_reason", monitoring_disabled_reason)
+            self._update_event_alert_trace(
+                event,
+                notification_policy_checked=True,
+                notification_policy_result=decision["decision"],
+                notification_policy_reason=decision["reason"],
+                severity_before_policy=severity_before_policy,
+                severity_after_policy=effective_severity,
+                alert_required=False,
+                alert_suppressed=True,
+                alert_suppression_reason=monitoring_disabled_reason,
+            )
+            self._write_decision(decision)
+            return decision
         if event.cooldown_suppressed:
             try:
                 current_count = int(self.db.get_background_monitor_state("suppressed_alert_count", "0") or "0")
@@ -1418,13 +1647,14 @@ class NotificationManager:
             "alert_suppressed_reason": "",
         }
         if not preference.get("enabled", True):
+            suppression_reason = str(preference.get("suppression_reason") or "event_disabled_by_preference")
             event.notification_decision = "disabled_by_user"
-            event.notification_reason = "event_disabled_by_preference"
+            event.notification_reason = suppression_reason
             event.cooldown_remaining_seconds = 0
             event.popup_allowed = False
             decision["decision"] = "disabled_by_user"
-            decision["reason"] = "event_disabled_by_preference"
-            decision["alert_suppressed_reason"] = "event_disabled_by_preference"
+            decision["reason"] = suppression_reason
+            decision["alert_suppressed_reason"] = suppression_reason
             self._update_event_alert_trace(
                 event,
                 notification_policy_checked=True,
@@ -1613,7 +1843,7 @@ class NotificationManager:
         overlay_shown = self.show_visible_security_alert(event, reason=event.notification_reason or "policy", force=force)
         overlay_attempted = True
         overlay_success = bool(getattr(event, "visible_alert_shown", False))
-        notification_mode = str(preference.get("notification_mode", settings.get("notification_mode", "none")))
+        notification_mode = str(settings.get("notification_mode", "overlay"))
         fallback_enabled = bool(settings.get("os_notification_fallback_enabled", False))
         if fallback_enabled and not overlay_shown and notification_mode in {"notification", "both"}:
             script = (
@@ -1744,10 +1974,13 @@ class NotificationManager:
             previous = {}
         same_type = previous.get("active", False) and previous.get("event_type") == event.event_type
         summary = event.evidence.strip().replace("\n", " ")
+        alert_style = get_alert_style(decision.style)
+        recommended_action = "Preserve Evidence Snapshot" if alert_style.severity in {"critical", "high"} else "Review Timeline"
         payload = {
             "active": True,
             "event_type": event.event_type,
             "severity": str(getattr(event, "_original_severity_for_alert", event.severity)),
+            "canonical_severity": alert_style.severity,
             "style": decision.style,
             "title": self._overlay_title_for(event, decision),
             "details": self._overlay_details_for(event, decision),
@@ -1756,6 +1989,8 @@ class NotificationManager:
             "count": int(previous.get("count", 0) or 0) + 1 if same_type else 1,
             "persistent": bool(decision.persistent),
             "dismiss_after_seconds": 0 if decision.persistent else self._overlay_auto_dismiss_seconds(decision.style),
+            "recommended_action": recommended_action,
+            "visual_style": alert_style.to_dict(),
             "visible_alert_shown": True,
             "alert_style": decision.style,
             "notification_decision": event.notification_decision or "log_only",
@@ -1775,6 +2010,7 @@ class NotificationManager:
             self.db.set_background_monitor_state("last_overlay_exception", str(exc))
             self.db.set_background_monitor_state("last_overlay_error", str(exc))
             self.db.set_background_monitor_state("last_alert_failure_stage", "overlay_state_write")
+            self.db.set_background_monitor_state("alert_delivery_degraded", "1")
             self._record_alert_delivery(
                 event,
                 overlay_attempted=True,
@@ -1818,10 +2054,16 @@ class NotificationManager:
             self.db.set_background_monitor_state("last_overlay_exception", "overlay manager not running or failed to launch")
             self.db.set_background_monitor_state("last_overlay_error", "overlay manager not running or failed to launch")
             self.db.set_background_monitor_state("last_alert_failure_stage", "overlay_process_launch")
+            self.db.set_background_monitor_state("alert_delivery_degraded", "1")
         else:
             self._increment_state_counter("overlay_render_successes")
             self.db.set_background_monitor_state("last_overlay_error", "")
             self.db.set_background_monitor_state("last_alert_failure_stage", "")
+            self.db.set_background_monitor_state("alert_delivery_degraded", "0")
+            self.db.set_background_monitor_state("last_alert_severity", alert_style.severity)
+            self.db.set_background_monitor_state("last_alert_color", alert_style.background)
+            self.db.set_background_monitor_state("last_alert_opacity", "1.0")
+            self.db.set_background_monitor_state("alert_style_validation", "PASS" if not validate_alert_styles() else "FAIL")
             self.db.set_background_monitor_state("last_alert_displayed_at", event.timestamp)
             self.db.set_background_monitor_state(self._visible_alert_last_key(event), event.timestamp)
             self._play_visible_alert_sound(event)
@@ -1955,16 +2197,21 @@ class NotificationManager:
     def _sound_for(self, event: BackgroundMonitorEvent, settings: dict[str, object]) -> str:
         if not bool(settings.get("enable_alert_sounds", False)):
             return ""
-        if event.event_type in {"network_ip_assigned", "vpn_connected"}:
+        severity = self._normalize_alert_severity(event.severity)
+        if severity == "info":
             return ""
-        if event.event_type in {"usb_device_connected", "new_usb_device_detected"}:
-            return self.db.get_background_monitor_state("usb_recognition_sound", "Pop") or "Pop"
-        if event.event_type == "system_moisture_detected":
-            return self.db.get_background_monitor_state("moisture_detection_sound", "Basso") or "Basso"
+        if severity == "medium":
+            return str(settings["notification_sound"])
+        if severity == "critical":
+            configured_critical = self.db.get_background_monitor_state("critical_alert_sound", "")
+            if configured_critical:
+                return configured_critical
+            configured_sound = str(settings["notification_sound"])
+            return configured_sound if configured_sound and configured_sound != "Glass" else "Basso"
         return str(settings["notification_sound"])
 
     def _play_visible_alert_sound(self, event: BackgroundMonitorEvent) -> None:
-        if event.severity not in {"high", "critical"}:
+        if self._normalize_alert_severity(event.severity) not in {"medium", "high", "critical"}:
             return
         settings = self.settings()
         if not bool(settings.get("enable_alert_sounds", False)):
@@ -2049,6 +2296,9 @@ class NotificationManager:
             "last_alert_rendered": self.db.get_background_monitor_state("last_alert_displayed_at", "never"),
             "last_failed_render_reason": self.db.get_background_monitor_state("last_overlay_error", ""),
             "last_failure_stage": self.db.get_background_monitor_state("last_alert_failure_stage", ""),
+            "alert_delivery_degraded": self.db.get_background_monitor_state("alert_delivery_degraded", "0") == "1",
+            "last_policy_decision": self.db.get_background_monitor_state("last_alert_decision", "none"),
+            "last_rate_limiter_decision": self.db.get_background_monitor_state("alert_rate_limiter_decision", "none"),
             "active_cooldown_entries": active_cooldowns,
             "rendering_success_rate": (successes / attempts) if attempts else 1.0,
             "authoritative_delivery": "AlertOverlayManager",
@@ -2155,6 +2405,13 @@ class NotificationManager:
             return "Authorized Use Notice"
         if event.event_type in {"apple_security_forecast_elevated", "cve_forecast_level_increased"}:
             return "Apple Exposure Assessment"
+        if event.event_type.startswith("usb_") or event.event_type in {"new_usb_device_detected", "trusted_usb_device_connected", "untrusted_usb_device_connected"}:
+            try:
+                metadata = json.loads(event.metadata_json or "{}")
+            except json.JSONDecodeError:
+                metadata = {}
+            name = str(metadata.get("device_name") or metadata.get("name") or "USB Device") if isinstance(metadata, dict) else "USB Device"
+            return f"{event.severity.upper()} USB Alert: {name}"
         readable = event.event_type.replace("_", " ").strip().title()
         return readable or "Security Alert"
 
@@ -2176,6 +2433,22 @@ class NotificationManager:
             )
         if event.event_type in {"apple_security_forecast_elevated", "apple_security_forecast_urgent", "cve_forecast_level_increased"}:
             return "Apple-related security advisory or forecast changed. Review update guidance."
+        if event.event_type.startswith("usb_") or event.event_type in {"new_usb_device_detected", "trusted_usb_device_connected", "untrusted_usb_device_connected"}:
+            try:
+                metadata = json.loads(event.metadata_json or "{}")
+            except json.JSONDecodeError:
+                metadata = {}
+            if isinstance(metadata, dict):
+                parts = [
+                    event.evidence,
+                    f"Device type: {metadata.get('device_type', 'unknown')}",
+                    f"Baseline: {metadata.get('baseline_status', 'unknown')}",
+                    f"Trust: {metadata.get('trust_status', 'unknown')}",
+                    f"Source: {metadata.get('source_method', event.source)}",
+                    f"Why it matters: {metadata.get('correlation_reason', 'physical device changes can introduce input, storage, or network risk')}",
+                    "Recommended action: verify the device before trusting it.",
+                ]
+                return " ".join(str(part) for part in parts if part)
         base = event.evidence or event.recommendation or "Review the event timeline."
         if event.severity in {"high", "critical"}:
             return f"{base} Review Monitor Logs and the event timeline before remediation."
@@ -2191,16 +2464,15 @@ class NotificationManager:
             buttons = ["Open Timeline", "Preserve Evidence Snapshot", "Acknowledge"]
         elif event.event_type in {"apple_security_forecast_elevated", "apple_security_forecast_urgent", "cve_forecast_level_increased"}:
             buttons = ["Open Timeline", "Acknowledge"]
+        elif event.event_type.startswith("usb_") or event.event_type in {"new_usb_device_detected", "trusted_usb_device_connected", "untrusted_usb_device_connected"}:
+            buttons = ["View Device", "Mark Trusted", "Mark Untrusted", "Open Timeline", "Preserve Evidence Snapshot", "Acknowledge"]
         elif event.severity in {"high", "critical"}:
             buttons = ["Open Timeline", "Preserve Evidence Snapshot", "Acknowledge"]
         return buttons
 
     def _overlay_auto_dismiss_seconds(self, style: str) -> int:
-        if style == "neutral_grey":
-            return 10
-        if style == "high_orange":
-            return 12
-        return 0
+        alert_style = get_alert_style(style)
+        return 0 if alert_style.persistent_by_default else alert_style.default_duration_seconds
 
     def _visible_alert_last_key(self, event: BackgroundMonitorEvent) -> str:
         return f"visible_alert:{event.event_type}:{self._alert_signature(event)}"

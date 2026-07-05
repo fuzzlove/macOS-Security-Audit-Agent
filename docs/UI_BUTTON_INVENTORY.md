@@ -13,7 +13,7 @@ Rule: a visible production control must either perform a working action or expla
 | Export JSON | Dashboard | Export current report | `export_json` | Completed scan | Scan result exists | Run a scan first to generate an exportable report. | Keep state-aware |
 | Export HTML | Dashboard | Export current report | `export_html` | Completed scan | Scan result exists | Run a scan first to generate an exportable report. | Keep state-aware |
 | Open Reports Folder | Dashboard | Open local report directory | `open_reports_folder` | None | Always | n/a | Keep |
-| Open Assessment | Dashboard summary | Open Apple Exposure Assessment tab | `show_forecast_page` | None | Always | n/a | Keep |
+| Open Apple Exposure Assessment | Dashboard summary | Open Apple Exposure Assessment tab | `open_apple_exposure_assessment` | None | Always | n/a | Keep |
 | Open Health | Dashboard summary | Open Settings health panel | `show_settings_page` | None | Always | n/a | Keep |
 
 ## Apple Exposure Assessment

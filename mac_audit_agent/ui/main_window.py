@@ -49,12 +49,24 @@ from PySide6.QtWidgets import (
 )
 
 from mac_audit_agent.assets import get_asset_path
+from mac_audit_agent.assessment import (
+    SecurityAssessment,
+    build_security_assessment,
+    default_assessment_path,
+    export_security_assessment_html,
+    export_security_assessment_json,
+    export_security_assessment_markdown,
+)
 from mac_audit_agent.baseline_drift import BaselineDriftEngine
 from mac_audit_agent.cases import CaseManager
 from mac_audit_agent.collectors import CollectorSuite
 from mac_audit_agent.command_registry import build_command_registry
 from mac_audit_agent.config import AuditConfig
 from mac_audit_agent.frameworks import rule_coverage_summary
+from mac_audit_agent.exporters import ExportOptions, export_assessment_excel, export_assessment_word
+from mac_audit_agent.help.contextual_help import make_help_button
+from mac_audit_agent.help.help_controller import DEFAULT_HELP_CONTROLLER, HelpController
+from mac_audit_agent.help.help_viewer import HelpViewer
 from mac_audit_agent.fleet_baseline import (
     FLEET_BASELINE_FILENAME,
     build_fleet_baseline,
@@ -64,10 +76,18 @@ from mac_audit_agent.fleet_baseline import (
     import_fleet_baseline,
 )
 from mac_audit_agent.ioc_engine import OfflineIOCEngine, export_matches_json, load_ioc_file
-from mac_audit_agent.launch_agent import LaunchAgentManager, default_monitor_db_path
+from mac_audit_agent.integrity.manifest import create_integrity_manifest, write_integrity_manifest
+from mac_audit_agent.integrity.core import IntegrityEngine
+from mac_audit_agent.integrity.repair_wizard import RepairWizard
+from mac_audit_agent.integrity.verifier import select_integrity_manifest, verify_current_install_integrity
+from mac_audit_agent.launch_agent import LaunchAgentManager, default_monitor_db_path, verify_protected_monitor_integrity
 from mac_audit_agent.models import AuditCommand, RawLogEntry, ScanResult, ScanSummary, utc_now_iso
 from mac_audit_agent.models import Finding, InvestigationNote, NetworkDiscoveryResult, NetworkHostSnapshot
 from mac_audit_agent.notification_manager import NotificationManager
+from mac_audit_agent.network_intelligence import NetworkIntelligenceCollector
+from mac_audit_agent.network_intelligence.baseline import snapshot_from_dict
+from mac_audit_agent.network_intelligence.diagnostics import build_network_intelligence_diagnostics
+from mac_audit_agent.network_intelligence.timeline import snapshot_to_events
 from mac_audit_agent.network_discovery import (
     SCAN_PROFILES,
     detect_preferred_interface,
@@ -103,6 +123,7 @@ from mac_audit_agent.reporting import (
     export_scan_result_json,
     get_reports_dir,
 )
+from mac_audit_agent.ui.severity_styles import get_severity_style, normalize_severity
 from mac_audit_agent.investigation_priority import InvestigationPriorityEngine
 from mac_audit_agent.runner import RunnerConfig, SafeCommandRunner
 from mac_audit_agent.rules import RULES
@@ -132,17 +153,22 @@ from mac_audit_agent.ui.cve_radar_panel import CveRadarDetailsDialog, CveRadarPa
 from mac_audit_agent.ui.flight_recorder_panel import FlightRecorderPanel
 from mac_audit_agent.ui.intrusion_detection_panel import IntrusionDetectionPanel
 from mac_audit_agent.ui.logs_panel import LogsPanel
+from mac_audit_agent.ui.network_intelligence_panel import NetworkIntelligencePanel
 from mac_audit_agent.ui.operational_health_panel import OperationalHealthPanel
+from mac_audit_agent.ui.persistence_intelligence_panel import PersistenceIntelligencePanel
 from mac_audit_agent.ui.reliability_panel import ReliabilityPanel
 from mac_audit_agent.ui.system_recovery_panel import RecoveryEvidenceWarningDialog, SystemRecoveryPanel
 from mac_audit_agent.ui.theme_panel import ThemeSettingsPanel
 from mac_audit_agent.recovery_center import SystemRecoveryCenter
+from mac_audit_agent.repair import OperationalRepairEngine
 from mac_audit_agent.system_monitor_readiness import SystemMonitorReadiness
 from mac_audit_agent.workflow_layer import InvestigatorWorkflowLayer
 from mac_audit_agent.ui.background_monitor_panel import BackgroundMonitorPanel
 from mac_audit_agent.vulnerability_review import AggressiveLocalVulnerabilityReviewer
 from mac_audit_agent.visibility_integrity import VisibilityIntegrityEngine
 from mac_audit_agent.themes import DEFAULT_THEME_NAME, theme_for_name, theme_stylesheet
+from mac_audit_agent.quality.audit_models import AuditContext
+from mac_audit_agent.quality.pre_uat_audit import run_pre_uat_audit
 
 
 LOGGER = logging.getLogger(__name__)
@@ -796,8 +822,8 @@ class NetworkDiscoveryProgressDialog(QDialog):
 
 
 def severity_qcolors(severity: str) -> tuple[QColor, QColor]:
-    colors = SEVERITY_COLOR_MAP[severity]
-    return QColor(colors["bg"]), QColor(colors["fg"])
+    style = get_severity_style(severity)
+    return QColor(style.background), QColor(style.foreground)
 
 
 def finding_to_dict(finding):
@@ -984,6 +1010,8 @@ class MainWindow(QMainWindow):
         if config is None and db_path.parent != Path.home():
             self.config.logs_dir = db_path.parent / "logs"
         self.registry = build_command_registry()
+        self.help_controller: HelpController = DEFAULT_HELP_CONTROLLER
+        self.help_viewer: HelpViewer | None = None
         self.runner = SafeCommandRunner(RunnerConfig(dry_run=self.config.dry_run))
         self.collectors = CollectorSuite(self.runner, self.config)
         self.db = AuditDatabase(db_path, self.config.logs_dir, self.config.log_retention_days)
@@ -1024,6 +1052,7 @@ class MainWindow(QMainWindow):
         self.current_ioc_report: dict = {}
         self.current_fleet_baseline: dict = {}
         self.current_fleet_comparison: dict = {}
+        self.current_assessment: SecurityAssessment | None = None
         self.alert_pipeline_inspector = AlertPipelineInspector(self.db)
         self.monitoring_coverage_engine = MonitoringCoverageEngine(self.db)
         self.release_readiness_engine = ReleaseReadinessEngine(self.db)
@@ -1082,11 +1111,45 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(8)
 
+        self.left_nav = QWidget()
+        self.left_nav.setObjectName("leftNavigation")
+        self.left_nav.setMaximumWidth(260)
+        self.left_nav.setMinimumWidth(170)
+        left_nav_layout = QVBoxLayout(self.left_nav)
+        left_nav_layout.setContentsMargins(0, 0, 0, 0)
+        left_nav_layout.setSpacing(8)
+
+        self.global_help_button = QPushButton("Help Menu ?")
+        self.global_help_button.setObjectName("globalHelpMenuButton")
+        self.global_help_button.setAccessibleName("Help Menu")
+        self.global_help_button.setAccessibleDescription("Open the MSAA Help Center")
+        self.global_help_button.setToolTip(
+            "Open the MSAA Help Center for feature explanations, troubleshooting, glossary definitions, and safe response guidance."
+        )
+        self.global_help_button.setMinimumHeight(36)
+        self.global_help_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.global_help_button.setStyleSheet(
+            """
+            QPushButton#globalHelpMenuButton {
+                font-weight: 700;
+                padding: 6px 12px;
+                text-align: left;
+            }
+            QPushButton#globalHelpMenuButton:focus {
+                border: 2px solid #58A6FF;
+            }
+            """
+        )
+        self.global_help_button.clicked.connect(self.open_help_center)
+
         self.sidebar = QListWidget()
         self.sidebar.addItems([
             "Dashboard",
+            "Apple Exposure Assessment",
             "Family & Safety",
             "Intrusion Detection",
+            "Persistence Intelligence",
+            "Network Intelligence",
             "Investigation Priorities",
             "Flight Recorder",
             "Logs",
@@ -1098,6 +1161,8 @@ class MainWindow(QMainWindow):
             "Skins",
             "Scan Categories",
             "Results",
+            "Assessment",
+            "Pre-UAT Audit",
             "Investigation Notes",
             "Command Preview",
         ])
@@ -1111,6 +1176,7 @@ class MainWindow(QMainWindow):
         self.cve_radar_panel.export_requested.connect(self.export_html)
         self.cve_radar_panel.review_requested.connect(self._review_cve_radar_card)
         self.cve_radar_panel.snooze_requested.connect(self._snooze_cve_radar_card)
+        self.cve_radar_panel.evidence_snapshot_requested.connect(self.create_system_recovery_snapshot)
         self.cve_radar_panel.set_status("Assessment not checked yet")
         self.family_safety_panel = FamilySafetyPanel(self)
         self.family_safety_panel.audit_requested.connect(self.run_family_safety_audit)
@@ -1122,6 +1188,12 @@ class MainWindow(QMainWindow):
         self.intrusion_detection_panel.snapshot_requested.connect(self.create_system_recovery_snapshot)
         self.intrusion_detection_panel.export_ai_summary_requested.connect(self.export_intrusion_ai_summary)
         self.intrusion_detection_panel.open_logs_requested.connect(self.show_logs_page)
+        self.persistence_intelligence_panel = PersistenceIntelligencePanel(self)
+        self.network_intelligence_panel = NetworkIntelligencePanel(self)
+        self.network_intelligence_panel.refresh_requested.connect(self.refresh_network_intelligence)
+        self.network_intelligence_panel.nmap_requested.connect(self.run_nmap_local_scan)
+        self.network_intelligence_panel.local_discovery_requested.connect(self.run_network_discovery)
+        self.network_intelligence_panel.settings_requested.connect(self.show_settings_page)
         self.flight_recorder_panel = FlightRecorderPanel("Flight Recorder", "Timeline of surrounding activity and correlated patterns.")
         self.flight_recorder_panel.refresh_requested.connect(self.refresh_flight_recorder)
         self.flight_recorder_panel.show_context_requested.connect(self._show_intrusion_context)
@@ -1137,6 +1209,16 @@ class MainWindow(QMainWindow):
         self.theme_panel.theme_changed.connect(self.apply_theme_choice)
         self.operational_health_panel = OperationalHealthPanel(self)
         self.operational_health_panel.refresh_requested.connect(self.refresh_operational_health)
+        self.operational_health_panel.repair_requested.connect(self.repair_operational_health)
+        self.operational_health_panel.enable_settings_requested.connect(self.show_settings_page)
+        self.operational_health_panel.verify_application_integrity_requested.connect(self.verify_application_integrity)
+        self.operational_health_panel.verify_system_monitor_integrity_requested.connect(self.verify_system_monitor_integrity)
+        self.operational_health_panel.verify_user_notifier_integrity_requested.connect(self.verify_user_notifier_integrity)
+        self.operational_health_panel.create_trusted_manifest_requested.connect(self.create_trusted_integrity_manifest)
+        self.operational_health_panel.resolve_integrity_mismatch_requested.connect(self.resolve_integrity_manifest_mismatch)
+        self.operational_health_panel.view_integrity_mismatch_details_requested.connect(self.view_integrity_mismatch_details)
+        self.operational_health_panel.export_integrity_report_requested.connect(self.export_integrity_report)
+        self.operational_health_panel.preserve_integrity_evidence_snapshot_requested.connect(self.create_system_recovery_snapshot)
         self.reliability_panel = ReliabilityPanel(self)
         self.reliability_panel.refresh_requested.connect(self.refresh_reliability)
         self.reliability_panel.incident_mode_enable_requested.connect(lambda: self.set_incident_mode(True))
@@ -1158,8 +1240,11 @@ class MainWindow(QMainWindow):
 
         self.pages = QStackedWidget()
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_dashboard_page(), resizable=True))
+        self.pages.addWidget(self._wrap_in_scroll_area(self._build_forecast_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_family_safety_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_intrusion_detection_page(), resizable=True))
+        self.pages.addWidget(self._wrap_in_scroll_area(self._build_help_panel_page("Persistence Intelligence", "persistence_intelligence", self.persistence_intelligence_panel), resizable=True))
+        self.pages.addWidget(self._wrap_in_scroll_area(self._build_help_panel_page("Network Intelligence", "network_intelligence", self.network_intelligence_panel), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_investigation_priorities_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_flight_recorder_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_logs_page(), resizable=True))
@@ -1171,6 +1256,8 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_skins_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_categories_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_results_page(), resizable=True))
+        self.pages.addWidget(self._wrap_in_scroll_area(self._build_assessment_page(), resizable=True))
+        self.pages.addWidget(self._wrap_in_scroll_area(self._build_pre_uat_audit_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_investigation_notes_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_preview_page(), resizable=True))
         self.sidebar.setCurrentRow(0)
@@ -1182,7 +1269,10 @@ class MainWindow(QMainWindow):
         self.main_splitter.addWidget(self.details_panel)
         self.main_splitter.setSizes([1000, 360])
 
-        outer.addWidget(self.sidebar)
+        left_nav_layout.addWidget(self.global_help_button)
+        left_nav_layout.addWidget(self.sidebar, 1)
+
+        outer.addWidget(self.left_nav)
         outer.addWidget(self.main_splitter)
         self._update_responsive_layout()
         self.cve_radar_timer = QTimer(self)
@@ -1197,9 +1287,40 @@ class MainWindow(QMainWindow):
         scroll.setWidget(widget)
         return scroll
 
+    def _build_help_header(self, title: str, topic_id: str, *, subtitle: str = "") -> QWidget:
+        header = QWidget()
+        layout = QHBoxLayout(header)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        text_layout = QVBoxLayout()
+        text_layout.setContentsMargins(0, 0, 0, 0)
+        heading = QLabel(title)
+        heading.setStyleSheet("font-size: 18px; font-weight: 700;")
+        heading.setWordWrap(True)
+        text_layout.addWidget(heading)
+        if subtitle:
+            subtitle_label = QLabel(subtitle)
+            subtitle_label.setWordWrap(True)
+            text_layout.addWidget(subtitle_label)
+        layout.addLayout(text_layout, 1)
+        layout.addWidget(make_help_button(self, topic_id), alignment=Qt.AlignTop)
+        return header
+
+    def _build_help_panel_page(self, title: str, topic_id: str, panel: QWidget, *, subtitle: str = "") -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+        layout.addWidget(self._build_help_header(title, topic_id, subtitle=subtitle))
+        layout.addWidget(panel)
+        return page
+
     def _build_support_section(self) -> QFrame:
         frame = ClickableFrame()
         frame.setObjectName("supportAd")
+        frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
+        frame.setMinimumHeight(286)
+        frame.setMinimumWidth(220)
         frame.setStyleSheet(
             """
             QFrame#supportAd {
@@ -1214,40 +1335,67 @@ class MainWindow(QMainWindow):
         frame.clicked.connect(lambda: self._open_support_link())
         self.support_ad_frame = frame
         ad_layout = QVBoxLayout(frame)
-        ad_layout.setContentsMargins(12, 12, 12, 12)
-        ad_layout.setSpacing(10)
+        ad_layout.setContentsMargins(0, 0, 0, 0)
+        ad_layout.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("supportAdScrollArea")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setStyleSheet("QScrollArea#supportAdScrollArea { background: transparent; border: none; }")
+        scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
+        self.support_ad_scroll_area = scroll
+
+        content = QWidget()
+        content.setObjectName("supportAdContent")
+        content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(18, 18, 18, 18)
+        content_layout.setSpacing(12)
 
         self.support_ad_image_label = QLabel()
-        self.support_ad_image_label.setFixedSize(100, 100)
+        self.support_ad_image_label.setMinimumSize(128, 128)
+        self.support_ad_image_label.setMaximumSize(160, 160)
+        self.support_ad_image_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.support_ad_image_label.setAlignment(Qt.AlignCenter)
         self.support_ad_image_label.setStyleSheet("background: white; border-radius: 10px;")
         self.support_ad_image_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        pixmap = load_support_image_pixmap()
+        pixmap = load_support_image_pixmap(size=(160, 160))
         if pixmap.isNull():
-            pixmap = create_fallback_qr_pixmap(100, "macOS Security Audit Agent Support")
-        self.support_ad_image_label.setPixmap(pixmap.scaled(100, 100, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            pixmap = create_fallback_qr_pixmap(160, "macOS Security Audit Agent Support")
+        self.support_ad_image_label.setPixmap(pixmap.scaled(128, 128, Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
         text_layout = QVBoxLayout()
-        text_layout.setSpacing(4)
+        text_layout.setContentsMargins(0, 0, 0, 0)
+        text_layout.setSpacing(6)
         title = QLabel("Support the author")
+        title.setWordWrap(True)
+        title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("font-size: 14px; font-weight: 700; color: #F8FAFC;")
         body = QLabel("Simple support for the work behind the app.\nJoin if you'd like to help keep it going.")
         body.setWordWrap(True)
+        body.setAlignment(Qt.AlignCenter)
+        body.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         body.setStyleSheet("color: #CBD5E1;")
         title.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         body.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.support_ad_link_label = QLabel(f'<a href="{SUPPORT_PATREON_URL}">Support via Patreon or BuyMeACoffee</a>')
         self.support_ad_link_label.setTextFormat(Qt.RichText)
         self.support_ad_link_label.setWordWrap(True)
+        self.support_ad_link_label.setAlignment(Qt.AlignCenter)
+        self.support_ad_link_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         self.support_ad_link_label.setStyleSheet("color: #93C5FD;")
         self.support_ad_link_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         text_layout.addWidget(title)
         text_layout.addWidget(body)
         text_layout.addWidget(self.support_ad_link_label)
-        text_layout.addStretch(1)
 
-        ad_layout.addWidget(self.support_ad_image_label, alignment=Qt.AlignHCenter)
-        ad_layout.addLayout(text_layout)
+        content_layout.addWidget(self.support_ad_image_label, alignment=Qt.AlignHCenter)
+        content_layout.addLayout(text_layout)
+        scroll.setWidget(content)
+        ad_layout.addWidget(scroll)
         return frame
 
     def _open_support_link(self) -> None:
@@ -1358,10 +1506,23 @@ class MainWindow(QMainWindow):
         self.developer_mode_action.toggled.connect(lambda enabled: self._set_developer_mode(enabled, persist=True))
         settings_menu.addAction(self.developer_mode_action)
         self.developer_mode_action.setVisible(bool(getattr(self.config, "developer_mode", False)))
-        help_menu = self.menuBar().addMenu("Help")
-        about_action = QAction("About Mac Audit Agent", self)
-        about_action.triggered.connect(self.show_about_dialog)
-        help_menu.addAction(about_action)
+        self.help_shortcut_action = QAction("Open Help Center", self)
+        self.help_shortcut_action.setObjectName("helpShortcutAction")
+        self.help_shortcut_action.setShortcut("F1")
+        self.help_shortcut_action.setToolTip(
+            "Open the MSAA Help Center for feature explanations, troubleshooting, glossary definitions, and safe response guidance."
+        )
+        self.help_shortcut_action.triggered.connect(self.open_help_center)
+        self.addAction(self.help_shortcut_action)
+
+    def open_help_center(self) -> None:
+        self.open_help_topic("help_center")
+
+    def open_help_topic(self, topic_id: str = "help_center") -> None:
+        self.help_viewer = self.help_controller.navigate_to_topic(topic_id, parent=self)
+
+    def show_context_help(self, topic_id: str) -> None:
+        self.open_help_topic(topic_id)
 
     def _setup_tray_icon(self) -> None:
         if self._tray_disabled_for_test_session():
@@ -1487,6 +1648,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(12)
+        layout.addWidget(self._build_help_header("Dashboard", "dashboard", subtitle="Current scan state, health signals, severity counts, and common review actions."))
 
         header = QFrame()
         self.dashboard_header_layout = QGridLayout(header)
@@ -1531,6 +1693,13 @@ class MainWindow(QMainWindow):
         self.export_html_button.clicked.connect(self.export_html)
         self.export_sarif_button = QPushButton("Export SARIF")
         self.export_sarif_button.clicked.connect(self.export_sarif_report)
+        self.show_assessment_button = QPushButton("Show Assessment")
+        self.show_assessment_button.setToolTip("Build and show the current real security assessment from scans, monitor events, mappings, and health data.")
+        self.show_assessment_button.clicked.connect(self.show_assessment_page)
+        self.export_word_report_button = QPushButton("Export Word Report")
+        self.export_word_report_button.clicked.connect(self.export_assessment_word_report)
+        self.export_excel_workbook_button = QPushButton("Export Excel Workbook")
+        self.export_excel_workbook_button.clicked.connect(self.export_assessment_excel_workbook)
         self.open_reports_folder_button = QPushButton("Open Reports Folder")
         self.open_reports_folder_button.setToolTip("Open the local reports folder.")
         self.open_reports_folder_button.clicked.connect(self.open_reports_folder)
@@ -1540,7 +1709,15 @@ class MainWindow(QMainWindow):
         )
         self.dashboard_report_actions = self._build_dashboard_action_group(
             "Reports",
-            [self.export_json_button, self.export_html_button, self.export_sarif_button, self.open_reports_folder_button],
+            [
+                self.show_assessment_button,
+                self.export_word_report_button,
+                self.export_excel_workbook_button,
+                self.export_json_button,
+                self.export_html_button,
+                self.export_sarif_button,
+                self.open_reports_folder_button,
+            ],
         )
         self.dashboard_advanced_note = QFrame()
         advanced_note_layout = QVBoxLayout(self.dashboard_advanced_note)
@@ -1598,8 +1775,13 @@ class MainWindow(QMainWindow):
             self.dashboard_forecast_kev_label,
         ]:
             label.setStyleSheet("color: #D6E4FF;")
-        self.open_forecast_button = make_forecast_button("Show Assessment", "Keep the Dashboard selected and focus the Apple Exposure Assessment section below.", "primary")
-        self.open_forecast_button.clicked.connect(self.show_forecast_page)
+        self.open_forecast_button = make_forecast_button(
+            "Open Apple Exposure Assessment",
+            "Open the Apple Exposure Assessment view to review Mac-relevant Apple security update exposure.",
+            "primary",
+        )
+        self.open_forecast_button.setObjectName("openAppleExposureAssessmentButton")
+        self.open_forecast_button.clicked.connect(self.open_apple_exposure_assessment)
         forecast_layout.addWidget(forecast_title)
         forecast_layout.addWidget(self.dashboard_forecast_level_label)
         forecast_layout.addWidget(self.dashboard_forecast_last_checked_label)
@@ -1630,15 +1812,91 @@ class MainWindow(QMainWindow):
         for label in [self.dashboard_health_status_label, self.dashboard_health_score_label, self.dashboard_health_summary_label]:
             label.setStyleSheet("color: #D6E4FF;")
         self.open_health_button = QPushButton("Open Health")
+        self.dashboard_repair_health_button = QPushButton("Repair Operational Health")
         self.open_health_button.setMinimumHeight(36)
+        self.dashboard_repair_health_button.setMinimumHeight(36)
         self.open_health_button.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
+        self.dashboard_repair_health_button.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
         self.open_health_button.setToolTip("Open the operational health dashboard in Settings.")
+        self.dashboard_repair_health_button.setToolTip("Attempt safe repairs for broken MSAA operational components such as notifier, monitor, settings drift, database schema, and log paths.")
+        self.dashboard_repair_health_button.setStyleSheet("font-weight: 700; background: #B42318; color: white;")
         self.open_health_button.clicked.connect(self.show_settings_page)
+        self.dashboard_repair_health_button.clicked.connect(self.repair_operational_health)
         health_layout.addWidget(health_title)
         health_layout.addWidget(self.dashboard_health_status_label)
         health_layout.addWidget(self.dashboard_health_score_label)
         health_layout.addWidget(self.dashboard_health_summary_label)
         health_layout.addWidget(self.open_health_button)
+        health_layout.addWidget(self.dashboard_repair_health_button)
+
+        self.dashboard_integrity_frame = QFrame()
+        self.dashboard_integrity_frame.setObjectName("dashboardIntegritySummary")
+        self.dashboard_integrity_frame.setStyleSheet(
+            """
+            QFrame#dashboardIntegritySummary {
+                background: rgba(24, 31, 46, 220);
+                border: 1px solid rgba(255, 188, 87, 130);
+                border-radius: 12px;
+            }
+            """
+        )
+        integrity_layout = QVBoxLayout(self.dashboard_integrity_frame)
+        integrity_layout.setContentsMargins(14, 14, 14, 14)
+        integrity_layout.setSpacing(6)
+        integrity_title_row = QHBoxLayout()
+        integrity_title_row.setContentsMargins(0, 0, 0, 0)
+        integrity_title_row.setSpacing(8)
+        integrity_title = QLabel("Integrity Health")
+        integrity_title.setStyleSheet("font-size: 16px; font-weight: 700; color: #F0F6FC;")
+        integrity_title.setWordWrap(True)
+        self.dashboard_integrity_help_button = make_help_button(self, "integrity_verification")
+        integrity_title_row.addWidget(integrity_title, 1)
+        integrity_title_row.addWidget(self.dashboard_integrity_help_button, 0, Qt.AlignRight | Qt.AlignTop)
+        self.dashboard_integrity_status_label = QLabel("Status: not checked yet")
+        self.dashboard_integrity_timestamp_label = QLabel("Last verified: not yet")
+        self.dashboard_integrity_manifest_label = QLabel("Manifest: not checked")
+        self.dashboard_integrity_build_label = QLabel("Build ID: not checked")
+        self.dashboard_integrity_summary_label = QLabel("Run Integrity Check to compare application files with the trusted manifest.")
+        self.dashboard_integrity_summary_label.setWordWrap(True)
+        for label in [
+            self.dashboard_integrity_status_label,
+            self.dashboard_integrity_timestamp_label,
+            self.dashboard_integrity_manifest_label,
+            self.dashboard_integrity_build_label,
+            self.dashboard_integrity_summary_label,
+        ]:
+            label.setStyleSheet("color: #D6E4FF;")
+        integrity_buttons = QHBoxLayout()
+        self.dashboard_run_integrity_button = QPushButton("Run Integrity Check")
+        self.dashboard_view_integrity_diff_button = QPushButton("View Detailed Differences")
+        self.dashboard_repair_integrity_button = QPushButton("Repair Installation")
+        self.dashboard_reinstall_integrity_button = QPushButton("Reinstall MSAA")
+        self.dashboard_export_integrity_button = QPushButton("Export Integrity Report")
+        self.dashboard_create_integrity_baseline_button = QPushButton("Create Trusted Baseline")
+        self.dashboard_run_integrity_button.clicked.connect(self.run_guided_integrity_check)
+        self.dashboard_view_integrity_diff_button.clicked.connect(self.view_integrity_mismatch_details)
+        self.dashboard_repair_integrity_button.clicked.connect(self.show_integrity_repair_wizard)
+        self.dashboard_reinstall_integrity_button.clicked.connect(self.show_integrity_reinstall_guidance)
+        self.dashboard_export_integrity_button.clicked.connect(self.export_integrity_report)
+        self.dashboard_create_integrity_baseline_button.clicked.connect(self.create_trusted_integrity_manifest)
+        self.dashboard_repair_integrity_button.setStyleSheet("font-weight: 700; background: #B42318; color: white;")
+        for button in [
+            self.dashboard_run_integrity_button,
+            self.dashboard_view_integrity_diff_button,
+            self.dashboard_repair_integrity_button,
+            self.dashboard_reinstall_integrity_button,
+            self.dashboard_export_integrity_button,
+            self.dashboard_create_integrity_baseline_button,
+        ]:
+            button.setMinimumHeight(34)
+            integrity_buttons.addWidget(button)
+        integrity_layout.addLayout(integrity_title_row)
+        integrity_layout.addWidget(self.dashboard_integrity_status_label)
+        integrity_layout.addWidget(self.dashboard_integrity_timestamp_label)
+        integrity_layout.addWidget(self.dashboard_integrity_manifest_label)
+        integrity_layout.addWidget(self.dashboard_integrity_build_label)
+        integrity_layout.addWidget(self.dashboard_integrity_summary_label)
+        integrity_layout.addLayout(integrity_buttons)
 
         privacy = QLabel(
             "Privacy warning: shell history review stores only matched indicators and counts by default. "
@@ -1648,7 +1906,7 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self.dashboard_forecast_frame)
         layout.addWidget(self.dashboard_health_frame)
-        layout.addWidget(self.cve_radar_panel)
+        layout.addWidget(self.dashboard_integrity_frame)
         self.dashboard_cards = {}
         self.severity_cards = {}
         self.dashboard_card_widgets: list[QFrame] = []
@@ -1729,6 +1987,7 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(self._build_help_header("Family & Safety Center", "family_safety"))
         layout.addWidget(self.family_safety_panel)
         return page
 
@@ -1750,6 +2009,7 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(self._build_help_header("Reports and Results", "reports_exports", subtitle="Findings, technical evidence, export views, and report-oriented result tables."))
         self.results_empty_state = QFrame()
         self.results_empty_state.setProperty("themeCard", True)
         empty_layout = QVBoxLayout(self.results_empty_state)
@@ -2118,6 +2378,142 @@ class MainWindow(QMainWindow):
         self._set_results_available(self.current_scan_result is not None)
         return page
 
+    def _build_assessment_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+        title = self._build_help_header("Security Assessment", "reports_exports")
+        self.assessment_status_label = QLabel("No assessment is available yet.")
+        self.assessment_status_label.setWordWrap(True)
+        actions = QHBoxLayout()
+        self.assessment_run_scan_button = QPushButton("Run Safe Scan")
+        self.assessment_run_scan_button.clicked.connect(self.run_safe_scan_from_assessment)
+        self.assessment_refresh_button = QPushButton("Refresh Assessment")
+        self.assessment_refresh_button.clicked.connect(self.refresh_assessment)
+        self.assessment_export_format_combo = QComboBox()
+        self.assessment_export_format_combo.addItem("HTML", "html")
+        self.assessment_export_format_combo.addItem("JSON", "json")
+        self.assessment_export_format_combo.addItem("Markdown", "md")
+        self.assessment_export_button = QPushButton("Export Assessment")
+        self.assessment_export_button.clicked.connect(self.export_assessment)
+        self.assessment_export_word_button = QPushButton("Export Word Report")
+        self.assessment_export_word_button.clicked.connect(self.export_assessment_word_report)
+        self.assessment_export_excel_button = QPushButton("Export Excel Workbook")
+        self.assessment_export_excel_button.clicked.connect(self.export_assessment_excel_workbook)
+        self.assessment_open_reports_button = QPushButton("Open Reports Folder")
+        self.assessment_open_reports_button.clicked.connect(self.open_reports_folder)
+        for widget in [
+            self.assessment_run_scan_button,
+            self.assessment_refresh_button,
+            self.assessment_export_format_combo,
+            self.assessment_export_button,
+            self.assessment_export_word_button,
+            self.assessment_export_excel_button,
+            self.assessment_open_reports_button,
+        ]:
+            actions.addWidget(widget)
+        actions.addStretch(1)
+        self.assessment_text = QTextEdit()
+        self.assessment_text.setReadOnly(True)
+        self.assessment_history_table = QTableWidget(0, 6)
+        self.assessment_history_table.setHorizontalHeaderLabels(["Timestamp", "Score", "Risk", "Critical", "High", "Summary"])
+        self.assessment_history_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(title)
+        layout.addWidget(self.assessment_status_label)
+        layout.addLayout(actions)
+        layout.addWidget(self.assessment_text)
+        layout.addWidget(QLabel("Assessment History"))
+        layout.addWidget(self.assessment_history_table)
+        self._render_assessment_empty_state()
+        return page
+
+    def _build_pre_uat_audit_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+        title = self._build_help_header("Pre-UAT Audit", "pre_uat_audit")
+        self.pre_uat_summary_label = QLabel("No Pre-UAT audit has been run in this session.")
+        self.pre_uat_summary_label.setWordWrap(True)
+        actions = QHBoxLayout()
+        self.pre_uat_full_button = QPushButton("Run Full Pre-UAT Audit")
+        self.pre_uat_ui_button = QPushButton("Run UI Audit")
+        self.pre_uat_settings_button = QPushButton("Run Settings Audit")
+        self.pre_uat_daemon_button = QPushButton("Run Daemon/Notifier Audit")
+        self.pre_uat_alert_button = QPushButton("Run Alert Pipeline Audit")
+        self.pre_uat_scan_button = QPushButton("Run Scan Audit")
+        self.pre_uat_export_button = QPushButton("Run Export Audit")
+        self.pre_uat_open_report_button = QPushButton("Open Latest Audit Report")
+        self.pre_uat_copy_blockers_button = QPushButton("Copy Blockers")
+        for button in [
+            self.pre_uat_full_button,
+            self.pre_uat_ui_button,
+            self.pre_uat_settings_button,
+            self.pre_uat_daemon_button,
+            self.pre_uat_alert_button,
+            self.pre_uat_scan_button,
+            self.pre_uat_export_button,
+            self.pre_uat_open_report_button,
+            self.pre_uat_copy_blockers_button,
+        ]:
+            actions.addWidget(button)
+        actions.addStretch(1)
+        self.pre_uat_results_text = QTextEdit()
+        self.pre_uat_results_text.setReadOnly(True)
+        self._latest_pre_uat_report = None
+        self.pre_uat_full_button.clicked.connect(lambda: self.run_pre_uat_audit("full"))
+        self.pre_uat_ui_button.clicked.connect(lambda: self.run_pre_uat_audit("ui"))
+        self.pre_uat_settings_button.clicked.connect(lambda: self.run_pre_uat_audit("settings"))
+        self.pre_uat_daemon_button.clicked.connect(lambda: self.run_pre_uat_audit("daemon"))
+        self.pre_uat_alert_button.clicked.connect(lambda: self.run_pre_uat_audit("alerts"))
+        self.pre_uat_scan_button.clicked.connect(lambda: self.run_pre_uat_audit("scans"))
+        self.pre_uat_export_button.clicked.connect(lambda: self.run_pre_uat_audit("exports"))
+        self.pre_uat_open_report_button.clicked.connect(self.open_latest_pre_uat_report)
+        self.pre_uat_copy_blockers_button.clicked.connect(self.copy_pre_uat_blockers)
+        layout.addWidget(title)
+        layout.addWidget(self.pre_uat_summary_label)
+        layout.addLayout(actions)
+        layout.addWidget(self.pre_uat_results_text)
+        return page
+
+    def run_pre_uat_audit(self, mode: str = "full") -> None:
+        try:
+            context = AuditContext(db_path=self.db.path, output_dir=get_reports_dir() / "pre_uat", mode=mode)
+            report = run_pre_uat_audit(context)
+            self._latest_pre_uat_report = report
+            counts = report.counts
+            html_path = report.output_paths.get("html", "")
+            self.pre_uat_summary_label.setText(
+                f"Latest run: {report.completed_at} | {report.readiness_decision} | "
+                f"blockers={counts['BLOCKER']} critical={counts['FAIL']} warnings={counts['WARN']} passed={counts['PASS']} | "
+                f"report={html_path}"
+            )
+            self.pre_uat_results_text.setPlainText(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        except Exception as exc:
+            self.pre_uat_summary_label.setText(f"Pre-UAT audit failed: {exc}")
+            self.pre_uat_results_text.setPlainText(str(exc))
+
+    def open_latest_pre_uat_report(self) -> None:
+        report = getattr(self, "_latest_pre_uat_report", None)
+        path = Path(report.output_paths.get("html", "")) if report else None
+        if path and path.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        else:
+            QMessageBox.warning(self, "Pre-UAT Audit", "No audit report is available yet.")
+
+    def copy_pre_uat_blockers(self) -> None:
+        report = getattr(self, "_latest_pre_uat_report", None)
+        if not report:
+            QMessageBox.warning(self, "Pre-UAT Audit", "No audit result is available yet.")
+            return
+        blockers = [
+            f"{check.check_id}: {check.actual_result}\nSuggested fix: {check.recommended_fix}"
+            for check in report.checks
+            if check.status == "BLOCKER"
+        ]
+        QApplication.clipboard().setText("\n\n".join(blockers) if blockers else "No blockers.")
+        QMessageBox.information(self, "Pre-UAT Audit", "Blockers copied to clipboard.")
+
     def _build_logs_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -2128,21 +2524,24 @@ class MainWindow(QMainWindow):
     def _build_forecast_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(self._build_help_header("Apple Exposure Assessment", "apple_exposure"))
         layout.addWidget(self.cve_radar_panel)
         return page
 
     def _build_system_recovery_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(self._build_help_header("Live Response Collection", "live_response", subtitle="Evidence snapshots, export bundles, and read-only response collection."))
         layout.addWidget(self.system_recovery_panel)
         return page
 
     def _build_reliability_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(self._build_help_header("Alert and Operational Reliability", "alert_severity"))
         layout.addWidget(self.reliability_panel)
         return page
 
@@ -2150,9 +2549,7 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(8, 8, 8, 8)
-        heading = QLabel("Visibility Integrity")
-        heading.setStyleSheet("font-size: 18px; font-weight: 700;")
-        heading.setWordWrap(True)
+        heading = self._build_help_header("Visibility Integrity", "integrity_verification")
         self.visibility_score_label = QLabel("Visibility Integrity Score: --")
         self.visibility_score_label.setStyleSheet("font-size: 16px; font-weight: 700;")
         self.visibility_score_label.setWordWrap(True)
@@ -2238,15 +2635,9 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(8, 8, 8, 8)
-        health_label = QLabel("Operational Health")
-        health_label.setStyleSheet("font-size: 18px; font-weight: 700; color: #F0F6FC;")
-        health_label.setWordWrap(True)
-        layout.addWidget(health_label)
+        layout.addWidget(self._build_help_header("Operational Health", "operational_health"))
         layout.addWidget(self.operational_health_panel)
-        monitor_label = QLabel("Monitor Settings")
-        monitor_label.setStyleSheet("font-size: 18px; font-weight: 700; color: #F0F6FC;")
-        monitor_label.setWordWrap(True)
-        layout.addWidget(monitor_label)
+        layout.addWidget(self._build_help_header("Monitor Settings", "settings"))
         layout.addWidget(self.background_monitor_panel)
         return page
 
@@ -2540,6 +2931,13 @@ class MainWindow(QMainWindow):
         nmap_credit.setWordWrap(True)
         nmap_credit.setAlignment(Qt.AlignCenter)
         layout.addWidget(nmap_credit)
+        persistence_credit = QLabel(
+            "MSAA Persistence Intelligence incorporates concepts and, where compatible, implementation ideas from macOS Persistence Radar, an open-source macOS persistence visibility and audit project.\n"
+            "https://github.com/fuzzlove/macOS-Persistence-Radar"
+        )
+        persistence_credit.setWordWrap(True)
+        persistence_credit.setAlignment(Qt.AlignCenter)
+        layout.addWidget(persistence_credit)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok)
         buttons.accepted.connect(dialog.accept)
         layout.addWidget(buttons)
@@ -3681,10 +4079,20 @@ class MainWindow(QMainWindow):
             report = self.operational_health_engine.build_report()
             self.operational_health_panel.set_report(report.to_dict())
             if hasattr(self, "dashboard_health_status_label"):
-                self.dashboard_health_status_label.setText(f"Status: {report.overall_status}")
+                self.dashboard_health_status_label.setText(f"Status: {report.display_status}")
                 self.dashboard_health_score_label.setText(f"Score: {report.health_score}/100")
-                top_issue = next((check.summary for check in report.checks if check.status != "healthy"), "All core components are healthy.")
-                self.dashboard_health_summary_label.setText(top_issue)
+                if report.security_degraded_mode:
+                    self.dashboard_health_summary_label.setText("Possible program modification or tampering detected. View integrity evidence before taking action.")
+                elif report.primary_cause:
+                    self.dashboard_health_summary_label.setText(f"{report.primary_cause.component}: {report.primary_cause.description}")
+                else:
+                    top_issue = next((check.summary for check in report.checks if check.status not in {"healthy", "disabled_by_settings", "unsupported"}), "All core components are healthy.")
+                    self.dashboard_health_summary_label.setText(top_issue)
+                self.dashboard_repair_health_button.setVisible(
+                    not report.security_degraded_mode
+                    and any(issue.auto_fixable for issue in report.issues)
+                    and report.overall_status in {"degraded", "broken", "repair recommended", "unavailable"}
+                )
             if self.current_payload is not None:
                 self.current_payload["operational_health"] = report.to_dict()
             LOGGER.info("Operational Health rendered status=%s score=%d", report.overall_status, report.health_score)
@@ -3694,6 +4102,8 @@ class MainWindow(QMainWindow):
                 self.dashboard_health_status_label.setText("Status: broken")
                 self.dashboard_health_score_label.setText("Score: 0/100")
                 self.dashboard_health_summary_label.setText(str(exc))
+                if hasattr(self, "dashboard_repair_health_button"):
+                    self.dashboard_repair_health_button.setVisible(True)
             self.operational_health_panel.set_report(
                 {
                     "generated_at": utc_now_iso(),
@@ -3711,6 +4121,531 @@ class MainWindow(QMainWindow):
                     "details": {},
                 }
             )
+
+    def _application_integrity_root(self) -> Path:
+        return Path(__file__).resolve().parents[2]
+
+    def _application_integrity_manifest_path(self) -> Path:
+        selection = select_integrity_manifest(self._application_integrity_root())
+        return selection.manifest_path
+
+    def verify_application_integrity(self) -> None:
+        root = self._application_integrity_root()
+        result = verify_current_install_integrity(root, bypass_cache=True)
+        payload = result.to_dict()
+        if self.current_payload is not None:
+            self.current_payload.setdefault("collected_artifacts", {})["application_integrity"] = payload
+            self.current_payload["application_integrity"] = payload
+        status = payload.get("overall_status", "unknown")
+        details = [
+            f"Manifest: {payload.get('manifest_path', '')}",
+            f"Source type: {payload.get('source_type', '')}",
+            f"Trust state: {payload.get('trust_state', '')}",
+            f"Health impact: {payload.get('health_impact', '')}",
+            f"Manifest app version: {payload.get('manifest_app_version', '')}",
+            f"Current app version: {payload.get('current_app_version', '')}",
+            f"Manifest build id: {payload.get('manifest_build_id', '')}",
+            f"Current build id: {payload.get('current_build_id', '')}",
+            f"Manifest git commit: {payload.get('manifest_git_commit', '')}",
+            f"Current git commit: {payload.get('current_git_commit', '')}",
+            f"Exact mismatch reason: {payload.get('exact_mismatch_reason', '')}",
+            f"Manifest hash: {payload.get('manifest_hash', '')}",
+            f"Matched: {payload.get('matched_count', 0)}",
+            f"Mismatched: {payload.get('mismatched_count', 0)}",
+            f"Missing: {payload.get('missing_count', 0)}",
+            f"Extra: {payload.get('extra_count', 0)}",
+            "",
+            "Recommended actions:",
+            *[f"- {item}" for item in payload.get("recommended_actions", [])],
+            "",
+            "Errors:",
+            *[f"- {item}" for item in payload.get("errors", [])],
+            "",
+            "Warnings:",
+            *[f"- {item}" for item in payload.get("warnings", [])],
+        ]
+        title = "MSAA Integrity Mismatch Detected" if status == "modified" else "Application Integrity Verification"
+        icon = QMessageBox.Warning if status in {"modified", "partial", "unknown", "failed"} else QMessageBox.Information
+        message = QMessageBox(self)
+        message.setIcon(icon)
+        message.setWindowTitle(title)
+        message.setText(f"Application integrity status: {status}")
+        message.setDetailedText("\n".join(str(item) for item in details if item is not None))
+        message.addButton(QMessageBox.Ok)
+        message.exec()
+        LOGGER.info("Application integrity verification status=%s manifest=%s", status, payload.get("manifest_path", ""))
+
+    def run_guided_integrity_check(self) -> None:
+        try:
+            report = IntegrityEngine(self._application_integrity_root(), db=self.db).generate_diff_report()
+            self._update_integrity_health_panel(report.to_dict())
+            message = QMessageBox(self)
+            message.setWindowTitle("Integrity Check Complete")
+            message.setIcon(QMessageBox.Warning if report.severity in {"high", "critical"} else QMessageBox.Information)
+            message.setText(report.summary)
+            message.setDetailedText("\n".join(self._integrity_diff_lines(report.to_dict())))
+            message.exec()
+        except Exception as exc:
+            LOGGER.exception("Guided integrity check failed: %s", exc)
+            QMessageBox.warning(self, "Integrity Check Failed", f"Integrity check failed:\n{exc}")
+
+    def _update_integrity_health_panel(self, report: dict) -> None:
+        if not hasattr(self, "dashboard_integrity_status_label"):
+            return
+        state = str(report.get("state", "UNKNOWN"))
+        severity = str(report.get("severity", "medium"))
+        self.dashboard_integrity_status_label.setText(f"Status: {state}")
+        self.dashboard_integrity_timestamp_label.setText(f"Last verified: {report.get('last_verified_at', '') or 'not available'}")
+        self.dashboard_integrity_manifest_label.setText(f"Manifest: {report.get('manifest_path', '') or 'not available'}")
+        self.dashboard_integrity_build_label.setText(f"Build ID: {report.get('build_id', '') or 'unknown'}")
+        self.dashboard_integrity_summary_label.setText(str(report.get("summary", "")))
+        color = {"info": "#1F883D", "medium": "#D29922", "high": "#B42318", "critical": "#B42318"}.get(severity, "#8B949E")
+        self.dashboard_integrity_status_label.setStyleSheet(f"color: white; font-weight: 700; background: {color}; padding: 4px; border-radius: 4px;")
+        self.dashboard_repair_integrity_button.setVisible(state in {"MODIFIED", "MISSING_FILES", "EXTRA_FILES", "FAILED"})
+
+    def _integrity_diff_lines(self, report: dict) -> list[str]:
+        lines = [
+            f"State: {report.get('state', '')}",
+            f"Severity: {report.get('severity', '')}",
+            f"Explanation: {report.get('explanation', '')}",
+            "",
+            "File changes:",
+        ]
+        for item in report.get("file_changes", []):
+            lines.extend(
+                [
+                    f"- {item.get('file_path', '')}",
+                    f"  status: {item.get('change_type', '')}",
+                    f"  severity: {item.get('severity', '')}",
+                    f"  expected: {item.get('expected_hash', '')}",
+                    f"  actual: {item.get('actual_hash', '')}",
+                    f"  description: {item.get('explanation', '')}",
+                ]
+            )
+        if not report.get("file_changes"):
+            lines.append("- no file differences recorded")
+        lines.extend(["", "Recommended actions:"])
+        lines.extend(f"- {item}" for item in report.get("recommended_actions", []))
+        return lines
+
+    def show_integrity_repair_wizard(self) -> None:
+        try:
+            engine = IntegrityEngine(self._application_integrity_root(), db=self.db)
+            report = engine.generate_diff_report()
+            plan = RepairWizard(engine).build_plan(report)
+            self._update_integrity_health_panel(report.to_dict())
+            message = QMessageBox(self)
+            message.setWindowTitle("Integrity Repair Wizard")
+            message.setIcon(QMessageBox.Warning)
+            message.setText(plan.recommended_action or report.summary)
+            details: list[str] = []
+            for step in plan.steps:
+                details.append(f"{step.title}: {step.description}")
+                details.extend(f"- {action}" for action in step.actions)
+            if plan.dangerous_actions:
+                details.extend(["", "Requires confirmation:", *[f"- {action}" for action in plan.dangerous_actions]])
+            details.append("")
+            details.append("Safe in-place repair can restore missing files only when a trusted repair source is provided. Reinstall from a trusted source if modified files were not expected.")
+            message.setDetailedText("\n".join(details))
+            message.exec()
+        except Exception as exc:
+            LOGGER.exception("Integrity repair wizard failed: %s", exc)
+            QMessageBox.warning(self, "Integrity Repair Wizard Failed", f"Unable to build repair plan:\n{exc}")
+
+    def show_integrity_reinstall_guidance(self) -> None:
+        QMessageBox.warning(
+            self,
+            "Reinstall MSAA From Trusted Source",
+            (
+                "Reinstall is required when modified files cannot be safely restored in place.\n\n"
+                "Preserve an integrity report and evidence snapshot first. Then replace MSAA only with a trusted release/build, rerun integrity verification, and create a new trusted baseline only after confirming the installation."
+            ),
+        )
+
+    def _application_integrity_payload(self) -> dict:
+        root = self._application_integrity_root()
+        result = verify_current_install_integrity(root, bypass_cache=True)
+        payload = result.to_dict()
+        if self.current_payload is not None:
+            self.current_payload.setdefault("collected_artifacts", {})["application_integrity"] = payload
+            self.current_payload["application_integrity"] = payload
+        return payload
+
+    def _integrity_detail_lines(self, payload: dict) -> list[str]:
+        return [
+            f"Status: {payload.get('overall_status', 'unknown')}",
+            f"Health impact: {payload.get('health_impact', '')}",
+            f"Exact reason: {payload.get('exact_mismatch_reason', '') or 'none'}",
+            "",
+            "Manifest:",
+            f"- path: {payload.get('manifest_path', '')}",
+            f"- source_type: {payload.get('source_type', '')}",
+            f"- trust state: {payload.get('trust_state', '')}",
+            f"- manifest app_version: {payload.get('manifest_app_version', '')}",
+            f"- manifest build_id: {payload.get('manifest_build_id', '')}",
+            f"- git commit: {payload.get('manifest_git_commit', '')}",
+            f"- package version: {payload.get('manifest_package_version', '')}",
+            f"- root path: {payload.get('manifest_root_path', '')}",
+            f"- created at: {payload.get('manifest_created_at', '')}",
+            f"- hash: {payload.get('manifest_hash', '')}",
+            "",
+            "Current:",
+            f"- install_mode: {payload.get('current_install_mode', '')}",
+            f"- current app_version: {payload.get('current_app_version', '')}",
+            f"- current build_id: {payload.get('current_build_id', '')}",
+            f"- git commit: {payload.get('current_git_commit', '')}",
+            f"- package version: {payload.get('current_package_version', '')}",
+            f"- root path: {payload.get('current_root_path', '')}",
+            "",
+            "Cache:",
+            f"- cached result: {payload.get('cached_result', False)}",
+            f"- cache valid: {payload.get('cache_valid', True)}",
+            f"- invalidated reason: {payload.get('cache_invalidated_reason', '') or 'none'}",
+            f"- verification result id: {payload.get('verification_result_id', payload.get('result_id', ''))}",
+            f"- verified at: {payload.get('verified_at', payload.get('checked_at', ''))}",
+            "",
+            "Files:",
+            f"- matched: {payload.get('matched_count', 0)}",
+            f"- mismatched: {payload.get('mismatched_count', 0)}",
+            f"- missing required: {payload.get('missing_count', 0)}",
+            f"- extra executables: {payload.get('extra_count', 0)}",
+            "",
+            "Ignored manifests:",
+            *[
+                f"- {item.get('path', '')}: {item.get('reason', '')}"
+                for item in payload.get("ignored_manifests", [])
+                if isinstance(item, dict)
+            ],
+            "",
+            "Mismatch fields:",
+            *[
+                f"- {item.get('field', '')}: {item.get('message', '')}"
+                for item in payload.get("mismatch_details", [])
+                if isinstance(item, dict)
+            ],
+            "",
+            "File details:",
+            *[
+                f"- {item.get('verification_status', '')}: {item.get('relative_path', '')} {', '.join(str(reason) for reason in item.get('mismatch_reasons', []))}"
+                for item in payload.get("file_results", [])
+                if isinstance(item, dict) and item.get("verification_status") in {"mismatch", "missing", "extra", "unknown"}
+            ],
+            "",
+            "Recommended actions:",
+            *[f"- {item}" for item in payload.get("recommended_actions", [])],
+        ]
+
+    def view_integrity_mismatch_details(self) -> None:
+        try:
+            payload = self._application_integrity_payload()
+            status = str(payload.get("overall_status", "unknown"))
+            message = QMessageBox(self)
+            message.setIcon(QMessageBox.Warning if status in {"modified", "failed"} else QMessageBox.Information)
+            message.setWindowTitle("Integrity Mismatch Details")
+            message.setText(f"Application integrity status: {status}")
+            message.setDetailedText("\n".join(self._integrity_detail_lines(payload)))
+            message.addButton(QMessageBox.Ok)
+            message.exec()
+        except Exception as exc:
+            LOGGER.exception("Failed to view integrity mismatch details: %s", exc)
+            QMessageBox.warning(self, "Integrity Details Failed", str(exc))
+
+    def export_integrity_report(self) -> None:
+        try:
+            payload = self._application_integrity_payload()
+            stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            default_path = get_reports_dir() / f"msaa_integrity_report_{stamp}.json"
+            path, _ = QFileDialog.getSaveFileName(self, "Export Integrity Report", str(default_path), "JSON Files (*.json)")
+            if not path:
+                return
+            output = Path(path)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+            self.db.set_background_monitor_state("last_integrity_report_export_path", str(output))
+            self.db.set_background_monitor_state("last_integrity_report_export_at", utc_now_iso())
+            QMessageBox.information(self, "Integrity Report Exported", f"Saved integrity report to:\n{output}")
+        except Exception as exc:
+            LOGGER.exception("Failed to export integrity report: %s", exc)
+            QMessageBox.warning(self, "Export Integrity Report Failed", str(exc))
+
+    def _record_integrity_manifest_audit(self, action: str, manifest_path: Path, before: dict, after: dict, backup_path: Path | None = None) -> None:
+        entry = {
+            "timestamp": utc_now_iso(),
+            "action": action,
+            "manifest_path": str(manifest_path),
+            "backup_path": str(backup_path) if backup_path else "",
+            "before_status": before.get("overall_status", ""),
+            "after_status": after.get("overall_status", ""),
+            "before_reason": before.get("exact_mismatch_reason", ""),
+            "after_reason": after.get("exact_mismatch_reason", ""),
+            "verification_result_id": after.get("verification_result_id", after.get("result_id", "")),
+        }
+        raw = self.db.get_background_monitor_state("integrity_manifest_audit_log_json", "[]")
+        try:
+            audit_log = json.loads(raw)
+        except json.JSONDecodeError:
+            audit_log = []
+        if not isinstance(audit_log, list):
+            audit_log = []
+        audit_log.append(entry)
+        self.db.set_background_monitor_state("integrity_manifest_audit_log_json", json.dumps(audit_log[-100:], sort_keys=True))
+        self.db.set_background_monitor_state("last_integrity_manifest_audit", json.dumps(entry, sort_keys=True))
+
+    def resolve_integrity_manifest_mismatch(self) -> None:
+        root = self._application_integrity_root()
+        selection = select_integrity_manifest(root)
+        manifest_path = selection.manifest_path
+        result = verify_current_install_integrity(root, bypass_cache=True)
+        payload = result.to_dict()
+        status = str(payload.get("overall_status", "unknown"))
+        mismatch_lines = [
+            f"Status: {status}",
+            f"Manifest: {payload.get('manifest_path', '')}",
+            f"Manifest source type: {payload.get('source_type', '')}",
+            f"Current install mode: {payload.get('current_install_mode', '')}",
+            f"Manifest app version: {payload.get('manifest_app_version', '')}",
+            f"Current app version: {payload.get('current_app_version', '')}",
+            f"Manifest build id: {payload.get('manifest_build_id', '')}",
+            f"Current build id: {payload.get('current_build_id', '')}",
+            f"Manifest git commit: {payload.get('manifest_git_commit', '')}",
+            f"Current git commit: {payload.get('current_git_commit', '')}",
+            f"Exact reason: {payload.get('exact_mismatch_reason', '') or 'none'}",
+            f"Matched files: {payload.get('matched_count', 0)}",
+            f"Mismatched files: {payload.get('mismatched_count', 0)}",
+            f"Missing files: {payload.get('missing_count', 0)}",
+            f"Extra executables: {payload.get('extra_count', 0)}",
+        ]
+        if status == "modified" or payload.get("mismatched_count") or payload.get("missing_count"):
+            QMessageBox.warning(
+                self,
+                "Integrity Files Modified",
+                "Current files differ from the trusted manifest. Preserve evidence and reinstall from a trusted source unless this change is known and approved.\n\n"
+                + "\n".join(mismatch_lines),
+            )
+            return
+        if status == "incompatible_manifest":
+            QMessageBox.warning(
+                self,
+                "Wrong Integrity Manifest",
+                "The selected manifest does not apply to this install mode. Select or create a trusted manifest for the current mode.\n\n"
+                + "\n".join(mismatch_lines),
+            )
+            return
+        if status not in {"stale", "unknown", "draft"}:
+            QMessageBox.information(self, "Integrity Mismatch Resolver", "No stale manifest mismatch currently requires resolution.\n\n" + "\n".join(mismatch_lines))
+            return
+        if status == "stale":
+            prompt = (
+                "The trusted manifest was generated for a different MSAA app version or build. Required files did not show hash mismatches.\n\n"
+                "Only continue if this MSAA installation/build was obtained from a trusted source.\n\n"
+                + "\n".join(mismatch_lines)
+            )
+        else:
+            prompt = (
+                "No compatible trusted manifest is available. Only create one after verifying this MSAA installation came from a trusted source.\n\n"
+                + "\n".join(mismatch_lines)
+            )
+        if QMessageBox.question(self, "Resolve Integrity Manifest Mismatch", prompt) != QMessageBox.StandardButton.Yes:
+            return
+        attest_dialog = QDialog(self)
+        attest_dialog.setWindowTitle("Confirm Trusted MSAA Build")
+        attest_layout = QVBoxLayout(attest_dialog)
+        attest_layout.addWidget(QLabel("Only continue if this MSAA installation/build was obtained from a trusted source."))
+        trusted_source_checkbox = QCheckBox("I confirm this MSAA installation/build was obtained from a trusted source.")
+        attest_layout.addWidget(trusted_source_checkbox)
+        attest_buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        attest_buttons.accepted.connect(attest_dialog.accept)
+        attest_buttons.rejected.connect(attest_dialog.reject)
+        attest_layout.addWidget(attest_buttons)
+        if attest_dialog.exec() != QDialog.Accepted or not trusted_source_checkbox.isChecked():
+            QMessageBox.warning(self, "Trusted Manifest Not Created", "Trusted-source confirmation was not checked. Current files were not trusted.")
+            return
+        confirmation, ok = QInputDialog.getText(
+            self,
+            "Confirm Trusted Build",
+            "Type TRUST CURRENT BUILD to record the current MSAA build as trusted.",
+        )
+        if not ok or confirmation != "TRUST CURRENT BUILD":
+            QMessageBox.warning(self, "Trusted Manifest Not Created", "Confirmation did not match. Current files were not trusted.")
+            return
+        try:
+            before_payload = payload
+            backup_path = None
+            if manifest_path.exists():
+                backup_path = manifest_path.with_suffix(f".{datetime.now().strftime('%Y%m%d%H%M%S')}.bak")
+                backup_path.write_text(manifest_path.read_text(encoding="utf-8"), encoding="utf-8")
+            manifest = create_integrity_manifest(root, source_type=selection.expected_source_type, notes="Created from Resolve Mismatch after explicit trusted build confirmation.")
+            write_integrity_manifest(manifest, manifest_path)
+            fresh = verify_current_install_integrity(root, bypass_cache=True)
+            self._record_integrity_manifest_audit("resolve_mismatch_create_trusted_manifest", manifest_path, before_payload, fresh.to_dict(), backup_path)
+            QMessageBox.information(
+                self,
+                "Integrity Manifest Resolved",
+                f"New trusted manifest created and verification reran.\n\nStatus: {fresh.overall_status}\nMatched files: {fresh.matched_count}",
+            )
+            self.refresh_operational_health()
+        except Exception as exc:
+            LOGGER.exception("Failed to resolve integrity manifest mismatch: %s", exc)
+            QMessageBox.warning(self, "Resolve Integrity Mismatch Failed", str(exc))
+
+    def _show_runtime_integrity_result(self, title: str, payload: dict) -> None:
+        status = str(payload.get("overall_status", "modified" if payload.get("tamper_detected") else "unknown"))
+        details = [
+            f"Scope: {payload.get('scope', '')}",
+            f"Manifest: {payload.get('manifest_path', '')}",
+            f"Runtime path: {payload.get('runtime_root', '')}",
+            f"Runtime package: {payload.get('runtime_package_root', '')}",
+            f"Plist: {payload.get('plist_path', '')}",
+            f"Owner/mode status: {'locked down' if payload.get('lockdown_compliant') else 'needs review'}",
+            f"Manifest digest: {payload.get('manifest_digest_status', '')}",
+            "",
+            "Evidence:",
+            *[f"- {item}" for item in payload.get("evidence", [])],
+            "",
+            f"Recommended action: {payload.get('recommendation', '')}",
+        ]
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Warning if status in {"modified", "unknown", "partial", "failed"} or payload.get("tamper_detected") else QMessageBox.Information)
+        message.setWindowTitle("MSAA Integrity Mismatch Detected" if payload.get("tamper_detected") else title)
+        message.setText(f"{title}: {status}")
+        message.setDetailedText("\n".join(str(item) for item in details if item is not None))
+        message.addButton(QMessageBox.Ok)
+        message.exec()
+
+    def verify_system_monitor_integrity(self) -> None:
+        try:
+            payload = verify_protected_monitor_integrity(scope="system")
+            if self.current_payload is not None:
+                self.current_payload.setdefault("collected_artifacts", {})["system_monitor_integrity"] = payload
+            self._show_runtime_integrity_result("System Monitor Integrity", payload)
+        except Exception as exc:
+            LOGGER.exception("System monitor integrity verification failed: %s", exc)
+            QMessageBox.warning(self, "System Monitor Integrity Failed", str(exc))
+
+    def verify_user_notifier_integrity(self) -> None:
+        try:
+            payload = verify_protected_monitor_integrity(scope="user")
+            if self.current_payload is not None:
+                self.current_payload.setdefault("collected_artifacts", {})["user_notifier_integrity"] = payload
+            self._show_runtime_integrity_result("User Notifier Integrity", payload)
+        except Exception as exc:
+            LOGGER.exception("User notifier integrity verification failed: %s", exc)
+            QMessageBox.warning(self, "User Notifier Integrity Failed", str(exc))
+
+    def create_trusted_integrity_manifest(self) -> None:
+        root = self._application_integrity_root()
+        selection = select_integrity_manifest(root)
+        manifest_path = selection.manifest_path
+        warning = (
+            "This action records the current files as trusted. Only do this after installing or building MSAA from a trusted source.\n\n"
+            f"Manifest path:\n{manifest_path}"
+        )
+        if QMessageBox.question(self, "Create Trusted Manifest", warning) != QMessageBox.StandardButton.Yes:
+            return
+        attest_dialog = QDialog(self)
+        attest_dialog.setWindowTitle("Confirm Trusted MSAA Build")
+        attest_layout = QVBoxLayout(attest_dialog)
+        attest_layout.addWidget(QLabel("Only continue if this MSAA installation/build was obtained from a trusted source."))
+        trusted_source_checkbox = QCheckBox("I confirm this MSAA installation/build was obtained from a trusted source.")
+        attest_layout.addWidget(trusted_source_checkbox)
+        attest_buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        attest_buttons.accepted.connect(attest_dialog.accept)
+        attest_buttons.rejected.connect(attest_dialog.reject)
+        attest_layout.addWidget(attest_buttons)
+        if attest_dialog.exec() != QDialog.Accepted or not trusted_source_checkbox.isChecked():
+            QMessageBox.warning(self, "Trusted Manifest Not Created", "Trusted-source confirmation was not checked. Current files were not trusted.")
+            return
+        confirmation, ok = QInputDialog.getText(
+            self,
+            "Confirm Trusted Manifest",
+            "Type TRUST CURRENT FILES to confirm this is a trusted MSAA installation.",
+        )
+        if not ok or confirmation != "TRUST CURRENT FILES":
+            QMessageBox.warning(self, "Trusted Manifest Not Created", "Confirmation did not match. Current files were not trusted.")
+            return
+        try:
+            before_payload = verify_current_install_integrity(root, bypass_cache=True).to_dict()
+            backup_path = None
+            if manifest_path.exists():
+                backup_path = manifest_path.with_suffix(f".{datetime.now().strftime('%Y%m%d%H%M%S')}.bak")
+                backup_path.write_text(manifest_path.read_text(encoding="utf-8"), encoding="utf-8")
+            manifest = create_integrity_manifest(root, source_type=selection.expected_source_type, notes="Created from UI after explicit trusted confirmation.")
+            write_integrity_manifest(manifest, manifest_path)
+            fresh = verify_current_install_integrity(root, bypass_cache=True)
+            self._record_integrity_manifest_audit("create_trusted_manifest", manifest_path, before_payload, fresh.to_dict(), backup_path)
+            LOGGER.info("Trusted integrity manifest created at %s", manifest_path)
+            QMessageBox.information(
+                self,
+                "Trusted Manifest Created",
+                f"Trusted manifest created with {len(manifest.file_entries)} file entries.\n\nVerification will compare current files to this manifest.",
+            )
+            self.verify_application_integrity()
+        except Exception as exc:
+            LOGGER.exception("Failed to create trusted integrity manifest: %s", exc)
+            QMessageBox.warning(self, "Create Trusted Manifest Failed", str(exc))
+
+    def repair_operational_health(self) -> None:
+        try:
+            before_report = self.operational_health_engine.build_report()
+            engine = OperationalRepairEngine(self.db, health_engine=self.operational_health_engine)
+            plan = engine.build_plan(before_report.to_dict())
+            if not plan.actions:
+                QMessageBox.information(self, "Operational Health Repair", "No repairable Operational Health issues were found.")
+                self.refresh_operational_health()
+                return
+            review_lines = [
+                "Diagnose: Operational Health diagnostics completed.",
+                "",
+                "Review proposed repairs:",
+            ]
+            for action in plan.actions:
+                review_lines.extend(
+                    [
+                        f"- {action.title}",
+                        f"  Component: {action.component}",
+                        f"  Issue: {action.issue}",
+                        f"  Proposed fix: {action.proposed_fix}",
+                        f"  Requires admin: {'yes' if action.requires_admin else 'no'}",
+                        f"  Destructive: {'yes' if action.destructive else 'no'}",
+                        f"  Restart required: {'yes' if action.requires_restart else 'no'}",
+                        f"  Command preview: {action.command_preview or 'none'}",
+                    ]
+                )
+            manual_count = len(plan.manual_actions)
+            safe_count = len(plan.safe_actions)
+            message = QMessageBox(self)
+            message.setWindowTitle("Repair Operational Health")
+            message.setIcon(QMessageBox.Warning if manual_count else QMessageBox.Information)
+            message.setText(f"{safe_count} safe repair(s) can run automatically. {manual_count} repair(s) require manual/admin action.")
+            message.setDetailedText("\n".join(review_lines))
+            run_button = message.addButton("Run Safe Repairs", QMessageBox.ButtonRole.AcceptRole)
+            cancel_button = message.addButton(QMessageBox.Cancel)
+            message.exec()
+            if message.clickedButton() != run_button:
+                return
+            result = engine.run_safe_repairs(plan)
+            self.refresh_operational_health()
+            result_lines = [
+                "Repair:",
+                *[
+                    f"- {action.title}: {action.status}"
+                    + (f" | {action.error}" if action.error else "")
+                    + (f" | verify: {action.verification_result[:240]}" if action.verification_result else "")
+                    for action in result.actions
+                ],
+                "",
+                "Verify:",
+                f"Before: {result.before_status or 'unknown'}",
+                f"After: {result.after_status or 'unknown'}",
+                "",
+                "Report:",
+                result.summary,
+            ]
+            QMessageBox.information(self, "Operational Health Repair", "\n".join(result_lines))
+        except Exception as exc:
+            LOGGER.exception("Operational Health repair failed: %s", exc)
+            QMessageBox.warning(self, "Operational Health Repair Failed", str(exc))
+            self.refresh_operational_health()
 
     def refresh_reliability(self) -> None:
         if not hasattr(self, "reliability_panel"):
@@ -4279,21 +5214,350 @@ class MainWindow(QMainWindow):
             current_text = current_item.text() if current_item is not None else ""
             if current_text == "Investigation Priorities" and hasattr(self, "results_tabs"):
                 self.results_tabs.setCurrentWidget(self.investigation_priority_panel)
+            elif current_text == "Network Intelligence" and hasattr(self, "network_intelligence_panel"):
+                self.refresh_network_intelligence()
             elif current_text == "Results" and hasattr(self, "results_tabs"):
                 self.results_tabs.setCurrentIndex(0)
+            elif current_text == "Assessment" and hasattr(self, "assessment_text"):
+                if self.current_assessment is None and self.db.latest_security_assessment() is None:
+                    self._render_assessment_empty_state()
+                else:
+                    self.refresh_assessment()
 
-    def _show_sidebar_page(self, title: str) -> None:
+    def _show_sidebar_page(self, title: str) -> bool:
         if not hasattr(self, "sidebar"):
-            return
+            return False
         matches = self.sidebar.findItems(title, Qt.MatchExactly)
         if matches:
             self.sidebar.setCurrentItem(matches[0])
+            return True
+        return False
 
-    def show_forecast_page(self) -> None:
-        self._show_sidebar_page("Dashboard")
+    def navigate_to_view(self, view_id: str) -> bool:
+        view_map = {
+            "dashboard": "Dashboard",
+            "assessment": "Assessment",
+            "apple_exposure_assessment": "Apple Exposure Assessment",
+            "monitoring_coverage": "Framework Coverage",
+            "reports": "Results",
+            "settings": "Settings",
+        }
+        title = view_map.get(view_id)
+        if not title:
+            LOGGER.error("Navigation failed: unknown view_id=%s", view_id)
+            self._show_navigation_unavailable("Requested view is unavailable.")
+            return False
+        if not self._show_sidebar_page(title):
+            LOGGER.error("Navigation failed: view_id=%s title=%s unavailable", view_id, title)
+            self._show_navigation_unavailable(f"{title} view is unavailable.")
+            return False
+        return True
+
+    def _show_navigation_unavailable(self, message: str) -> None:
+        self.statusBar().showMessage(message, 5000)
+        QMessageBox.warning(self, "Navigation Unavailable", message)
+
+    def refresh_apple_exposure_view_if_needed(self) -> None:
+        if not hasattr(self, "cve_radar_panel"):
+            return
+        payload = getattr(self.cve_radar_panel, "_radar_payload", {}) or {}
+        if not payload.get("timestamp") and not payload.get("generated_at"):
+            self.cve_radar_panel.set_status("Assessment not checked yet")
+            self.cve_radar_panel.reason_label.setText("Apple Exposure Assessment has not been checked yet.")
+
+    def open_apple_exposure_assessment(self) -> None:
+        if not self.navigate_to_view("apple_exposure_assessment"):
+            LOGGER.error("Apple Exposure Assessment view is unavailable.")
+            return
+        self.refresh_apple_exposure_view_if_needed()
         if hasattr(self, "cve_radar_panel"):
             self.cve_radar_panel.setFocus(Qt.OtherFocusReason)
-        self.statusBar().showMessage("Apple Exposure Assessment is available on the Dashboard", 3000)
+        self.statusBar().showMessage("Apple Exposure Assessment opened", 3000)
+
+    def show_forecast_page(self) -> None:
+        self.open_apple_exposure_assessment()
+
+    def show_assessment_page(self) -> None:
+        self._show_sidebar_page("Assessment")
+        self.refresh_assessment()
+
+    def run_safe_scan_from_assessment(self) -> None:
+        if hasattr(self, "scan_mode_combo"):
+            index = self.scan_mode_combo.findData("safe")
+            if index >= 0:
+                self.scan_mode_combo.setCurrentIndex(index)
+        self._show_sidebar_page("Dashboard")
+        self.run_scan()
+
+    def refresh_assessment(self) -> None:
+        try:
+            assessment = self._build_current_security_assessment()
+            self.current_assessment = assessment
+            self.db.record_security_assessment(assessment)
+            self._render_assessment(assessment)
+            self._refresh_assessment_history()
+            self.statusBar().showMessage("assessment refreshed", 4000)
+        except Exception as exc:
+            self.db.set_background_monitor_state("assessment_builder_error", str(exc))
+            if hasattr(self, "assessment_status_label"):
+                self.assessment_status_label.setText(f"Assessment unavailable: {exc}")
+            if hasattr(self, "assessment_text"):
+                self.assessment_text.setPlainText(
+                    "\n".join(
+                        [
+                            "Assessment failed.",
+                            f"Database path: {self.db.path}",
+                            f"Assessment builder error: {exc}",
+                            f"Latest scan exists: {'yes' if self.db.latest_scan_result() is not None else 'no'}",
+                            f"Latest monitor events exist: {'yes' if self.db.recent_background_monitor_events(limit=1) else 'no'}",
+                        ]
+                    )
+                )
+            QMessageBox.warning(self, "Show Assessment Failed", f"Failed to build assessment:\n{exc}")
+
+    def _build_current_security_assessment(self) -> SecurityAssessment:
+        scan_result = self.current_scan_result or self.db.latest_scan_result()
+        events = self.db.recent_background_monitor_events(limit=1000)
+        monitor_status = self.db.get_background_monitor_status()
+        apple_exposure = self.cve_radar_engine.load_cached_state()
+        try:
+            visibility = self._current_visibility_integrity_payload()
+        except Exception as exc:
+            visibility = {"status": "unavailable", "error": str(exc)}
+        try:
+            reliability = self._current_reliability_payload()
+        except Exception as exc:
+            reliability = {"status": "unavailable", "error": str(exc)}
+        try:
+            physical_devices = self.db.physical_device_report()
+        except Exception as exc:
+            physical_devices = {"status": "unavailable", "summary": f"Physical device report unavailable: {exc}"}
+        persistence_payload = {}
+        try:
+            persistence_report = getattr(getattr(self, "persistence_intelligence_panel", None), "report", None)
+            if persistence_report is not None:
+                persistence_payload = persistence_report.to_dict()
+        except Exception as exc:
+            persistence_payload = {"status": "unavailable", "error": str(exc)}
+        settings = self.notification_manager.settings()
+        assessment = build_security_assessment(
+            scan_result,
+            monitor_status,
+            events,
+            settings,
+            apple_exposure=apple_exposure,
+            visibility_integrity=visibility,
+            reliability=reliability,
+            physical_devices=physical_devices,
+            persistence_intelligence=persistence_payload,
+        )
+        assessment.diagnostics.update(
+            {
+                "database_path": str(self.db.path),
+                "latest_scan_exists": scan_result is not None,
+                "latest_monitor_events_exist": bool(events),
+                "assessment_builder_error": "",
+            }
+        )
+        return assessment
+
+    def _render_assessment_empty_state(self) -> None:
+        if hasattr(self, "assessment_status_label"):
+            self.assessment_status_label.setText("No assessment is available yet. Run a Safe Scan or refresh monitor data to generate an assessment.")
+        if hasattr(self, "assessment_text"):
+            self.assessment_text.setPlainText("No assessment is available yet. Run a Safe Scan or refresh monitor data to generate an assessment.")
+        self._refresh_assessment_history()
+
+    def _render_assessment(self, assessment: SecurityAssessment) -> None:
+        score = "Unavailable" if assessment.overall_score is None else f"{assessment.overall_score}/100"
+        self.assessment_status_label.setText(
+            f"Status: {assessment.assessment_status} | Score: {score} | Risk: {assessment.risk_level} | Created: {assessment.created_at}"
+        )
+        self.assessment_text.setPlainText(self._assessment_text_body(assessment))
+
+    def _assessment_text_body(self, assessment: SecurityAssessment) -> str:
+        def section(title: str, value: object) -> list[str]:
+            if isinstance(value, (dict, list)):
+                rendered = json.dumps(json_safe(value), indent=2, sort_keys=True)
+            else:
+                rendered = str(value)
+            return [title, "-" * len(title), rendered, ""]
+
+        lines: list[str] = []
+        lines.extend(section("Overall Security Assessment", {
+            "score": assessment.overall_score,
+            "risk_level": assessment.risk_level,
+            "freshness": assessment.data_freshness,
+            "monitor_status": assessment.monitor_integrity_summary.get("status", "unavailable"),
+        }))
+        lines.extend(section("Executive Summary", assessment.executive_summary))
+        lines.extend(section("Top Risks", assessment.top_risks or "No top risks recorded."))
+        lines.extend(section("Category Breakdown", {
+            "Admin & Persistence": assessment.admin_persistence_summary,
+            "Network Activity": assessment.network_activity_summary,
+            "Physical Devices / USB": assessment.physical_device_summary,
+            "Apple Exposure": assessment.apple_exposure_summary,
+            "Monitor Integrity": assessment.monitor_integrity_summary,
+            "Baseline Drift": assessment.baseline_drift_summary,
+            "Evidence / Reporting": assessment.evidence_summary,
+        }))
+        lines.extend(section("Framework Alignment", {
+            "Mapped to NIST CSF 2.0": assessment.nist_summary.get("mapped_to_nist_csf_2_0", {}),
+            "Aligned with NIST 800-53": assessment.nist_summary.get("aligned_with_nist_800_53", {}),
+            "Mapped to MITRE ATT&CK": assessment.mitre_summary,
+        }))
+        lines.extend(section("Recommended Next Actions", assessment.recommended_actions or "No actions recorded."))
+        lines.extend(section("Limitations", assessment.limitations or "None recorded."))
+        lines.extend(section("Diagnostics", assessment.diagnostics))
+        return "\n".join(lines)
+
+    def _refresh_assessment_history(self) -> None:
+        if not hasattr(self, "assessment_history_table"):
+            return
+        rows = self.db.assessment_history(limit=20)
+        self.assessment_history_table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            values = [
+                row.get("created_at", ""),
+                "Unavailable" if row.get("score") is None else str(row.get("score")),
+                row.get("risk_level", ""),
+                row.get("critical_count", 0),
+                row.get("high_count", 0),
+                row.get("summary", ""),
+            ]
+            for column, value in enumerate(values):
+                self.assessment_history_table.setItem(row_index, column, QTableWidgetItem(str(value)))
+
+    def export_assessment(self) -> None:
+        assessment = self.current_assessment
+        if assessment is None:
+            latest = self.db.latest_security_assessment()
+            if latest:
+                assessment = SecurityAssessment(**latest)
+            else:
+                assessment = self._build_current_security_assessment()
+                self.db.record_security_assessment(assessment)
+                self.current_assessment = assessment
+        fmt = str(self.assessment_export_format_combo.currentData() or "html")
+        default_path = default_assessment_path(assessment, fmt)
+        filter_map = {"html": "HTML Files (*.html)", "json": "JSON Files (*.json)", "md": "Markdown Files (*.md)"}
+        path, _ = QFileDialog.getSaveFileName(self, "Export Assessment", str(default_path), filter_map.get(fmt, "All Files (*)"))
+        if not path:
+            return
+        try:
+            if fmt == "json":
+                saved_path = export_security_assessment_json(assessment, Path(path))
+            elif fmt == "md":
+                saved_path = export_security_assessment_markdown(assessment, Path(path))
+            else:
+                saved_path = export_security_assessment_html(assessment, Path(path))
+        except OSError as exc:
+            self.db.set_background_monitor_state("assessment_export_error", str(exc))
+            QMessageBox.critical(self, "Export Assessment Failed", f"Failed to export assessment:\n{exc}")
+            return
+        self.statusBar().showMessage("assessment exported", 5000)
+        QMessageBox.information(self, "Assessment Exported", f"Saved assessment to:\n{saved_path}")
+
+    def _existing_assessment_for_office_export(self) -> SecurityAssessment | None:
+        if self.current_assessment is not None:
+            return self.current_assessment
+        latest = self.db.latest_security_assessment()
+        if latest:
+            try:
+                self.current_assessment = SecurityAssessment(**latest)
+                return self.current_assessment
+            except Exception as exc:
+                self.db.set_background_monitor_state("assessment_export_error", f"latest assessment load failed: {exc}")
+        QMessageBox.information(
+            self,
+            "No Assessment Available",
+            "No assessment is available yet. Run a Safe Scan or Show Assessment first.",
+        )
+        return None
+
+    def _office_export_options(self) -> ExportOptions | None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Office Export Options")
+        layout = QVBoxLayout(dialog)
+        controls: dict[str, QCheckBox] = {}
+        options = [
+            ("include_executive_summary", "Include executive summary", True),
+            ("include_detailed_findings", "Include detailed findings", True),
+            ("include_evidence_appendix", "Include evidence appendix", False),
+            ("include_framework_mappings", "Include framework mappings", True),
+            ("include_remediation_plan", "Include remediation plan", True),
+            ("include_historical_events", "Include historical events", False),
+            ("include_raw_technical_appendix", "Include raw technical appendix", False),
+            ("include_limitations", "Include limitations", True),
+            ("redact_usernames_hostnames", "Redact usernames/hostnames", False),
+        ]
+        for key, label, checked in options:
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(checked)
+            controls[key] = checkbox
+            layout.addWidget(checkbox)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        return ExportOptions(**{key: checkbox.isChecked() for key, checkbox in controls.items()})
+
+    def _office_assessment_default_path(self, assessment: SecurityAssessment, suffix: str) -> Path:
+        host = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in assessment.hostname) or "mac"
+        stamp = assessment.created_at.replace(":", "").replace("+", "Z").replace("-", "")[:15]
+        return get_reports_dir() / f"MSAA_Security_Assessment_{host}_{stamp}.{suffix}"
+
+    def export_assessment_word_report(self) -> None:
+        assessment = self._existing_assessment_for_office_export()
+        if assessment is None:
+            return
+        options = self._office_export_options()
+        if options is None:
+            return
+        default_path = self._office_assessment_default_path(assessment, "docx")
+        path, _ = QFileDialog.getSaveFileName(self, "Export Word Report", str(default_path), "Word Documents (*.docx)")
+        if not path:
+            return
+        try:
+            saved_path = export_assessment_word(assessment, Path(path), options=options)
+            self.db.set_background_monitor_state("last_word_export_status", "success")
+            self.db.set_background_monitor_state("last_word_export_path", str(saved_path))
+            self.db.set_background_monitor_state("last_word_export_error", "")
+        except Exception as exc:
+            self.db.set_background_monitor_state("last_word_export_status", "failed")
+            self.db.set_background_monitor_state("last_word_export_path", str(path))
+            self.db.set_background_monitor_state("last_word_export_error", str(exc))
+            QMessageBox.critical(self, "Export Word Report Failed", f"Failed to export Word report:\n{path}\n\n{exc}")
+            return
+        self.statusBar().showMessage("Word report exported", 5000)
+        QMessageBox.information(self, "Word Report Exported", f"Saved Word report to:\n{saved_path}")
+
+    def export_assessment_excel_workbook(self) -> None:
+        assessment = self._existing_assessment_for_office_export()
+        if assessment is None:
+            return
+        options = self._office_export_options()
+        if options is None:
+            return
+        default_path = self._office_assessment_default_path(assessment, "xlsx")
+        path, _ = QFileDialog.getSaveFileName(self, "Export Excel Workbook", str(default_path), "Excel Workbooks (*.xlsx)")
+        if not path:
+            return
+        try:
+            saved_path = export_assessment_excel(assessment, Path(path), options=options)
+            self.db.set_background_monitor_state("last_excel_export_status", "success")
+            self.db.set_background_monitor_state("last_excel_export_path", str(saved_path))
+            self.db.set_background_monitor_state("last_excel_export_error", "")
+        except Exception as exc:
+            self.db.set_background_monitor_state("last_excel_export_status", "failed")
+            self.db.set_background_monitor_state("last_excel_export_path", str(path))
+            self.db.set_background_monitor_state("last_excel_export_error", str(exc))
+            QMessageBox.critical(self, "Export Excel Workbook Failed", f"Failed to export Excel workbook:\n{path}\n\n{exc}")
+            return
+        self.statusBar().showMessage("Excel workbook exported", 5000)
+        QMessageBox.information(self, "Excel Workbook Exported", f"Saved Excel workbook to:\n{saved_path}")
 
     def show_intrusion_detection_page(self) -> None:
         self._show_sidebar_page("Intrusion Detection")
@@ -4465,6 +5729,12 @@ class MainWindow(QMainWindow):
         self.current_scan_summary = summary
         self._load_scan_result(scan_result)
         self._refresh_dashboard()
+        try:
+            assessment = self._build_current_security_assessment()
+            self.current_assessment = assessment
+            self.db.record_security_assessment(assessment)
+        except Exception as exc:
+            self.db.set_background_monitor_state("assessment_builder_error", str(exc))
         self._refresh_command_preview_page()
         self.refresh_visibility_integrity()
         self.statusBar().showMessage("scan completed", 5000)
@@ -4679,6 +5949,96 @@ class MainWindow(QMainWindow):
             message = f"{message}\n\n" + "\n".join(details)
         response = QMessageBox.question(self, "Authorized Local Scan Notice", message)
         return response == QMessageBox.StandardButton.Yes
+
+    def refresh_network_intelligence(self) -> None:
+        if not hasattr(self, "network_intelligence_panel"):
+            return
+        settings = NotificationManager(self.db).settings()
+        latest_payload = self.db.latest_network_intelligence_snapshot()
+        previous_snapshot = snapshot_from_dict(latest_payload) if latest_payload else None
+        try:
+            snapshot = NetworkIntelligenceCollector().collect(baseline=previous_snapshot, settings=settings)
+            if not hasattr(snapshot, "to_dict") or not hasattr(snapshot, "diagnostics"):
+                LOGGER.error(
+                    "Network Intelligence collector returned unexpected snapshot type: %s",
+                    type(snapshot).__name__,
+                )
+                raise TypeError(f"unexpected network intelligence snapshot type: {type(snapshot).__name__}")
+            event_count = 0
+            for event in snapshot_to_events(snapshot):
+                if self.db.record_background_monitor_event(event):
+                    event_count += 1
+            try:
+                snapshot.diagnostics.update(
+                    build_network_intelligence_diagnostics(
+                        snapshot,
+                        settings=settings,
+                        extra={
+                            "db_write_success": "pending",
+                            "alert_pipeline_success": "yes" if event_count or not snapshot.findings else "no events recorded",
+                            "normalized_event_count": event_count,
+                        },
+                    )
+                )
+            except Exception as diagnostics_exc:
+                LOGGER.exception(
+                    "Network Intelligence diagnostics failed function=%s snapshot_type=%s snapshot_id=%s",
+                    "build_network_intelligence_diagnostics",
+                    type(snapshot).__name__,
+                    getattr(snapshot, "snapshot_id", ""),
+                )
+                snapshot.diagnostics.update(
+                    {
+                        "module_loaded": True,
+                        "collectors_running": True,
+                        "last_error": "Diagnostics failed to generate. See logs.",
+                        "failure_stage": "diagnostics_builder",
+                        "db_write_success": "pending",
+                        "alert_pipeline_success": "yes" if event_count or not snapshot.findings else "no events recorded",
+                        "ui_tab_loading_success": True,
+                        "permissions_status": "read-only collectors",
+                        "diagnostics_error_context": {
+                            "snapshot_id": str(getattr(snapshot, "snapshot_id", "")),
+                            "function_called": "build_network_intelligence_diagnostics",
+                            "invalid_kwargs": {},
+                            "timestamp": utc_now_iso(),
+                            "error": str(diagnostics_exc),
+                        },
+                    }
+                )
+            self.db.record_network_intelligence_snapshot(snapshot)
+            snapshot.diagnostics["db_write_success"] = True
+            payload = snapshot.to_dict()
+            if self.current_payload is None:
+                self.current_payload = {
+                    "dashboard": {},
+                    "findings": [],
+                    "raw_logs": [],
+                    "collected_artifacts": {},
+                }
+            self.current_payload["network_intelligence"] = payload
+            self.current_payload.setdefault("collected_artifacts", {})["network_intelligence"] = payload
+            self.network_intelligence_panel.set_snapshot(payload, settings=settings)
+            self.statusBar().showMessage("Network Intelligence refreshed", 4000)
+        except Exception as exc:
+            LOGGER.exception("Network Intelligence refresh failed")
+            diagnostics = {
+                "module_loaded": True,
+                "collectors_running": False,
+                "last_error": str(exc),
+                "failure_stage": "collector_or_storage",
+                "db_write_success": False,
+                "alert_pipeline_success": False,
+                "ui_tab_loading_success": True,
+                "permissions_status": "see collector error",
+            }
+            if latest_payload:
+                latest_payload.setdefault("diagnostics", {}).update(diagnostics)
+                self.network_intelligence_panel.set_snapshot(latest_payload, settings=settings)
+            else:
+                self.network_intelligence_panel.set_snapshot({"diagnostics": diagnostics}, settings=settings)
+            self.db.set_background_monitor_state("network_intelligence_last_error", str(exc))
+            self.statusBar().showMessage("Network Intelligence refresh failed", 5000)
 
     def run_nmap_local_scan(self) -> None:
         profile_key = str(self.nmap_profile_combo.currentData()) if hasattr(self, "nmap_profile_combo") else DEFAULT_SCAN_PROFILE
@@ -6270,11 +7630,28 @@ class MainWindow(QMainWindow):
     def export_html(self) -> Path | None:
         if not self._ensure_scan_state():
             return None
+        report_label, accepted = QInputDialog.getItem(
+            self,
+            "Report Detail Level",
+            "Report Detail Level:",
+            ["Analyst", "Executive", "Full Technical"],
+            0,
+            False,
+        )
+        if not accepted:
+            return None
+        detail_level = str(report_label or "Analyst").lower().replace(" ", "_")
+        if detail_level == "full_technical":
+            QMessageBox.information(
+                self,
+                "Full Technical Report",
+                "Full Technical reports may be large because raw evidence appendices and diagnostics can be included.",
+            )
         default_report_path = str(default_html_report_path())
         path, _ = QFileDialog.getSaveFileName(self, "Export HTML Report", default_report_path, "HTML Files (*.html)")
         if not path:
             return None
-        include_background_monitor_logs = self._confirm_include_background_monitor_logs()
+        include_background_monitor_logs = True if detail_level == "full_technical" else self._confirm_include_background_monitor_logs()
         include_investigation_notes = self._confirm_include_investigation_notes()
         background_monitor_events = [item.to_dict() for item in self.db.recent_background_monitor_events(limit=1000)] if include_background_monitor_logs else []
         investigation_notes = [item.to_dict() for item in self.db.list_investigation_notes(linked_scan_id=self._current_scan_id(), limit=1000)] if include_investigation_notes else []
@@ -6295,6 +7672,7 @@ class MainWindow(QMainWindow):
                 investigation_audit_trail=investigation_audit_trail,
                 investigation_priorities=investigation_priorities,
                 reliability=reliability,
+                detail_level=detail_level,
             )
         except OSError as exc:
             self.statusBar().showMessage("export failed", 5000)
@@ -6359,9 +7737,10 @@ class MainWindow(QMainWindow):
         return True
 
     def _apply_severity_style(self, items: list[QTableWidgetItem], severity: str) -> None:
-        if severity not in SEVERITY_COLOR_MAP:
+        normalized = normalize_severity(severity)
+        if normalized == "unknown" and str(severity or "").strip().lower() not in {"unknown", "review_needed", "unavailable"}:
             return
-        bg_color, fg_color = severity_qcolors(severity)
+        bg_color, fg_color = severity_qcolors(normalized)
         bg = QBrush(bg_color)
         fg = QBrush(fg_color)
         for item in items:

@@ -27,6 +27,7 @@ from mac_audit_agent.models import (
     FindingSuppressionRule,
     EventAlertTrace,
     NotificationCapabilities,
+    USBDeviceIdentity,
     HistoryIndicator,
     InvestigationAuditEntry,
     InvestigationNote,
@@ -491,6 +492,18 @@ class AuditDatabase:
                 scan_id TEXT PRIMARY KEY,
                 payload_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS assessment_history (
+                assessment_id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                score INTEGER,
+                risk_level TEXT NOT NULL,
+                critical_count INTEGER NOT NULL DEFAULT 0,
+                high_count INTEGER NOT NULL DEFAULT 0,
+                medium_count INTEGER NOT NULL DEFAULT 0,
+                info_count INTEGER NOT NULL DEFAULT 0,
+                summary TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS findings (
                 id TEXT PRIMARY KEY,
                 finding_id TEXT NOT NULL DEFAULT '',
@@ -639,6 +652,84 @@ class AuditDatabase:
                 confidence TEXT NOT NULL DEFAULT '',
                 payload_json TEXT NOT NULL DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS network_intelligence_snapshots (
+                snapshot_id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS network_connections (
+                connection_id TEXT PRIMARY KEY,
+                snapshot_id TEXT NOT NULL DEFAULT '',
+                timestamp TEXT NOT NULL DEFAULT '',
+                protocol TEXT NOT NULL DEFAULT '',
+                local_address TEXT NOT NULL DEFAULT '',
+                local_port TEXT NOT NULL DEFAULT '',
+                remote_address TEXT NOT NULL DEFAULT '',
+                remote_port TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL DEFAULT '',
+                pid INTEGER,
+                process_name TEXT NOT NULL DEFAULT '',
+                user TEXT NOT NULL DEFAULT '',
+                baseline_status TEXT NOT NULL DEFAULT '',
+                risk_level TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS network_ports (
+                listener_id TEXT PRIMARY KEY,
+                snapshot_id TEXT NOT NULL DEFAULT '',
+                timestamp TEXT NOT NULL DEFAULT '',
+                protocol TEXT NOT NULL DEFAULT '',
+                address TEXT NOT NULL DEFAULT '',
+                port TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL DEFAULT '',
+                process TEXT NOT NULL DEFAULT '',
+                pid INTEGER,
+                user TEXT NOT NULL DEFAULT '',
+                service_guess TEXT NOT NULL DEFAULT '',
+                visibility_status TEXT NOT NULL DEFAULT '',
+                risk_level TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS network_posture (
+                snapshot_id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL DEFAULT '',
+                gateway TEXT NOT NULL DEFAULT '',
+                dns_servers_json TEXT NOT NULL DEFAULT '[]',
+                vpn_state TEXT NOT NULL DEFAULT '',
+                proxy_state TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS network_findings (
+                finding_id TEXT PRIMARY KEY,
+                snapshot_id TEXT NOT NULL DEFAULT '',
+                timestamp TEXT NOT NULL DEFAULT '',
+                severity TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT '',
+                evidence TEXT NOT NULL DEFAULT '',
+                suggested_fix TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS network_baseline (
+                baseline_id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL DEFAULT '',
+                trusted INTEGER NOT NULL DEFAULT 1,
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS network_events (
+                event_id TEXT PRIMARY KEY,
+                snapshot_id TEXT NOT NULL DEFAULT '',
+                timestamp TEXT NOT NULL DEFAULT '',
+                event_type TEXT NOT NULL DEFAULT '',
+                severity TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS network_sentinel_diagnostics (
+                snapshot_id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
             CREATE TABLE IF NOT EXISTS baseline_drift_snapshots (
                 baseline_id TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL,
@@ -781,6 +872,16 @@ class AuditDatabase:
                 result_text TEXT NOT NULL DEFAULT '',
                 payload_json TEXT NOT NULL DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS integrity_history (
+                run_id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                result_status TEXT NOT NULL,
+                changed_file_count INTEGER NOT NULL DEFAULT 0,
+                missing_file_count INTEGER NOT NULL DEFAULT 0,
+                extra_file_count INTEGER NOT NULL DEFAULT 0,
+                user_action_taken TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
             CREATE TABLE IF NOT EXISTS background_monitor_events (
                 event_id TEXT PRIMARY KEY,
                 timestamp TEXT NOT NULL,
@@ -816,6 +917,44 @@ class AuditDatabase:
             CREATE TABLE IF NOT EXISTS background_monitor_state (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS usb_device_identities (
+                device_id TEXT PRIMARY KEY,
+                vendor_id TEXT NOT NULL DEFAULT '',
+                product_id TEXT NOT NULL DEFAULT '',
+                serial_number TEXT NOT NULL DEFAULT '',
+                device_name TEXT NOT NULL DEFAULT '',
+                manufacturer TEXT NOT NULL DEFAULT '',
+                device_class TEXT NOT NULL DEFAULT '',
+                subclass TEXT NOT NULL DEFAULT '',
+                protocol TEXT NOT NULL DEFAULT '',
+                transport TEXT NOT NULL DEFAULT 'USB',
+                location_id TEXT NOT NULL DEFAULT '',
+                current_connected INTEGER NOT NULL DEFAULT 0,
+                first_seen TEXT NOT NULL DEFAULT '',
+                last_seen TEXT NOT NULL DEFAULT '',
+                last_removed TEXT NOT NULL DEFAULT '',
+                baseline_status TEXT NOT NULL DEFAULT 'unknown',
+                trust_status TEXT NOT NULL DEFAULT 'unknown',
+                user_label TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                confidence TEXT NOT NULL DEFAULT 'medium',
+                source_method TEXT NOT NULL DEFAULT '',
+                last_event_id TEXT NOT NULL DEFAULT '',
+                last_event_type TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS usb_device_history (
+                history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                event_id TEXT NOT NULL DEFAULT '',
+                event_type TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT '',
+                baseline_status TEXT NOT NULL DEFAULT '',
+                trust_status TEXT NOT NULL DEFAULT '',
+                location_id TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}'
             );
             CREATE TABLE IF NOT EXISTS event_alert_traces (
                 trace_id TEXT PRIMARY KEY,
@@ -861,6 +1000,20 @@ class AuditDatabase:
                 delivery_method_used TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL,
                 payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS repair_history (
+                repair_id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                component TEXT NOT NULL,
+                issue TEXT NOT NULL,
+                action TEXT NOT NULL,
+                requires_admin INTEGER NOT NULL DEFAULT 0,
+                command_preview TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                stdout TEXT NOT NULL DEFAULT '',
+                stderr TEXT NOT NULL DEFAULT '',
+                error TEXT NOT NULL DEFAULT '',
+                verification_result TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS background_monitor_heartbeats (
                 heartbeat_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -998,6 +1151,13 @@ class AuditDatabase:
         self._ensure_column("system_cleanup_actions", "deleted_json", "TEXT NOT NULL DEFAULT '[]'")
         self._ensure_column("system_cleanup_actions", "result_text", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("system_cleanup_actions", "payload_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("integrity_history", "timestamp", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("integrity_history", "result_status", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("integrity_history", "changed_file_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("integrity_history", "missing_file_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("integrity_history", "extra_file_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("integrity_history", "user_action_taken", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("integrity_history", "payload_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_column("finding_suppression_rules", "rationale", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("finding_suppression_rules", "active", "INTEGER NOT NULL DEFAULT 1")
         self._ensure_column("finding_suppression_rules", "matched_count", "INTEGER NOT NULL DEFAULT 0")
@@ -1023,6 +1183,9 @@ class AuditDatabase:
         self._ensure_column("background_monitor_events", "duplicate_category", "TEXT NOT NULL DEFAULT 'single'")
         self._ensure_column("background_monitor_events", "first_seen", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("background_monitor_events", "last_seen", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("usb_device_identities", "payload_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("usb_device_identities", "last_event_type", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("usb_device_identities", "last_event_id", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("event_alert_traces", "original_event_type", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("event_alert_traces", "normalized_event_type", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("event_alert_traces", "detector_source", "TEXT NOT NULL DEFAULT ''")
@@ -1243,6 +1406,168 @@ class AuditDatabase:
         if commit:
             self.conn.commit()
 
+    def record_network_intelligence_snapshot(self, snapshot, *, commit: bool = True) -> None:
+        payload = snapshot.to_dict() if hasattr(snapshot, "to_dict") else dict(snapshot)
+        snapshot_id = str(payload.get("snapshot_id", ""))
+        timestamp = str(payload.get("timestamp", ""))
+        self.conn.execute(
+            "INSERT OR REPLACE INTO network_intelligence_snapshots (snapshot_id, timestamp, payload_json) VALUES (?, ?, ?)",
+            (snapshot_id, timestamp, json.dumps(json_safe(payload))),
+        )
+        self.conn.execute("DELETE FROM network_connections WHERE snapshot_id = ?", (snapshot_id,))
+        self.conn.executemany(
+            """
+            INSERT OR REPLACE INTO network_connections
+            (connection_id, snapshot_id, timestamp, protocol, local_address, local_port, remote_address, remote_port, state, pid, process_name, user, baseline_status, risk_level, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    str(item.get("connection_id", "")),
+                    snapshot_id,
+                    str(item.get("timestamp", timestamp)),
+                    str(item.get("protocol", "")),
+                    str(item.get("local_address", "")),
+                    str(item.get("local_port", "")),
+                    str(item.get("remote_address", "")),
+                    str(item.get("remote_port", "")),
+                    str(item.get("state", "")),
+                    item.get("pid") if isinstance(item.get("pid"), int) else None,
+                    str(item.get("process_name", "")),
+                    str(item.get("user", "")),
+                    str(item.get("baseline_status", "")),
+                    str(item.get("risk_level", "")),
+                    json.dumps(json_safe(item)),
+                )
+                for item in payload.get("connections", [])
+                if isinstance(item, dict)
+            ],
+        )
+        self.conn.execute("DELETE FROM network_ports WHERE snapshot_id = ?", (snapshot_id,))
+        self.conn.executemany(
+            """
+            INSERT OR REPLACE INTO network_ports
+            (listener_id, snapshot_id, timestamp, protocol, address, port, state, process, pid, user, service_guess, visibility_status, risk_level, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    str(item.get("listener_id", "")),
+                    snapshot_id,
+                    str(item.get("timestamp", timestamp)),
+                    str(item.get("protocol", "")),
+                    str(item.get("local_address", item.get("address", ""))),
+                    str(item.get("port", "")),
+                    str(item.get("state", "")),
+                    str(item.get("process_name", item.get("process", ""))),
+                    item.get("pid") if isinstance(item.get("pid"), int) else None,
+                    str(item.get("user", "")),
+                    str(item.get("service_guess", "")),
+                    str(item.get("visibility_status", "")),
+                    str(item.get("risk_level", "")),
+                    json.dumps(json_safe(item)),
+                )
+                for item in payload.get("listeners", [])
+                if isinstance(item, dict)
+            ],
+        )
+        posture = payload.get("posture", {}) if isinstance(payload.get("posture", {}), dict) else {}
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO network_posture
+            (snapshot_id, timestamp, gateway, dns_servers_json, vpn_state, proxy_state, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot_id,
+                str(posture.get("timestamp", timestamp)),
+                str(posture.get("gateway", "")),
+                json.dumps(json_safe(posture.get("dns_servers", []))),
+                "active" if posture.get("vpn_active") else "inactive",
+                "enabled" if posture.get("proxy_enabled") else "disabled",
+                json.dumps(json_safe(posture)),
+            ),
+        )
+        self.conn.execute("DELETE FROM network_findings WHERE snapshot_id = ?", (snapshot_id,))
+        self.conn.executemany(
+            """
+            INSERT OR REPLACE INTO network_findings
+            (finding_id, snapshot_id, timestamp, severity, title, category, evidence, suggested_fix, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    str(item.get("finding_id", "")),
+                    snapshot_id,
+                    str(item.get("created_at", timestamp)),
+                    str(item.get("severity", "")),
+                    str(item.get("title", "")),
+                    str(item.get("category", "")),
+                    str(item.get("evidence", "")),
+                    str(item.get("suggested_fix", "")),
+                    json.dumps(json_safe(item)),
+                )
+                for item in payload.get("findings", [])
+                if isinstance(item, dict)
+            ],
+        )
+        diagnostics = payload.get("diagnostics", {}) if isinstance(payload.get("diagnostics", {}), dict) else {}
+        baseline = payload.get("baseline_comparison", {}) if isinstance(payload.get("baseline_comparison", {}), dict) else {}
+        self.conn.execute(
+            "INSERT OR REPLACE INTO network_baseline (baseline_id, created_at, trusted, payload_json) VALUES (?, ?, ?, ?)",
+            (
+                f"{snapshot_id}-baseline",
+                timestamp,
+                1,
+                json.dumps(json_safe(baseline)),
+            ),
+        )
+        self.conn.execute("DELETE FROM network_events WHERE snapshot_id = ?", (snapshot_id,))
+        self.conn.executemany(
+            """
+            INSERT OR REPLACE INTO network_events
+            (event_id, snapshot_id, timestamp, event_type, severity, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    str(item.get("finding_id", f"{snapshot_id}-{index}")),
+                    snapshot_id,
+                    str(item.get("created_at", timestamp)),
+                    str(item.get("category", "network_intelligence")),
+                    str(item.get("severity", "")),
+                    json.dumps(json_safe(item)),
+                )
+                for index, item in enumerate(payload.get("findings", []))
+                if isinstance(item, dict)
+            ],
+        )
+        self.conn.execute(
+            "INSERT OR REPLACE INTO network_sentinel_diagnostics (snapshot_id, timestamp, status, payload_json) VALUES (?, ?, ?, ?)",
+            (
+                snapshot_id,
+                timestamp,
+                "degraded" if diagnostics.get("errors") else "ok",
+                json.dumps(json_safe(diagnostics)),
+            ),
+        )
+        self.set_background_monitor_state("network_intelligence_last_snapshot_id", snapshot_id)
+        self.set_background_monitor_state("network_intelligence_last_scan_time", timestamp)
+        if commit:
+            self.conn.commit()
+
+    def latest_network_intelligence_snapshot(self) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT payload_json FROM network_intelligence_snapshots ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            payload = json.loads(str(row["payload_json"]))
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
+
     def record_baseline_drift_snapshot(self, payload: dict[str, Any]) -> None:
         self.conn.execute(
             """
@@ -1319,6 +1644,51 @@ class AuditDatabase:
         except (json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
             LOGGER.exception("Failed to hydrate scan result %s: %s", scan_id, exc)
             return None
+
+    def record_security_assessment(self, assessment: Any) -> None:
+        payload = assessment.to_dict() if hasattr(assessment, "to_dict") else dict(assessment)
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO assessment_history
+            (assessment_id, created_at, score, risk_level, critical_count, high_count, medium_count, info_count, summary, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(payload.get("assessment_id", "")),
+                str(payload.get("created_at", utc_now_iso())),
+                payload.get("overall_score"),
+                str(payload.get("risk_level", "info")),
+                len(payload.get("critical_findings", []) or []),
+                len(payload.get("high_findings", []) or []),
+                len(payload.get("medium_findings", []) or []),
+                len(payload.get("info_findings", []) or []),
+                str(payload.get("executive_summary", "")),
+                json.dumps(json_safe(payload), sort_keys=True),
+            ),
+        )
+        self.conn.commit()
+
+    def latest_security_assessment(self) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT payload_json FROM assessment_history ORDER BY created_at DESC LIMIT 1").fetchone()
+        if not row:
+            return None
+        try:
+            payload = json.loads(str(row["payload_json"] or "{}"))
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def assessment_history(self, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT assessment_id, created_at, score, risk_level, critical_count, high_count, medium_count, info_count, summary
+            FROM assessment_history
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_finding_by_id(self, finding_id: str) -> Finding | None:
         row = self.conn.execute("SELECT * FROM findings WHERE id = ? OR finding_id = ? ORDER BY created_at DESC LIMIT 1", (finding_id, finding_id)).fetchone()
@@ -1504,6 +1874,42 @@ class AuditDatabase:
         )
         self.conn.commit()
         return int(cursor.lastrowid)
+
+    def record_integrity_history(self, report: Any, *, user_action_taken: str = "verification_only") -> None:
+        payload = report.to_dict() if hasattr(report, "to_dict") else dict(report)
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO integrity_history
+            (run_id, timestamp, result_status, changed_file_count, missing_file_count, extra_file_count, user_action_taken, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(payload.get("run_id", "")),
+                str(payload.get("timestamp", utc_now_iso())),
+                str(payload.get("status", payload.get("result_status", "unknown"))),
+                len(payload.get("changed_files", []) or []),
+                len(payload.get("missing_files", []) or []),
+                len(payload.get("extra_files", []) or []),
+                user_action_taken,
+                json.dumps(json_safe(payload), sort_keys=True),
+            ),
+        )
+        self.conn.commit()
+
+    def latest_integrity_history(self, limit: int = 25) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM integrity_history ORDER BY timestamp DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            payload = dict(row)
+            try:
+                payload["payload_json"] = json.loads(str(payload.get("payload_json") or "{}"))
+            except json.JSONDecodeError:
+                payload["payload_json"] = {}
+            results.append(payload)
+        return results
 
     def record_user_approval(self, command_id: str, approved_at: str, approval_text: str) -> None:
         self.conn.execute(
@@ -2411,6 +2817,151 @@ class AuditDatabase:
     def get_background_monitor_state(self, key: str, default: str = "") -> str:
         row = self.conn.execute("SELECT value FROM background_monitor_state WHERE key = ?", (key,)).fetchone()
         return str(row["value"]) if row else default
+
+    def upsert_usb_device_identity(self, identity: USBDeviceIdentity) -> USBDeviceIdentity:
+        existing = self.get_usb_device_identity(identity.device_id)
+        if existing:
+            identity.first_seen = existing.first_seen or identity.first_seen
+            identity.user_label = existing.user_label
+            identity.notes = existing.notes
+            identity.trust_status = existing.trust_status if existing.trust_status != "unknown" else identity.trust_status
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO usb_device_identities
+            (device_id, vendor_id, product_id, serial_number, device_name, manufacturer, device_class, subclass, protocol, transport, location_id, current_connected, first_seen, last_seen, last_removed, baseline_status, trust_status, user_label, notes, confidence, source_method, last_event_id, last_event_type, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                identity.device_id,
+                identity.vendor_id,
+                identity.product_id,
+                identity.serial_number,
+                identity.device_name,
+                identity.manufacturer,
+                identity.device_class,
+                identity.subclass,
+                identity.protocol,
+                identity.transport,
+                identity.location_id,
+                int(bool(identity.current_connected)),
+                identity.first_seen,
+                identity.last_seen,
+                identity.last_removed,
+                identity.baseline_status,
+                identity.trust_status,
+                identity.user_label,
+                identity.notes,
+                identity.confidence,
+                identity.source_method,
+                identity.last_event_id,
+                identity.last_event_type,
+                json.dumps(identity.to_dict(), sort_keys=True),
+            ),
+        )
+        self.conn.commit()
+        return identity
+
+    def get_usb_device_identity(self, device_id: str) -> USBDeviceIdentity | None:
+        row = self.conn.execute("SELECT * FROM usb_device_identities WHERE device_id = ?", (device_id,)).fetchone()
+        if not row:
+            return None
+        return USBDeviceIdentity(
+            device_id=str(row["device_id"]),
+            vendor_id=str(row["vendor_id"] or ""),
+            product_id=str(row["product_id"] or ""),
+            serial_number=str(row["serial_number"] or ""),
+            device_name=str(row["device_name"] or ""),
+            manufacturer=str(row["manufacturer"] or ""),
+            device_class=str(row["device_class"] or ""),
+            subclass=str(row["subclass"] or ""),
+            protocol=str(row["protocol"] or ""),
+            transport=str(row["transport"] or "USB"),
+            location_id=str(row["location_id"] or ""),
+            current_connected=bool(row["current_connected"]),
+            first_seen=str(row["first_seen"] or ""),
+            last_seen=str(row["last_seen"] or ""),
+            last_removed=str(row["last_removed"] or ""),
+            baseline_status=str(row["baseline_status"] or "unknown"),
+            trust_status=str(row["trust_status"] or "unknown"),
+            user_label=str(row["user_label"] or ""),
+            notes=str(row["notes"] or ""),
+            confidence=str(row["confidence"] or "medium"),
+            source_method=str(row["source_method"] or ""),
+            last_event_id=str(row["last_event_id"] or ""),
+            last_event_type=str(row["last_event_type"] or ""),
+        )
+
+    def list_usb_device_identities(self, *, limit: int = 500) -> list[USBDeviceIdentity]:
+        rows = self.conn.execute(
+            "SELECT * FROM usb_device_identities ORDER BY last_seen DESC, first_seen DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [item for row in rows if (item := self.get_usb_device_identity(str(row["device_id"])))]
+
+    def set_usb_device_trust(self, device_id: str, trust_status: str, *, user_label: str = "", notes: str = "") -> None:
+        trust_status = trust_status if trust_status in {"trusted", "untrusted", "unknown"} else "unknown"
+        self.conn.execute(
+            """
+            UPDATE usb_device_identities
+            SET trust_status = ?,
+                baseline_status = CASE WHEN ? = 'trusted' THEN 'trusted' WHEN ? = 'untrusted' THEN 'untrusted' ELSE baseline_status END,
+                user_label = CASE WHEN ? != '' THEN ? ELSE user_label END,
+                notes = CASE WHEN ? != '' THEN ? ELSE notes END
+            WHERE device_id = ?
+            """,
+            (trust_status, trust_status, trust_status, user_label, user_label, notes, notes, device_id),
+        )
+        self.conn.commit()
+
+    def forget_usb_device(self, device_id: str) -> None:
+        self.conn.execute("DELETE FROM usb_device_identities WHERE device_id = ?", (device_id,))
+        self.conn.commit()
+
+    def record_usb_device_history(self, identity: USBDeviceIdentity, *, event_id: str, event_type: str, timestamp: str, severity: str) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO usb_device_history
+            (device_id, event_id, event_type, timestamp, severity, baseline_status, trust_status, location_id, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                identity.device_id,
+                event_id,
+                event_type,
+                timestamp,
+                severity,
+                identity.baseline_status,
+                identity.trust_status,
+                identity.location_id,
+                json.dumps(identity.to_dict(), sort_keys=True),
+            ),
+        )
+        self.conn.commit()
+
+    def usb_device_history(self, device_id: str = "", *, limit: int = 200) -> list[dict[str, Any]]:
+        if device_id:
+            rows = self.conn.execute(
+                "SELECT * FROM usb_device_history WHERE device_id = ? ORDER BY timestamp DESC LIMIT ?",
+                (device_id, limit),
+            ).fetchall()
+        else:
+            rows = self.conn.execute("SELECT * FROM usb_device_history ORDER BY timestamp DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def physical_device_report(self) -> dict[str, Any]:
+        devices = [item.to_dict() for item in self.list_usb_device_identities(limit=1000)]
+        events = [event.to_dict() for event in self.latest_monitor_events(limit=200) if "usb" in event.event_type or "bluetooth" in event.event_type or "physical_device" in event.event_type]
+        return {
+            "current_usb_devices": [item for item in devices if item.get("current_connected")],
+            "known_usb_devices": devices,
+            "new_usb_devices": [item for item in devices if item.get("baseline_status") == "new"],
+            "trusted_usb_devices": [item for item in devices if item.get("trust_status") == "trusted"],
+            "untrusted_usb_devices": [item for item in devices if item.get("trust_status") == "untrusted"],
+            "bluetooth_devices": [event for event in events if "bluetooth" in event.get("event_type", "")],
+            "recent_device_alerts": events,
+            "device_history": self.usb_device_history(limit=200),
+            "trust_store_path": str(getattr(self, "path", "")),
+        }
 
     def record_event_alert_trace(self, trace: EventAlertTrace | dict[str, Any]) -> None:
         payload = trace.to_dict() if hasattr(trace, "to_dict") else dict(trace)

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import html
+import logging
 from typing import Any
 
-from PySide6.QtCore import QTimer, Qt, Signal
+from PySide6.QtCore import QTimer, Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -22,6 +24,10 @@ from PySide6.QtWidgets import (
 )
 
 from mac_audit_agent.ui.action_state import ActionState, apply_action_state
+from mac_audit_agent.apple_exposure_guidance import build_apple_exposure_update_guide
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 FORECAST_STYLES = {
@@ -113,7 +119,7 @@ BUTTON_TOOLTIPS = {
     "details": "Open full advisory details and local evidence for this assessment card.",
     "review": "Mark this assessment item as reviewed without hiding it permanently.",
     "snooze": "Temporarily hide alerts for this assessment item.",
-    "guidance": "Show recommended Apple update steps.",
+    "guidance": "Open step-by-step update and remediation guidance for this Apple security exposure item.",
 }
 
 
@@ -143,6 +149,44 @@ class CveRadarDetailsDialog(QDialog):
         layout.addWidget(viewer)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok)
         buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
+
+
+class CveRadarUpdateGuidanceDialog(QDialog):
+    def __init__(
+        self,
+        body: str,
+        *,
+        parent: QWidget | None = None,
+        open_software_update=None,
+        refresh_assessment=None,
+        create_evidence_snapshot=None,
+        mark_reviewed=None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Update Guidance")
+        layout = QVBoxLayout(self)
+        viewer = QTextEdit()
+        viewer.setReadOnly(True)
+        viewer.setPlainText(body or "Apple security update guidance could not be rendered. Refresh Apple Exposure Assessment and view diagnostics.")
+        layout.addWidget(viewer)
+
+        action_row = QHBoxLayout()
+        self.open_software_update_button = make_forecast_button("Open Software Update", "Open System Settings at Software Update when possible.", "primary", min_width=160)
+        self.snapshot_button = make_forecast_button("Create Evidence Snapshot", "Create an MSAA evidence snapshot before updating if this Mac is under investigation.", "secondary", min_width=180)
+        self.refresh_button = make_forecast_button("Refresh Assessment", "Refresh Apple Exposure Assessment after reviewing or updating.", "secondary", min_width=150)
+        self.review_button = make_forecast_button("Mark Reviewed", "Mark the selected Apple Exposure item as reviewed.", "secondary", min_width=130)
+        for button in [self.open_software_update_button, self.snapshot_button, self.refresh_button, self.review_button]:
+            action_row.addWidget(button)
+        layout.addLayout(action_row)
+
+        self.open_software_update_button.clicked.connect(open_software_update or (lambda: None))
+        self.snapshot_button.clicked.connect(create_evidence_snapshot or (lambda: None))
+        self.refresh_button.clicked.connect(refresh_assessment or (lambda: None))
+        self.review_button.clicked.connect(mark_reviewed or (lambda: None))
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
 
@@ -269,7 +313,7 @@ class CveRadarCardWidget(QFrame):
         primary = make_forecast_button("Details", BUTTON_TOOLTIPS["details"], "primary", min_width=110)
         review = make_forecast_button("Reviewed", BUTTON_TOOLTIPS["review"], "secondary", min_width=110)
         snooze = make_forecast_button("Snooze", BUTTON_TOOLTIPS["snooze"], "warning", min_width=110)
-        guidance = make_forecast_button("Update Guide", BUTTON_TOOLTIPS["guidance"], "urgent", min_width=120)
+        guidance = make_forecast_button("Update Guidance", BUTTON_TOOLTIPS["guidance"], "urgent", min_width=135)
         for button in [primary, review, snooze, guidance]:
             button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         primary.clicked.connect(lambda: self.details_requested.emit(self.card))
@@ -319,6 +363,7 @@ class CveRadarPanel(QFrame):
     export_requested = Signal()
     review_requested = Signal(object)
     snooze_requested = Signal(object, object)
+    evidence_snapshot_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -363,7 +408,7 @@ class CveRadarPanel(QFrame):
         self.kev_label = QLabel("KEV matches: 0")
         self.apple_updates_label = QLabel("Apple updates available: no")
         self.status_label = QLabel("Assessment not checked yet")
-        self.reason_label = QLabel("No assessment has been checked yet.")
+        self.reason_label = QLabel("Apple Exposure Assessment has not been checked yet.")
         self.reason_label.setWordWrap(True)
         for widget in [
             self.last_updated_label,
@@ -407,15 +452,16 @@ class CveRadarPanel(QFrame):
         button_grid = QVBoxLayout()
         top_button_row = QHBoxLayout()
         self.update_button = make_forecast_button("Update Assessment", BUTTON_TOOLTIPS["update"], "primary")
+        self.toolbar_guidance_button = make_forecast_button("Update Guidance", BUTTON_TOOLTIPS["guidance"], "urgent")
         self.diagnostics_button = make_forecast_button("Diagnostics", BUTTON_TOOLTIPS["diagnostics"], "secondary")
         self.export_button = make_forecast_button("Export Assessment", "Export the current Apple Exposure Assessment report.", "secondary")
         self.details_button = make_forecast_button("View Details", BUTTON_TOOLTIPS["details"], "primary")
         self.review_button = make_forecast_button("Reviewed", BUTTON_TOOLTIPS["review"], "secondary")
         self.snooze_button = make_forecast_button("Snooze", BUTTON_TOOLTIPS["snooze"], "warning")
-        self.guidance_button = make_forecast_button("Update Guide", BUTTON_TOOLTIPS["guidance"], "urgent")
+        self.guidance_button = make_forecast_button("Update Guidance", BUTTON_TOOLTIPS["guidance"], "urgent")
         for button in [self.update_button, self.diagnostics_button, self.export_button]:
             button.setEnabled(False)
-        for button in [self.update_button, self.diagnostics_button]:
+        for button in [self.update_button, self.toolbar_guidance_button, self.diagnostics_button]:
             top_button_row.addWidget(button)
         top_button_row.addWidget(self.export_button)
         button_grid.addLayout(top_button_row)
@@ -453,6 +499,7 @@ class CveRadarPanel(QFrame):
         layout.addWidget(self.selected_action_frame)
 
         self.update_button.clicked.connect(self.update_requested.emit)
+        self.toolbar_guidance_button.clicked.connect(self.open_update_guidance)
         self.diagnostics_button.clicked.connect(self.diagnostics_requested.emit)
         self.export_button.clicked.connect(self.export_requested.emit)
         self.details_button.clicked.connect(self.open_details)
@@ -618,8 +665,9 @@ class CveRadarPanel(QFrame):
     def _set_buttons_enabled(self, enabled: bool) -> None:
         self.diagnostics_button.setEnabled(True)
         state = ActionState(enabled, True, "Select an assessment card first.", ["selected assessment card"])
-        for button in [self.details_button, self.review_button, self.snooze_button, self.guidance_button]:
+        for button in [self.details_button, self.review_button, self.snooze_button]:
             apply_action_state(button, state)
+        apply_action_state(self.guidance_button, ActionState(True, True, "", []))
 
     def _detail_text(self, card: dict[str, Any]) -> str:
         alerts = card.get("alerts") or [card]
@@ -690,7 +738,7 @@ class CveRadarPanel(QFrame):
 
     def _reason_text(self, payload: dict[str, Any]) -> str:
         if not payload.get("timestamp") and not payload.get("generated_at"):
-            return "No Apple Exposure Assessment has been checked yet."
+            return "Apple Exposure Assessment has not been checked yet."
         if payload.get("last_error") and not payload.get("display_cards"):
             return "Update failed and the panel is using cached data." if payload.get("timestamp") else "Update failed and no cache exists."
         cards = payload.get("alerts") or payload.get("cards") or payload.get("display_cards") or []
@@ -719,11 +767,12 @@ class CveRadarPanel(QFrame):
             return
         self._open_card_details(card)
 
+    def open_apple_exposure_update_guide(self, selected_item=None) -> None:
+        self._open_card_update_guidance(selected_item if selected_item is not None else self.current_card())
+
     def open_update_guidance(self) -> None:
         card = self.current_card()
-        if not card:
-            return
-        self._open_card_update_guidance(card)
+        self.open_apple_exposure_update_guide(card)
 
     def mark_reviewed(self) -> None:
         card = self.current_card()
@@ -741,13 +790,60 @@ class CveRadarPanel(QFrame):
         dialog = CveRadarDetailsDialog(str(card.get("title", "Apple Exposure Assessment Details")), self._detail_text(card), self)
         dialog.exec()
 
-    def _open_card_update_guidance(self, card: dict[str, Any]) -> None:
-        dialog = CveRadarDetailsDialog(
-            "Update Guidance",
-            f"{card.get('update_guidance', '')}\n\nRecommended action:\n{card.get('recommended_action', '')}",
-            self,
-        )
-        dialog.exec()
+    def _open_card_update_guidance(self, card: dict[str, Any] | None) -> None:
+        try:
+            inventory = self._radar_payload.get("inventory", {}) if isinstance(self._radar_payload.get("inventory", {}), dict) else {}
+            guide = build_apple_exposure_update_guide(card, inventory, self._radar_payload)
+            body = guide.to_text()
+            diagnostics = {
+                "button_clicked": "update_guidance",
+                "selected_item_id": guide.source_card_id or guide.source_finding_id,
+                "selected_item_type": type(card).__name__ if card is not None else "None",
+                "product": guide.affected_product,
+                "category": guide.affected_component,
+                "forecast_level": guide.forecast_level,
+                "data_freshness": self._radar_payload.get("generated_at", self._radar_payload.get("timestamp", "")),
+                "guide_generated": bool(body.strip()),
+                "missing_fields": guide.missing_fields,
+                "fallback_used": guide.fallback_used,
+            }
+            LOGGER.info("Apple Exposure update guidance opened %s", diagnostics)
+            dialog = CveRadarUpdateGuidanceDialog(
+                body,
+                parent=self,
+                open_software_update=self.open_software_update,
+                refresh_assessment=self.update_requested.emit,
+                create_evidence_snapshot=self.evidence_snapshot_requested.emit,
+                mark_reviewed=lambda: self._review_card(card) if card else None,
+            )
+            dialog.exec()
+        except Exception as exc:
+            LOGGER.exception("Apple Exposure update guidance failed: %s", exc)
+            dialog = CveRadarDetailsDialog(
+                "Update Guidance Error",
+                f"Update guidance could not be opened.\n\nError: {exc}\n\nRefresh Apple Exposure Assessment or view diagnostics.",
+                self,
+            )
+            dialog.exec()
+
+    def open_software_update(self) -> None:
+        urls = [
+            "x-apple.systempreferences:com.apple.Software-Update-Settings.extension",
+            "x-apple.systempreferences:com.apple.systempreferences",
+        ]
+        success = False
+        for target in urls:
+            success = QDesktopServices.openUrl(QUrl(target))
+            LOGGER.info("Apple Exposure open Software Update attempted target=%s success=%s", target, success)
+            if success:
+                break
+        if not success:
+            dialog = CveRadarDetailsDialog(
+                "Open Software Update",
+                "Open System Settings manually, then go to General -> Software Update.",
+                self,
+            )
+            dialog.exec()
 
     def _review_card(self, card: dict[str, Any]) -> None:
         self.review_requested.emit(card)
@@ -764,6 +860,7 @@ class CveRadarPanel(QFrame):
     def style_for_action_buttons(self) -> None:
         for button in [
             self.update_button,
+            self.toolbar_guidance_button,
             self.diagnostics_button,
             self.export_button,
             self.details_button,

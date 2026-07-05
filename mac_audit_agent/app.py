@@ -8,6 +8,7 @@ from pathlib import Path
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from mac_audit_agent.ui.main_window import MainWindow, create_security_tray_icon
+from mac_audit_agent.ui.integrity_diff_viewer import run_launch_integrity_gate
 from mac_audit_agent.ui.startup_notice import preview_startup_notice
 
 
@@ -80,6 +81,9 @@ def main() -> int:
         return 0
     db_path = default_gui_db_path()
     window = _open_main_window_with_writable_db(db_path)
+    if not run_launch_integrity_gate(parent=window, db=window.db):
+        window.close()
+        return 0
     window.show()
     return app.exec()
 

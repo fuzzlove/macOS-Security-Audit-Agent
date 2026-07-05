@@ -1,0 +1,218 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextBrowser,
+    QVBoxLayout,
+    QWidget,
+)
+
+from mac_audit_agent.integrity.change_authorization import AuthorizedChangeRegistry
+from mac_audit_agent.integrity.strict_verifier import FileIntegrityChange, IntegrityDiffReport, StrictIntegrityVerifier
+from mac_audit_agent.integrity.verifier import select_integrity_manifest
+from mac_audit_agent.storage import AuditDatabase
+
+
+class IntegrityDiffViewer(QDialog):
+    def __init__(self, report: IntegrityDiffReport, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.report = report
+        self.setWindowTitle("Integrity Diff Viewer")
+        self.resize(1100, 720)
+        self._build_ui()
+        self._load_rows(report.all_changes or report.unchanged_files)
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        heading = QLabel(f"Integrity Status: {self.report.status.upper()} | Severity: {self.report.severity_level}")
+        heading.setStyleSheet("font-size: 18px; font-weight: 700;")
+        heading.setWordWrap(True)
+        layout.addWidget(heading)
+
+        summary = QTextBrowser()
+        summary.setMaximumHeight(96)
+        summary.setPlainText(self.report.explanation_summary)
+        layout.addWidget(summary)
+
+        controls = QHBoxLayout()
+        self.search_field = QLineEdit()
+        self.search_field.setPlaceholderText("Search file path, change type, severity, or explanation")
+        self.search_field.textChanged.connect(self._filter_rows)
+        controls.addWidget(self.search_field, 1)
+        layout.addLayout(controls)
+
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["File Path", "Expected Hash", "Actual Hash", "Change Type", "Severity", "Risk Explanation"])
+        self.table.setSortingEnabled(True)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.table, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
+
+    def _load_rows(self, changes: list[FileIntegrityChange]) -> None:
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(0)
+        for change in changes:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            values = [
+                change.file_path,
+                _short_hash(change.expected_hash),
+                _short_hash(change.actual_hash),
+                change.change_type,
+                change.severity,
+                change.risk_explanation,
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.UserRole, change.to_dict())
+                self.table.setItem(row, column, item)
+        self.table.setSortingEnabled(True)
+        self.table.resizeColumnsToContents()
+
+    def _filter_rows(self, query: str) -> None:
+        needle = query.strip().lower()
+        for row in range(self.table.rowCount()):
+            haystack = " ".join(self.table.item(row, column).text() for column in range(self.table.columnCount()) if self.table.item(row, column)).lower()
+            self.table.setRowHidden(row, bool(needle and needle not in haystack))
+
+
+class IntegrityLaunchGateDialog(QDialog):
+    def __init__(self, report: IntegrityDiffReport, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.report = report
+        self.user_action_taken = "none"
+        self.setWindowTitle("Integrity Verification Failed")
+        self.resize(1180, 760)
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        title = QLabel("Integrity Verification Failed")
+        title.setStyleSheet("font-size: 24px; font-weight: 800; color: #B42318;")
+        layout.addWidget(title)
+
+        body = QLabel(
+            f"{self.report.explanation_summary}\n\n"
+            f"Detected at: {self.report.timestamp}\n"
+            "MSAA cannot be considered trusted until you explicitly review these changes."
+        )
+        body.setWordWrap(True)
+        layout.addWidget(body)
+
+        self.viewer = IntegrityDiffViewer(self.report, self)
+        self.viewer.setWindowFlags(Qt.Widget)
+        layout.addWidget(self.viewer)
+
+        self.ack_checkbox = QCheckBox("I acknowledge these changes are expected and authorize this specific diff snapshot.")
+        self.reject_checkbox = QCheckBox("I reject these changes and want to stop before normal startup.")
+        self.ack_checkbox.toggled.connect(self._sync_buttons)
+        self.reject_checkbox.toggled.connect(self._sync_buttons)
+        layout.addWidget(self.ack_checkbox)
+        layout.addWidget(self.reject_checkbox)
+
+        buttons_row = QHBoxLayout()
+        self.proceed_button = QPushButton("Proceed")
+        self.proceed_button.setEnabled(False)
+        self.full_diff_button = QPushButton("View Full Diff Report")
+        self.export_button = QPushButton("Export Evidence Snapshot")
+        self.reinstall_button = QPushButton("Reinstall From Trusted Source")
+        self.stop_button = QPushButton("Stop / Quarantine Mode")
+        self.proceed_button.clicked.connect(self._proceed)
+        self.full_diff_button.clicked.connect(self._open_full_diff)
+        self.export_button.clicked.connect(self._export_snapshot)
+        self.reinstall_button.clicked.connect(self._reinstall_guidance)
+        self.stop_button.clicked.connect(self.reject)
+        for button in [self.proceed_button, self.full_diff_button, self.export_button, self.reinstall_button, self.stop_button]:
+            buttons_row.addWidget(button)
+        layout.addLayout(buttons_row)
+
+    def _sync_buttons(self) -> None:
+        if self.ack_checkbox.isChecked() and self.reject_checkbox.isChecked():
+            sender = self.sender()
+            if sender is self.ack_checkbox:
+                self.reject_checkbox.setChecked(False)
+            else:
+                self.ack_checkbox.setChecked(False)
+        self.proceed_button.setEnabled(self.ack_checkbox.isChecked() and not self.reject_checkbox.isChecked())
+
+    def _proceed(self) -> None:
+        if not self.ack_checkbox.isChecked():
+            return
+        self.user_action_taken = "authorized_expected_changes"
+        self.accept()
+
+    def _open_full_diff(self) -> None:
+        IntegrityDiffViewer(self.report, self).exec()
+
+    def _export_snapshot(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "Export Integrity Evidence Snapshot", "integrity-diff-report.json", "JSON Files (*.json)")
+        if not path:
+            return
+        Path(path).write_text(json.dumps(self.report.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
+        self.user_action_taken = "exported_evidence_snapshot"
+
+    def _reinstall_guidance(self) -> None:
+        QMessageBox.information(
+            self,
+            "Reinstall From Trusted Source",
+            "Stop MSAA, preserve this diff report, then reinstall from a trusted release or source checkout. Do not regenerate a manifest from the modified state unless you explicitly trust the source.",
+        )
+
+
+def run_launch_integrity_gate(
+    *,
+    parent: QWidget | None = None,
+    root: Path | None = None,
+    manifest_path: Path | None = None,
+    db: AuditDatabase | None = None,
+    authorization_registry: AuthorizedChangeRegistry | None = None,
+) -> bool:
+    base = Path(root or Path(__file__).resolve().parents[2]).resolve(strict=False)
+    selected = select_integrity_manifest(base)
+    manifest = manifest_path or selected.manifest_path
+    verifier = StrictIntegrityVerifier(base, manifest)
+    report = verifier.verify()
+    if db is not None:
+        db.record_integrity_history(report, user_action_taken="launch_verification")
+    if report.status == "verified":
+        return True
+
+    registry = authorization_registry or AuthorizedChangeRegistry()
+    authorized = registry.has_authorization_for_report(report)
+    dialog = IntegrityLaunchGateDialog(report, parent)
+    if authorized:
+        dialog.setWindowTitle("Authorized Changes Present")
+    if dialog.exec() != QDialog.Accepted:
+        if db is not None:
+            db.record_integrity_history(report, user_action_taken="rejected_or_stopped")
+        verifier.log_report(report, user_action_taken="rejected_or_stopped")
+        return False
+    registry.authorize(report, user_confirmation="I ACKNOWLEDGE THESE CHANGES", reason="Launch-time explicit acknowledgement")
+    if db is not None:
+        db.record_integrity_history(report, user_action_taken=dialog.user_action_taken)
+    verifier.log_report(report, user_action_taken=dialog.user_action_taken)
+    return True
+
+
+def _short_hash(value: str) -> str:
+    if not value:
+        return ""
+    return value if len(value) <= 18 else f"{value[:12]}...{value[-6:]}"

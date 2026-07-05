@@ -3,10 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from mac_audit_agent.config import AuditConfig
-from mac_audit_agent.operational_health import OperationalHealthEngine
+from mac_audit_agent.operational_health import HealthCheck, OperationalHealthEngine, analyze_operational_health
 from mac_audit_agent.privacy import redact_text, redact_structure
 from mac_audit_agent.rules import rule_registry_summary, validate_rule_registry
 from mac_audit_agent.storage import AuditDatabase
+from mac_audit_agent.integrity.manifest import create_integrity_manifest, write_integrity_manifest
+from mac_audit_agent.source_integrity import record_source_integrity_baseline
 
 
 class _FakeStatus:
@@ -92,9 +94,128 @@ def test_operational_health_report_includes_core_components(tmp_path: Path) -> N
         system_readiness=_FakeReadiness(),
         cve_radar_engine=_FakeRadar(),
         reports_dir=tmp_path / "reports",
+        health_log_path=tmp_path / "operational_health.log",
     )
     report = engine.build_report()
     components = {check.component for check in report.checks}
     assert {"App", "Source Integrity", "SQLite", "Rule Registry", "System Monitor", "Notifier", "User LaunchAgent", "System LaunchDaemon", "Detector", "Apple Exposure Assessment", "Report Export"} <= components
     assert report.health_score > 0
     assert report.overall_status in {"healthy", "repair recommended", "degraded", "broken"}
+
+
+def _health_engine(db: AuditDatabase, tmp_path: Path) -> OperationalHealthEngine:
+    return OperationalHealthEngine(
+        db,
+        user_launch_agent=_FakeLaunchAgent(),
+        system_launch_agent=_FakeLaunchAgent(),
+        notification_manager=_FakeNotifier(),
+        system_readiness=_FakeReadiness(),
+        cve_radar_engine=_FakeRadar(),
+        reports_dir=tmp_path / "reports",
+        health_log_path=tmp_path / "operational_health.log",
+    )
+
+
+def test_missing_source_integrity_manifest_is_degraded_not_broken(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    report = _health_engine(db, tmp_path).build_report()
+    source = next(check for check in report.checks if check.component == "Source Integrity")
+
+    assert source.status == "degraded"
+    assert "No trusted integrity manifest" in source.summary
+
+
+def test_draft_source_integrity_manifest_is_degraded_not_broken(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    package = root / "mac_audit_agent"
+    package.mkdir(parents=True)
+    (package / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    record_source_integrity_baseline(db, root=root, trust_state="draft")
+
+    report = _health_engine(db, tmp_path).build_report()
+    source = next(check for check in report.checks if check.component == "Source Integrity")
+
+    assert source.status == "degraded"
+    assert "draft" in source.summary.lower()
+
+
+def test_matching_source_integrity_manifest_is_healthy(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    package = root / "mac_audit_agent"
+    package.mkdir(parents=True)
+    (package / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (root / "logs").mkdir()
+    (root / "logs" / "monitor.log").write_text("first", encoding="utf-8")
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    record_source_integrity_baseline(db, root=root)
+
+    (root / "logs" / "monitor.log").write_text("changed mutable log", encoding="utf-8")
+    report = _health_engine(db, tmp_path).build_report()
+    source = next(check for check in report.checks if check.component == "Source Integrity")
+
+    assert source.status == "healthy"
+    assert "match" in source.summary.lower()
+
+
+def test_degraded_report_includes_issue_reason_fix_and_component_breakdown(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    report = OperationalHealthEngine(
+        db,
+        user_launch_agent=_FakeLaunchAgent(installed=False, loaded=False, running=False),
+        system_launch_agent=_FakeLaunchAgent(),
+        notification_manager=_FakeNotifier(),
+        system_readiness=_FakeReadiness(),
+        cve_radar_engine=_FakeRadar(),
+        reports_dir=tmp_path / "reports",
+        health_log_path=tmp_path / "operational_health.log",
+    ).build_report()
+
+    assert report.overall_status == "degraded"
+    assert report.primary_cause is not None
+    assert report.primary_cause.title
+    assert report.primary_cause.description
+    assert report.primary_cause.suggested_fix
+    assert report.issues
+    assert all(issue.description and issue.suggested_fix for issue in report.issues)
+    assert any(component.component == "User LaunchAgent" and component.fix_label == "Repair Notifier" for component in report.components)
+    assert "Degraded (" in report.display_status
+    assert (tmp_path / "operational_health.log").exists()
+
+
+def test_analyze_operational_health_ranks_all_root_causes_without_collapsing() -> None:
+    analysis = analyze_operational_health(
+        [
+            HealthCheck("Notifier", "degraded", "User notifier unavailable.", "notification_status=unavailable", "Repair Notifier.", "notifier_failure", True),
+            HealthCheck("Source Integrity", "critical", "Possible program modification or tampering detected.", "changed=1", "View Integrity Report.", "integrity_mismatch", False, False, True),
+            HealthCheck("Settings System", "degraded", "Settings mismatch detected.", "runtime=settings drift", "Re-sync Settings.", "configuration", True),
+        ]
+    )
+
+    assert len(analysis.issues) == 3
+    assert analysis.primary_cause is not None
+    assert analysis.primary_cause.risk_of_tampering is True
+    assert analysis.root_cause_ranking[0]["severity"] == "critical"
+
+
+def test_matching_disk_source_manifest_is_healthy_without_cached_baseline(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    package = root / "mac_audit_agent"
+    package.mkdir(parents=True)
+    (package / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    manifest = create_integrity_manifest(root, source_type="source_tree")
+    write_integrity_manifest(manifest, root / "msaa_integrity_manifest.json")
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+
+    from mac_audit_agent import source_integrity
+
+    original_project_root = source_integrity.project_root
+    source_integrity.project_root = lambda: root
+    try:
+        report = _health_engine(db, tmp_path).build_report()
+    finally:
+        source_integrity.project_root = original_project_root
+    source = next(check for check in report.checks if check.component == "Source Integrity")
+
+    assert source.status == "healthy"
+    assert "match" in source.summary.lower()

@@ -10,13 +10,9 @@ from datetime import datetime, timedelta, timezone
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
+from mac_audit_agent.alert_styles import SEVERITY_STYLES, canonical_alert_severity, get_alert_style
 
 POLL_MILLISECONDS = 750
-SEVERITY_STYLES = {
-    "neutral_grey": {"background": "rgba(60, 65, 75, 214)", "border": "rgba(210, 216, 230, 120)", "opacity": 0.90},
-    "high_orange": {"background": "rgba(185, 95, 25, 219)", "border": "rgba(255, 214, 153, 140)", "opacity": 0.94},
-    "critical_red": {"background": "rgba(170, 14, 28, 248)", "border": "rgba(255, 225, 225, 210)", "opacity": 1.0},
-}
 
 
 class SecurityOverlay(QWidget):
@@ -30,54 +26,61 @@ class SecurityOverlay(QWidget):
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.FramelessWindowHint
         )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-        self.setFixedWidth(390)
+        self.setFixedWidth(460)
         self.setObjectName("securityOverlayRoot")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setContentsMargins(18, 16, 16, 16)
+        layout.setSpacing(10)
+        self.header_row = QHBoxLayout()
+        self.header_row.setSpacing(10)
+        self.icon = QLabel()
+        self.icon.setObjectName("securityOverlayIcon")
+        self.icon.setFixedSize(28, 28)
+        self.icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.title = QLabel()
-        self.title.setStyleSheet("font-size: 15px; font-weight: bold;")
+        self.title.setWordWrap(True)
         self.badge = QLabel()
         self.badge.setObjectName("securityOverlayBadge")
-        self.badge.setStyleSheet(
-            "font-size: 11px; font-weight: 700; letter-spacing: 1px; "
-            "padding: 3px 8px; border-radius: 8px; color: #FFFFFF;"
-        )
+        self.badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.header_text = QVBoxLayout()
+        self.header_text.setSpacing(6)
+        self.header_text.addWidget(self.badge, 0, Qt.AlignmentFlag.AlignLeft)
+        self.header_text.addWidget(self.title)
+        self.header_row.addWidget(self.icon, 0, Qt.AlignmentFlag.AlignTop)
+        self.header_row.addLayout(self.header_text, 1)
         self.details = QLabel()
         self.details.setWordWrap(True)
         self.evidence = QLabel()
         self.evidence.setWordWrap(True)
+        self.evidence.setObjectName("securityOverlayEvidence")
         self.notice = QLabel(
             "Authorized use only. Activity is logged. This indicator is not a legal determination."
         )
         self.notice.setWordWrap(True)
-        self.notice.setStyleSheet("font-size: 11px;")
         self.button_row = QVBoxLayout()
         self.open_timeline = QPushButton("Open Timeline")
         self.preserve_snapshot = QPushButton("Preserve Evidence Snapshot")
         self.acknowledge = QPushButton("Acknowledge")
+        self.open_timeline.setObjectName("securityOverlayPrimaryButton")
+        self.acknowledge.setObjectName("securityOverlayPrimaryButton")
+        self.preserve_snapshot.setObjectName("securityOverlaySecondaryButton")
+        self.open_timeline.setToolTip("Open the Security Timeline for this alert.")
+        self.preserve_snapshot.setToolTip("Preserve a non-destructive evidence snapshot for review.")
+        self.acknowledge.setToolTip("Acknowledge and hide this alert.")
         for button in [self.open_timeline, self.preserve_snapshot, self.acknowledge]:
             button.setMinimumHeight(34)
             button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            button.setStyleSheet(
-                "QPushButton {"
-                "padding: 6px 10px;"
-                "font-size: 12px;"
-                "font-weight: 600;"
-                "border-radius: 8px;"
-                "}"
-            )
         self.open_timeline.clicked.connect(lambda: self._set_requested_action("open_timeline"))
         self.preserve_snapshot.clicked.connect(lambda: self._set_requested_action("preserve_evidence_snapshot"))
         self.acknowledge.clicked.connect(self._acknowledge)
         for button in [self.open_timeline, self.preserve_snapshot, self.acknowledge]:
             self.button_row.addWidget(button)
         self.button_row.setSpacing(8)
-        for widget in [self.title, self.details, self.evidence, self.notice]:
-            widget.setStyleSheet("color: #FFFFFF;")
+        layout.addLayout(self.header_row)
+        for widget in [self.details, self.evidence, self.notice]:
             layout.addWidget(widget)
-        layout.insertWidget(0, self.badge)
         layout.addLayout(self.button_row)
         timer = QTimer(self)
         timer.timeout.connect(self.refresh)
@@ -94,7 +97,9 @@ class SecurityOverlay(QWidget):
         if not payload.get("active", False):
             self.hide()
             return
-        severity = str(payload.get("style") or payload.get("severity", "neutral_grey")).lower()
+        style_key = str(payload.get("style") or payload.get("severity", "info")).lower()
+        severity = canonical_alert_severity(str(payload.get("severity") or style_key))
+        style = get_alert_style(style_key)
         count = int(payload.get("count", 1) or 1)
         expires = self._expires_at(payload)
         if expires is not None and datetime.now(timezone.utc) > expires:
@@ -103,46 +108,55 @@ class SecurityOverlay(QWidget):
         if raw == self._last_payload:
             return
         self._last_payload = raw
-        self.title.setText(str(payload.get("title") or f"{severity.replace('_', ' ').upper()} security indicator"))
-        if severity == "critical_red":
-            self.badge.setText("CRITICAL ALERT")
-        elif severity == "high_orange":
-            self.badge.setText("HIGH PRIORITY")
-        else:
-            self.badge.setText("INFORMATIONAL")
+        self.icon.setText(style.icon)
+        self.title.setText(str(payload.get("title") or f"{severity.upper()} security alert"))
+        self.badge.setText(severity.upper())
         self.details.setText(
-            f"{payload.get('details') or payload.get('event_type', 'security_event')}\n"
+            f"{payload.get('details') or payload.get('event_type', 'security_event')}\n\n"
             f"Detected: {payload.get('timestamp', '')}\n"
+            f"Recommended action: {payload.get('recommended_action', 'Review Timeline')}\n"
             f"Grouped events: {count}"
             + (f"\n{payload.get('grouped_message')}" if payload.get("grouped_message") else "")
         )
-        self.evidence.setText(str(payload.get("summary", "")))
-        style = SEVERITY_STYLES.get(severity, SEVERITY_STYLES["neutral_grey"])
-        self.setWindowOpacity(style["opacity"])
-        badge_style = {
-            "critical_red": "background-color: rgba(110, 8, 18, 255); border: 1px solid rgba(255, 220, 220, 220);",
-            "high_orange": "background-color: rgba(135, 71, 18, 255); border: 1px solid rgba(255, 227, 182, 200);",
-            "neutral_grey": "background-color: rgba(72, 78, 88, 255); border: 1px solid rgba(220, 226, 235, 150);",
-        }.get(severity, "background-color: rgba(72, 78, 88, 255); border: 1px solid rgba(220, 226, 235, 150);")
+        self.evidence.setText(f"Evidence: {payload.get('summary', '')}")
+        self.setWindowOpacity(1.0)
         self.setStyleSheet(
             "#securityOverlayRoot {"
-            f"background-color: {style['background']};"
-            f"border: 1px solid {style['border']};"
-            "border-radius: 14px;"
-            "}"
-            f"QLabel {{ color: #FFFFFF; }}"
-            f"QLabel[objectName='securityOverlayBadge'] {{ {badge_style} }}"
-            "QPushButton {"
-            "background-color: rgba(255, 255, 255, 28);"
-            "border: 1px solid rgba(255, 255, 255, 60);"
+            f"background-color: {style.background};"
+            f"border-left: 10px solid {style.border};"
+            f"border-top: 2px solid {style.border};"
+            f"border-right: 2px solid {style.border};"
+            f"border-bottom: 2px solid {style.border};"
             "border-radius: 8px;"
-            "padding: 6px 10px;"
-            "color: #FFFFFF;"
+            "}"
+            f"QLabel {{ color: {style.body_text}; font-size: 13px; line-height: 1.35; }}"
+            f"QLabel#securityOverlayIcon {{ color: {style.badge_text}; background-color: {style.badge_background}; border: 1px solid {style.border}; border-radius: 14px; font-size: 16px; font-weight: 900; }}"
+            f"QLabel#securityOverlayBadge {{ background-color: {style.badge_background}; color: {style.badge_text}; border: 1px solid {style.border}; border-radius: 6px; padding: 4px 9px; font-size: 12px; font-weight: 800; }}"
+            f"QLabel#securityOverlayEvidence {{ color: {style.body_text}; font-size: 12px; }}"
+            f"QLabel {{ selection-background-color: {style.border}; }}"
+            f"QLabel[objectName=''] {{ color: {style.body_text}; }}"
+            "QPushButton {"
+            f"background-color: {style.secondary_button_background};"
+            f"border: 1px solid {style.border};"
+            "border-radius: 6px;"
+            "padding: 7px 10px;"
+            f"color: {style.secondary_button_text};"
+            "font-size: 12px;"
+            "font-weight: 700;"
             "}"
             "QPushButton:hover {"
-            "background-color: rgba(255, 255, 255, 40);"
+            "background-color: #344054;"
+            "}"
+            "QPushButton:focus {"
+            f"border: 2px solid {style.focus_border};"
+            "}"
+            "QPushButton#securityOverlayPrimaryButton {"
+            f"background-color: {style.primary_button_background};"
+            f"color: {style.primary_button_text};"
+            f"border: 1px solid {style.primary_button_background};"
             "}"
         )
+        self.title.setStyleSheet(f"color: {style.title_text}; font-size: 15px; font-weight: 800;")
         self.adjustSize()
         self._move_to_bottom_right()
         self.show()
@@ -175,7 +189,7 @@ class SecurityOverlay(QWidget):
         if screen is None:
             return
         available = screen.availableGeometry()
-        margin = 18
+        margin = 24
         self.move(available.right() - self.width() - margin, available.bottom() - self.height() - margin)
 
     def _acknowledge(self) -> None:

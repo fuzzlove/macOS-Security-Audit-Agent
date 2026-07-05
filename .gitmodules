@@ -1,0 +1,6 @@
+[submodule "macOS-Live-Response-Collector"]
+	path = macOS-Live-Response-Collector
+	url = https://github.com/fuzzlove/macOS-Live-Response-Collector
+[submodule "macOS-Network-Sentinel"]
+	path = macOS-Network-Sentinel
+	url = https://github.com/fuzzlove/macOS-Network-Sentinel

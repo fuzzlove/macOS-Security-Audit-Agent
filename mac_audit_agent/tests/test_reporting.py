@@ -242,11 +242,11 @@ def test_invalid_output_path_fails_gracefully(tmp_path: Path) -> None:
 
 def test_color_mapping_supports_all_severities() -> None:
     assert set(SEVERITY_COLOR_MAP.keys()) == {"info", "low", "medium", "high", "critical"}
-    assert SEVERITY_COLOR_MAP["info"] == {"bg": "#2C3E50", "fg": "#ECF0F1"}
-    assert SEVERITY_COLOR_MAP["low"] == {"bg": "#27AE60", "fg": "#FFFFFF"}
-    assert SEVERITY_COLOR_MAP["medium"] == {"bg": "#F39C12", "fg": "#000000"}
-    assert SEVERITY_COLOR_MAP["high"] == {"bg": "#E74C3C", "fg": "#FFFFFF"}
-    assert SEVERITY_COLOR_MAP["critical"] == {"bg": "#8E0000", "fg": "#FFFFFF"}
+    assert SEVERITY_COLOR_MAP["info"] == {"bg": "#344054", "fg": "#FFFFFF"}
+    assert SEVERITY_COLOR_MAP["low"] == {"bg": "#175CD3", "fg": "#FFFFFF"}
+    assert SEVERITY_COLOR_MAP["medium"] == {"bg": "#B54708", "fg": "#FFFFFF"}
+    assert SEVERITY_COLOR_MAP["high"] == {"bg": "#B42318", "fg": "#FFFFFF"}
+    assert SEVERITY_COLOR_MAP["critical"] == {"bg": "#7A0000", "fg": "#FFFFFF"}
 
 
 def test_no_color_uses_transparency() -> None:
@@ -581,6 +581,86 @@ def test_reports_include_investigation_priorities_section(tmp_path: Path) -> Non
     assert "Top Priorities" in html_content
 
 
+def test_html_report_includes_integrity_manifest_mismatch_diagnostics(tmp_path: Path) -> None:
+    scan_result = make_scan_result()
+    scan_result.collected_artifacts["application_integrity"] = {
+        "overall_status": "stale",
+        "manifest_path": "/tmp/msaa_integrity_manifest.json",
+        "source_type": "source_tree",
+        "current_install_mode": "source_tree",
+        "manifest_app_version": "0.9.4",
+        "current_app_version": "0.9.5",
+        "manifest_build_id": "old",
+        "current_build_id": "new",
+        "manifest_git_commit": "abc",
+        "current_git_commit": "def",
+        "manifest_package_version": "0.9.4",
+        "current_package_version": "0.9.5",
+        "manifest_root_path": "/tmp/old",
+        "current_root_path": "/tmp/current",
+        "manifest_created_at": "2026-06-01T00:00:00+00:00",
+        "manifest_hash": "hash",
+        "verification_result_id": "verify-1",
+        "verified_at": "2026-07-01T00:00:00+00:00",
+        "cached_result": False,
+        "cache_valid": True,
+        "cache_invalidated_reason": "bypassed",
+        "matched_count": 10,
+        "mismatched_count": 0,
+        "missing_count": 0,
+        "extra_count": 0,
+        "exact_mismatch_reason": "Manifest version 0.9.4 differs from current app version 0.9.5.",
+        "recommended_actions": ["Create new trusted manifest after verifying update."],
+        "ignored_manifests": [{"path": "/tmp/integrity_manifest.json", "reason": "source_type does not match active install mode"}],
+    }
+
+    html_path = export_scan_result_html(scan_result, tmp_path / "scan.html")
+    html_content = html_path.read_text(encoding="utf-8")
+
+    assert "Integrity Verification" in html_content
+    assert "Manifest version 0.9.4 differs from current app version 0.9.5." in html_content
+    assert "The integrity manifest was generated for a different MSAA build. This does not by itself prove tampering." in html_content
+    assert "Cache Invalidated Reason" in html_content
+    assert "bypassed" in html_content
+    assert "/tmp/integrity_manifest.json" in html_content
+
+
+def test_professional_html_report_is_navigable_compact_and_mode_aware(tmp_path: Path) -> None:
+    long_evidence = "\n".join([f"raw evidence line {index}" for index in range(1, 12)])
+    scan_result = make_scan_result()
+    scan_result.findings = [make_finding("finding-long", "high", "Long Evidence Finding", evidence=long_evidence)]
+    scan_result.raw_logs = [RawLogEntry("collector", "command", "2026-04-23T00:10:00Z", 0, "", "RAW-LOG-SECRET-LINE")]
+
+    executive_path = export_scan_result_html(scan_result, tmp_path / "executive.html", detail_level="executive")
+    executive = executive_path.read_text(encoding="utf-8")
+
+    for required in [
+        'aria-label="Report navigation"',
+        'id="executive-summary"',
+        'id="risk-overview"',
+        'id="top-priorities"',
+        'id="findings"',
+        'id="recommended-fixes"',
+        'id="appendices"',
+        'class="finding-card"',
+        "<summary>",
+        "@media print",
+        "Back to top",
+        "severity-high",
+    ]:
+        assert required in executive
+    assert "cdn." not in executive.lower()
+    assert "RAW-LOG-SECRET-LINE" not in executive
+    main_before_appendix = executive.split('id="appendices"')[0]
+    assert "raw evidence line 11" not in main_before_appendix
+    assert "raw evidence line 11" in executive
+    assert "&lt;b&gt;unsafe&lt;/b&gt;" in executive
+
+    technical_path = export_scan_result_html(scan_result, tmp_path / "technical.html", detail_level="full_technical")
+    technical = technical_path.read_text(encoding="utf-8")
+    assert "RAW-LOG-SECRET-LINE" in technical
+
+
 def test_reports_include_reliability_trust_and_drift_sections(tmp_path: Path) -> None:
     scan_result = make_scan_result()
     reliability = {
@@ -700,3 +780,37 @@ def test_packet_capture_metadata_included_but_contents_not_embedded(tmp_path: Pa
     assert "Packet Capture Snapshot" in html_content
     assert str(pcap_path) in html_content
     assert "SUPER-SECRET-PACKET-CONTENT" not in html_content
+
+
+def test_apple_exposure_reports_include_update_guidance(tmp_path: Path) -> None:
+    scan_result = make_scan_result()
+    scan_result.collected_artifacts["apple_security_forecast"] = {
+        "generated_at": "2026-06-01T00:00:00+00:00",
+        "level": "urgent",
+        "display_cards": [
+            {
+                "card_id": "card-guidance",
+                "title": "Safari/WebKit Security Update",
+                "forecast_level": "urgent",
+                "source": "apple",
+                "affected_local_product": "Safari/WebKit",
+                "detected_version": "17.0",
+                "fixed_version": "17.1",
+                "recommended_action": "Install available Apple updates.",
+                "references": ["https://support.apple.com/en-us/100100"],
+            }
+        ],
+    }
+    json_path = export_scan_result_json(scan_result, tmp_path / "scan.json")
+    html_path = export_scan_result_html(scan_result, tmp_path / "scan.html")
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    card = payload["report_summary"]["apple_security_forecast_summary"]["cards"][0]
+    html_content = html_path.read_text(encoding="utf-8")
+
+    assert card["update_guidance"]["title"] == "Safari / WebKit Security Update Guidance"
+    assert card["update_guidance"]["recommended_actions"]
+    assert card["update_guidance"]["verification_steps"]
+    assert card["update_guidance"]["evidence_preservation_notes"]
+    assert "Update Guidance Summary" in html_content
+    assert "Evidence Preservation" in html_content
+    assert "Re-run Apple Exposure Assessment" in html_content

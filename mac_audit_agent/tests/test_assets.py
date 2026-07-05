@@ -135,11 +135,19 @@ def test_support_rail_uses_image_and_patreon_link(tmp_path: Path, monkeypatch) -
     assert hasattr(window, "support_ad_frame")
     assert hasattr(window, "support_ad_image_label")
     assert hasattr(window, "support_ad_link_label")
+    assert hasattr(window, "support_ad_scroll_area")
     assert window.support_ad_frame.parent() is window.details_panel
     assert window.support_ad_frame.cursor().shape() == Qt.PointingHandCursor
     pixmap = window.support_ad_image_label.pixmap()
     assert pixmap is not None and not pixmap.isNull()
+    assert window.support_ad_image_label.minimumWidth() >= 128
+    assert window.support_ad_image_label.minimumHeight() >= 128
+    assert window.support_ad_image_label.maximumWidth() >= window.support_ad_image_label.minimumWidth()
+    assert window.support_ad_frame.minimumHeight() >= 280
+    assert window.support_ad_scroll_area.widgetResizable()
+    assert window.support_ad_scroll_area.verticalScrollBarPolicy() == Qt.ScrollBarAsNeeded
     assert window.support_ad_link_label.text().startswith('<a href="https://www.patreon.com/16166750/join"')
+    assert window.support_ad_link_label.wordWrap()
     assert window.support_ad_frame.toolTip().startswith("Open Patreon support page:")
 
     class FakeEvent:

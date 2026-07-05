@@ -56,10 +56,32 @@ MonitorEventType = Literal[
     "localhost_hidden_port_detected",
     "new_admin_user_detected",
     "protected_monitor_tamper_detected",
+    "user_notifier_integrity_mismatch",
     "packet_capture_started",
     "packet_capture_completed",
     "usb_device_connected",
+    "usb_device_removed",
+    "usb_inventory_changed",
+    "new_usb_device_detected",
+    "trusted_usb_device_connected",
+    "untrusted_usb_device_connected",
+    "usb_device_reconnected",
+    "usb_device_changed",
+    "usb_storage_device_connected",
+    "usb_hid_device_connected",
+    "usb_keyboard_connected",
+    "usb_mouse_connected",
+    "usb_trackpad_connected",
+    "usb_network_adapter_connected",
+    "usb_camera_connected",
+    "usb_microphone_connected",
+    "usb_unknown_class_connected",
+    "physical_device_connected",
+    "physical_device_removed",
     "bluetooth_device_connected",
+    "bluetooth_device_disconnected",
+    "bluetooth_inventory_changed",
+    "unknown_hid_device_detected",
     "system_moisture_detected",
     "network_ip_assigned",
     "new_network_connection_detected",
@@ -134,6 +156,36 @@ def get_exit_code(result):
     if isinstance(result, dict):
         return result.get("exit_code")
     return getattr(result, "exit_code", None)
+
+
+@dataclass
+class USBDeviceIdentity:
+    device_id: str
+    vendor_id: str = ""
+    product_id: str = ""
+    serial_number: str = ""
+    device_name: str = ""
+    manufacturer: str = ""
+    device_class: str = ""
+    subclass: str = ""
+    protocol: str = ""
+    transport: str = "USB"
+    location_id: str = ""
+    current_connected: bool = False
+    first_seen: str = ""
+    last_seen: str = ""
+    last_removed: str = ""
+    baseline_status: str = "unknown"
+    trust_status: str = "unknown"
+    user_label: str = ""
+    notes: str = ""
+    confidence: str = "medium"
+    source_method: str = ""
+    last_event_id: str = ""
+    last_event_type: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -814,24 +866,33 @@ class EventAlertTrace:
     event_type: str
     original_event_type: str = ""
     normalized_event_type: str = ""
+    canonical_event_type: str = ""
+    severity: str = ""
     detector_source: str = ""
     created_at: str = field(default_factory=utc_now_iso)
     stored_db_path: str = ""
     stored_success: bool = False
+    event_written_to_db: bool = False
+    event_db_path: str = ""
     notifier_db_path: str = ""
     notifier_poll_seen: bool = False
     notifier_poll_time: str = ""
     notifier_cursor_before: str = ""
     notifier_cursor_after: str = ""
     notifier_seen: bool = False
+    notifier_received: bool = False
     notifier_seen_at: str = ""
+    notifier_settings_version: str = ""
+    daemon_settings_version: str = ""
     notification_policy_checked: bool = False
     notification_policy_result: str = ""
     notification_policy_reason: str = ""
+    policy_result: str = ""
     severity_before_policy: str = ""
     severity_after_policy: str = ""
     cooldown_checked: bool = False
     cooldown_result: str = ""
+    rate_limiter_result: str = ""
     alert_required: bool = False
     alert_suppressed: bool = False
     alert_suppression_reason: str = ""
@@ -839,24 +900,38 @@ class EventAlertTrace:
     alert_queue_length_before: int = 0
     alert_queue_length_after: int = 0
     overlay_dispatch_attempted: bool = False
+    overlay_render_attempted: bool = False
     overlay_dispatch_at: str = ""
     overlay_dispatch_result: str = ""
+    overlay_render_success: bool = False
+    overlay_window_id: str = ""
     overlay_error: str = ""
+    render_error: str = ""
     visible_alert_id: str = ""
     displayed_at: str = ""
+    acknowledged_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
-        payload.setdefault("canonical_event_type", self.normalized_event_type or self.event_type)
+        payload["canonical_event_type"] = self.canonical_event_type or self.normalized_event_type or self.event_type
         payload.setdefault("db_path_written", self.stored_db_path)
+        payload["event_written_to_db"] = self.event_written_to_db or self.stored_success
+        payload["event_db_path"] = self.event_db_path or self.stored_db_path
+        payload["notifier_received"] = self.notifier_received or self.notifier_seen
         payload.setdefault("policy_checked", self.notification_policy_checked)
         payload.setdefault("policy_result", self.notification_policy_result)
+        payload["policy_result"] = self.policy_result or self.notification_policy_result
         payload.setdefault("policy_reason", self.notification_policy_reason)
         payload.setdefault("suppression_reason", self.alert_suppression_reason)
+        payload["rate_limiter_result"] = self.rate_limiter_result or self.cooldown_result
+        payload["overlay_render_attempted"] = self.overlay_render_attempted or self.overlay_dispatch_attempted
+        payload["overlay_render_success"] = self.overlay_render_success or self.overlay_dispatch_result == "shown"
+        payload["render_error"] = self.render_error or self.overlay_error
         return payload
 
 
 AlertPipelineTrace = EventAlertTrace
+AlertDeliveryTrace = EventAlertTrace
 
 
 @dataclass

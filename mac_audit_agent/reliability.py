@@ -145,8 +145,9 @@ class MonitoringCoverageReport:
 
 class MonitoringCoverageEngine:
     COMPONENTS = [
-        ("USB detector", "detector_enabled_hardware", {"usb_device_connected", "usb_device_removed", "new_usb_device_detected"}),
-        ("Bluetooth detector", "detector_enabled_hardware", {"bluetooth_device_connected", "bluetooth_device_disconnected", "bluetooth_inventory_changed"}),
+        ("Persistent Local EDR", "persistent_local_edr_enabled", set()),
+        ("USB detector", "detector_enabled_usb", {"usb_device_connected", "usb_device_removed", "new_usb_device_detected"}),
+        ("Bluetooth detector", "detector_enabled_bluetooth", {"bluetooth_device_connected", "bluetooth_device_disconnected", "bluetooth_inventory_changed"}),
         ("Lid/display detector", "detector_enabled_session", {"lid_opened", "lid_closed", "display_wake", "display_sleep", "possible_lid_opened", "possible_lid_closed"}),
         ("Session detector", "detector_enabled_session", {"screen_unlocked", "screen_locked", "session_unlocked", "session_locked"}),
         ("Input/idle detector", "detector_enabled_session", {"idle_resume_detected", "mouse_or_keyboard_activity_after_idle", "input_activity_resumed_after_idle"}),
@@ -176,7 +177,7 @@ class MonitoringCoverageEngine:
         components: list[CoverageComponent] = []
         for name, enabled_key, event_types in self.COMPONENTS:
             components.append(self._component(name, enabled_key, event_types, by_type, detector_last_run, detector_errors, heartbeat_age))
-        problems = [item.component for item in components if item.status in {"degraded", "failing", "disabled"}]
+        problems = [item.component for item in components if item.status in {"degraded", "failing"}]
         score = max(0, min(100, round(sum(self._points(item.status) for item in components) / (len(components) * 4) * 100)))
         return MonitoringCoverageReport(utc_now_iso(), score, problems, components)
 
@@ -192,14 +193,37 @@ class MonitoringCoverageEngine:
     ) -> CoverageComponent:
         last_event = next((events[item] for item in event_types if item in events), None)
         enabled = self.db.get_background_monitor_state(enabled_key, "1") != "0" if enabled_key else True
+        if name == "Persistent Local EDR":
+            enabled = self.db.get_background_monitor_state("persistent_local_edr_enabled", "1") != "0"
+        if name != "Persistent Local EDR" and self.db.get_background_monitor_state("persistent_local_edr_enabled", "1") == "0" and name.endswith("detector"):
+            enabled = False
+        if name == "USB detector" and self.db.get_background_monitor_state("usb_monitoring_enabled", "1") == "0":
+            enabled = False
+        if name == "Bluetooth detector" and self.db.get_background_monitor_state("bluetooth_monitoring_enabled", "1") == "0":
+            enabled = False
+        if name == "Admin/user detector" and self.db.get_background_monitor_state("admin_persistence_monitoring_enabled", "1") == "0":
+            enabled = False
         last_error = detector_errors if name.endswith("detector") else ""
         status = "healthy"
         failure_reason = ""
         fix = "No action required."
         if not enabled:
             status = "disabled"
-            failure_reason = "Component disabled in monitor state."
-            fix = "Enable the component or document why it is unsupported."
+            if name == "Network detector":
+                failure_reason = self.db.get_background_monitor_state("detector_disabled_reason:network_state_detector", "Network Activity Monitor: Disabled by settings")
+            elif name == "Persistent Local EDR":
+                failure_reason = "Persistent Local EDR: Disabled by settings"
+            elif name == "Persistence detector":
+                failure_reason = self.db.get_background_monitor_state("detector_disabled_reason:persistence_detector", "Admin/Persistence Monitor: Disabled by settings")
+            elif name == "USB detector":
+                failure_reason = self.db.get_background_monitor_state("detector_disabled_reason:usb_device_detector", "USB Monitor: Disabled by settings")
+            elif name == "Bluetooth detector":
+                failure_reason = self.db.get_background_monitor_state("detector_disabled_reason:bluetooth_device_detector", "Bluetooth Monitor: Disabled by settings")
+            elif name == "Admin/user detector":
+                failure_reason = "Admin/Persistence Monitor: Disabled by settings"
+            else:
+                failure_reason = "Component disabled in monitor state."
+            fix = "No repair required while this component is disabled by settings."
         elif name == "SQLite storage":
             try:
                 quick = self.db.conn.execute("PRAGMA quick_check").fetchone()
@@ -283,7 +307,7 @@ class MonitoringCoverageEngine:
         )
 
     def _points(self, status: str) -> int:
-        return {"healthy": 4, "degraded": 2, "unsupported": 2, "disabled": 1, "failing": 0}.get(status, 0)
+        return {"healthy": 4, "degraded": 2, "unsupported": 2, "disabled": 4, "failing": 0}.get(status, 0)
 
 
 @dataclass

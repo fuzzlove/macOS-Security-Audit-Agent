@@ -1231,7 +1231,7 @@ def test_input_activity_resumed_after_idle_notifies_by_default(tmp_path: Path) -
         metadata_json="{}",
     )
     assert manager.preference_for(event.event_type)["severity"] == "medium"
-    assert manager.preference_for(event.event_type)["notification_mode"] == "dialog"
+    assert manager.preference_for(event.event_type)["notification_mode"] == "overlay"
     assert manager.should_notify(event) is True
 
 
@@ -1370,9 +1370,9 @@ def test_visible_alert_decision_and_overlay_payload_restore_bottom_right_styles(
         ("launchdaemon_added", "critical_red"),
         ("usb_device_connected", "high_orange"),
         ("new_usb_device_detected", "critical_red"),
-        ("apple_security_forecast_elevated", "neutral_grey"),
+        ("apple_security_forecast_elevated", "medium_blue"),
         ("apple_security_forecast_urgent", "high_orange"),
-        ("input_activity_resumed_after_idle", "critical_red"),
+        ("input_activity_resumed_after_idle", "medium_blue"),
     ]
     for event_type, expected_style in cases:
         event = BackgroundMonitorEvent(
@@ -1981,7 +1981,7 @@ def test_usb_events_send_a_non_modal_recognition_notification_by_default(tmp_pat
     )
     assert manager.should_notify(event) is True
     assert event.notification_reason == "first_severe_event"
-    assert manager.preference_for("usb_device_connected")["notification_mode"] == "notification"
+    assert manager.preference_for("usb_device_connected")["notification_mode"] == "overlay"
 
 
 def test_hardware_monitor_baselines_usb_then_emits_new_recognition() -> None:
@@ -1997,7 +1997,7 @@ def test_hardware_monitor_baselines_usb_then_emits_new_recognition() -> None:
     )
     assert monitor.evaluate(None, baseline) == []
     events = monitor.evaluate(baseline, current)
-    assert [event.event_type for event in events] == ["usb_device_connected"]
+    assert [event.event_type for event in events] == ["usb_device_connected", "usb_inventory_changed"]
     assert "Acme New Device" in events[0].evidence
 
 
@@ -2011,7 +2011,9 @@ def test_hardware_monitor_assigns_distinct_ids_to_usb_devices_in_same_snapshot()
         ],
         timestamp="2026-05-31T12:00:00+00:00",
     )
-    assert len({event.event_id for event in events}) == 2
+    assert len({event.event_id for event in events}) == 3
+    assert [event.event_type for event in events].count("usb_device_connected") == 2
+    assert [event.event_type for event in events].count("usb_inventory_changed") == 1
 
 
 def test_hardware_monitor_parses_only_connected_bluetooth_devices() -> None:
@@ -2185,7 +2187,7 @@ def test_usb_reconnect_observer_enqueues_new_connection() -> None:
     assert '"session_id": "new"' in events[0].metadata_json
 
 
-def test_service_groups_usb_observer_burst_into_one_alert(tmp_path: Path) -> None:
+def test_service_preserves_usb_observer_events_without_coalescing(tmp_path: Path) -> None:
     hardware = HardwareMonitor()
     events = hardware.usb_connection_events(
         [],
@@ -2196,33 +2198,119 @@ def test_service_groups_usb_observer_burst_into_one_alert(tmp_path: Path) -> Non
         ],
     )
     service = BackgroundMonitorService(tmp_path / "audit.sqlite")
-    grouped = service._coalesce_usb_observer_events(events)
-    assert len(grouped) == 1
-    assert grouped[0].event_type == "usb_device_connected"
-    assert "USB reconnect recognized 2 device(s)" in grouped[0].evidence
-    assert "connection=" not in grouped[0].evidence
+    classified = service._classify_usb_observer_events(events, [])
+    assert len(classified) == len(events)
+    assert [event.event_type for event in classified].count("usb_device_connected") == 3
+    assert [event.event_type for event in classified].count("usb_inventory_changed") == 1
 
 
-def test_service_alerts_critical_once_for_first_seen_usb_identity(tmp_path: Path) -> None:
+def test_service_classifies_first_seen_usb_identity_as_high_new_device(tmp_path: Path) -> None:
     hardware = HardwareMonitor()
     trusted = {"vendor_id": "1", "product_id": "2", "serial": "trusted", "location_id": "3", "name": "Phone"}
     new = {"vendor_id": "4", "product_id": "5", "serial": "new", "location_id": "6", "name": "Adapter"}
     service = BackgroundMonitorService(tmp_path / "audit.sqlite")
-    assert service._classify_usb_observer_events([], [trusted]) == []
-
     events = hardware.usb_connection_events([], [new])
-    first_seen = service._classify_usb_observer_events(events, [trusted, new])
-    assert len(first_seen) == 1
-    assert first_seen[0].event_type == "new_usb_device_detected"
-    assert first_seen[0].severity == "critical"
-
-    reconnect = service._classify_usb_observer_events(events, [trusted, new])
-    assert len(reconnect) == 1
-    assert reconnect[0].event_type == "usb_device_connected"
-    assert reconnect[0].severity == "info"
+    first_seen = events[0]
+    service.record_monitor_event(first_seen)
+    stored = service.db.latest_monitor_events(limit=1)[0]
+    assert stored.event_type == "usb_unknown_class_connected"
+    assert stored.severity == "high"
 
 
-def test_usb_and_moisture_events_use_distinct_sounds(tmp_path: Path) -> None:
+def test_usb_identity_generation_with_and_without_serial() -> None:
+    monitor = HardwareMonitor()
+    with_serial = monitor.usb_device_identity(
+        {"vendor_id": "1", "product_id": "2", "serial": "ABC", "name": "Keyboard", "vendor": "Acme", "location_id": "3"},
+        now="2026-06-28T12:00:00+00:00",
+    )
+    without_serial = monitor.usb_device_identity(
+        {"vendor_id": "1", "product_id": "2", "name": "Keyboard", "vendor": "Acme", "location_id": "3"},
+        now="2026-06-28T12:00:00+00:00",
+    )
+    assert with_serial.device_id == "1|2|ABC"
+    assert with_serial.confidence == "high"
+    assert without_serial.device_id == "1|2|Keyboard|Acme|3"
+    assert without_serial.confidence == "medium"
+
+
+def test_untrusted_usb_routes_to_high_bottom_right_overlay(tmp_path: Path, monkeypatch) -> None:
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite", poll_interval_seconds=5, record_startup=False)
+    state_path = tmp_path / "state" / "security_overlay.json"
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", state_path)
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_PID_PATH", tmp_path / "state" / "security_overlay.pid")
+    monkeypatch.setattr(service.notifications, "_ensure_security_overlay_process", lambda: True)
+    identity = service.hardware_monitor.usb_device_identity(
+        {"vendor_id": "1", "product_id": "2", "serial": "BAD", "name": "Adapter", "vendor": "Acme", "location_id": "3"},
+        now="2026-06-28T12:00:00+00:00",
+    )
+    service.db.upsert_usb_device_identity(identity)
+    service.db.set_usb_device_trust(identity.device_id, "untrusted")
+    event = BackgroundMonitorEvent(
+        event_id="untrusted-usb",
+        timestamp="2026-06-28T12:01:00+00:00",
+        event_type="usb_device_connected",
+        severity="info",
+        source="ioreg_usb_observer",
+        evidence="USB device connected.",
+        confidence="high",
+        recommendation="review",
+        metadata_json=json.dumps({"vendor_id": "1", "product_id": "2", "serial": "BAD", "name": "Adapter", "vendor": "Acme", "location_id": "3"}),
+        rule_id="usb_device_connected",
+        trigger_rule_id="usb_device_connected",
+    )
+    service.record_monitor_event(event)
+    stored = service.db.latest_monitor_events(limit=1)[0]
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    assert stored.event_type == "untrusted_usb_device_connected"
+    assert stored.severity == "high"
+    assert stored.visible_alert_shown is True
+    assert payload["style"] == "high_orange"
+
+
+def test_usb_network_adapter_after_idle_escalates_critical_overlay(tmp_path: Path, monkeypatch) -> None:
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite", poll_interval_seconds=5, record_startup=False)
+    state_path = tmp_path / "state" / "security_overlay.json"
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", state_path)
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_PID_PATH", tmp_path / "state" / "security_overlay.pid")
+    monkeypatch.setattr(service.notifications, "_ensure_security_overlay_process", lambda: True)
+    service.record_monitor_event(
+        BackgroundMonitorEvent(
+            event_id="idle-before-usb",
+            timestamp="2026-06-28T12:00:00+00:00",
+            event_type="idle_resume_detected",
+            severity="medium",
+            source="session",
+            evidence="Idle resumed.",
+            confidence="high",
+            recommendation="review",
+            rule_id="idle_resume_detected",
+            trigger_rule_id="idle_resume_detected",
+        )
+    )
+    event = BackgroundMonitorEvent(
+        event_id="usb-network-after-idle",
+        timestamp="2026-06-28T12:05:00+00:00",
+        event_type="usb_device_connected",
+        severity="info",
+        source="ioreg_usb_observer",
+        evidence="USB network adapter connected.",
+        confidence="high",
+        recommendation="review",
+        metadata_json=json.dumps({"vendor_id": "9", "product_id": "1", "serial": "NET", "name": "USB Ethernet Adapter", "vendor": "Acme", "device_class": "network", "location_id": "2"}),
+        rule_id="usb_device_connected",
+        trigger_rule_id="usb_device_connected",
+    )
+    service.record_monitor_event(event)
+    stored = service.db.latest_monitor_events(limit=1)[0]
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    assert stored.event_type == "usb_network_adapter_connected"
+    assert stored.severity == "critical"
+    assert stored.visible_alert_shown is True
+    assert payload["style"] == "critical_red"
+    assert payload["persistent"] is True
+
+
+def test_alert_sounds_are_severity_gated(tmp_path: Path) -> None:
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
     db.set_background_monitor_state("enable_alert_sounds", "1")
     manager = NotificationManager(db)
@@ -2242,11 +2330,11 @@ def test_usb_and_moisture_events_use_distinct_sounds(tmp_path: Path) -> None:
         source="hardware",
         evidence="Liquid detected.",
     )
-    assert manager._sound_for(usb, manager.settings()) == "Pop"
+    assert manager._sound_for(usb, manager.settings()) == ""
     assert manager._sound_for(moisture, manager.settings()) == "Basso"
 
 
-def test_new_usb_device_uses_critical_alert_and_usb_sound(tmp_path: Path) -> None:
+def test_new_usb_device_uses_critical_alert_and_critical_sound(tmp_path: Path) -> None:
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
     db.set_background_monitor_state("enable_alert_sounds", "1")
     manager = NotificationManager(db)
@@ -2260,8 +2348,8 @@ def test_new_usb_device_uses_critical_alert_and_usb_sound(tmp_path: Path) -> Non
     )
     preference = manager.preference_for(event.event_type)
     assert preference["severity"] == "critical"
-    assert preference["notification_mode"] == "both"
-    assert manager._sound_for(event, manager.settings()) == "Pop"
+    assert preference["notification_mode"] == "overlay"
+    assert manager._sound_for(event, manager.settings()) == "Basso"
 
 
 def test_network_monitor_detects_ip_assignment_and_vpn_connection() -> None:
@@ -2392,7 +2480,7 @@ def test_medium_network_interface_event_triggers_visible_overlay(tmp_path: Path,
     assert manager.update_security_overlay(event) is True
     payload = json.loads(state_path.read_text(encoding="utf-8"))
     assert payload["event_type"] == "network_interface_connected"
-    assert payload["style"] in {"neutral_grey", "high_orange"}
+    assert payload["style"] == "medium_blue"
     assert event.visible_alert_shown is True
 
 
@@ -2771,7 +2859,7 @@ def test_security_overlay_renders_low_severity_as_subtle_bottom_right_alert(tmp_
     assert manager.update_security_overlay(event) is True
     payload = json.loads(state_path.read_text(encoding="utf-8"))
     assert payload["severity"] == "low"
-    assert payload["style"] == "neutral_grey"
+    assert payload["style"] == "low"
     assert payload["persistent"] is False
 
 
@@ -2955,18 +3043,15 @@ def test_send_alert_dialog_timeout_is_converted_to_failure() -> None:
     assert "timed out" in (result.stderr or "")
 
 
-def test_high_event_uses_dialog_fallback_after_notification_failure(tmp_path: Path, monkeypatch) -> None:
+def test_high_event_uses_overlay_only_without_osascript_fallback_by_default(tmp_path: Path, monkeypatch) -> None:
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
-    db.set_background_monitor_state("os_notification_fallback_enabled", "1")
     fallback_path = tmp_path / "monitor.log"
     monkeypatch.setattr("mac_audit_agent.notification_manager.FALLBACK_MONITOR_LOG", fallback_path)
     calls = []
 
     def runner(command, **kwargs):
         calls.append(command)
-        if "display notification" in command[2]:
-            return FakeCompletedProcess(returncode=1, stderr="not allowed")
-        return FakeCompletedProcess(returncode=0, stdout="dialog ok")
+        return FakeCompletedProcess(returncode=1, stderr="not allowed")
 
     manager = NotificationManager(db, runner=runner)
     monkeypatch.setattr(manager, "_ensure_security_overlay_process", lambda: False)
@@ -2986,11 +3071,10 @@ def test_high_event_uses_dialog_fallback_after_notification_failure(tmp_path: Pa
         metadata_json="{}",
     )
     sent, error = manager.notify(event)
-    assert sent is True
-    assert error == ""
-    assert any("display notification" in command[2] for command in calls)
-    assert any("display dialog" in command[2] for command in calls)
-    assert "notification attempt" in fallback_path.read_text(encoding="utf-8")
+    assert sent is False
+    assert "overlay unavailable" in error
+    assert calls == []
+    assert db.get_background_monitor_state("alert_delivery_degraded") == "1"
 
 
 def test_normal_alert_delivery_uses_overlay_without_osascript_duplicates(tmp_path: Path, monkeypatch) -> None:
@@ -3256,6 +3340,7 @@ def test_notification_failure_does_not_crash_and_logs_error(tmp_path: Path, monk
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
     db.set_background_monitor_state("show_visible_alerts", "0")
     db.set_background_monitor_state("os_notification_fallback_enabled", "1")
+    db.set_background_monitor_state("notification_mode", "dialog")
     fallback_path = tmp_path / "monitor.log"
     monkeypatch.setattr("mac_audit_agent.notification_manager.FALLBACK_MONITOR_LOG", fallback_path)
     manager = NotificationManager(db, runner=lambda *args, **kwargs: FakeCompletedProcess(returncode=1, stderr="denied"))
@@ -3279,7 +3364,7 @@ def test_notification_failure_does_not_crash_and_logs_error(tmp_path: Path, monk
     assert event.notification_returncode == 1
 
 
-def test_notification_readiness_keeps_security_alerting_ready_when_notification_center_fails(tmp_path: Path, monkeypatch) -> None:
+def test_notification_readiness_uses_overlay_without_dialog_or_notification_center(tmp_path: Path, monkeypatch) -> None:
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
     readiness_path = tmp_path / "app-support" / "MacAuditAgent" / "notification_readiness.json"
     monkeypatch.setattr("mac_audit_agent.notification_manager.NOTIFICATION_READINESS_PATH", readiness_path)
@@ -3299,14 +3384,17 @@ def test_notification_readiness_keeps_security_alerting_ready_when_notification_
     result = manager.readiness_check()
 
     assert result["overlay"]["success"] is True
-    assert result["dialog"]["success"] is True
+    assert result["dialog"]["attempted"] is False
+    assert result["dialog"]["success"] is False
     assert result["notification_center"]["success"] is False
+    assert result["notification_center"]["attempted"] is False
     assert result["overall_status"] == "PASS"
     assert result["security_alerting_ready"] is True
+    assert result["authoritative_delivery"] == "AlertOverlayManager"
     assert db.get_background_monitor_state("notification_status", "").startswith("security alerts ready")
     assert readiness_path.exists()
     assert db.latest_notification_capabilities() is not None
-    assert db.latest_alert_delivery_records(limit=1)[0].delivery_method_used in {"overlay", "dialog"}
+    assert db.latest_alert_delivery_records(limit=1)[0].delivery_method_used == "overlay"
 
 
 def test_notification_readiness_overlay_passes_even_when_visible_alerts_disabled(tmp_path: Path, monkeypatch) -> None:
@@ -3371,7 +3459,7 @@ def test_usb_reconnect_observer_emits_immediately_for_first_topology_change(tmp_
     previous = [{"vendor_id": "1", "product_id": "2", "serial": "A", "name": "USB Keyboard"}]
     current = []
     events = monitor.usb_connection_events(previous, current, timestamp="2026-06-01T12:00:00+00:00")
-    assert [event.event_type for event in events] == ["usb_device_removed"]
+    assert [event.event_type for event in events] == ["usb_device_removed", "usb_inventory_changed"]
 
 
 def test_camera_detection_never_records_images_or_audio() -> None:
@@ -4568,20 +4656,20 @@ def test_monitor_test_notification_command_logs_result(tmp_path: Path, monkeypat
             self.db = AuditDatabase(db_path, tmp_path / "logs")
 
         def test_notification(self):
-            self.db.set_background_monitor_state("notification_status", "security alerts ready (overlay/dialog; notification center optional)")
+            self.db.set_background_monitor_state("notification_status", "security alerts ready (AlertOverlayManager)")
             return {
                 "success": True,
                 "overall_status": "PASS",
                 "overlay": {"success": True, "error": ""},
-                "dialog": {"success": True, "error": ""},
+                "dialog": {"success": False, "error": "disabled"},
                 "notification_center": {"success": False, "error": "notification failed"},
                 "security_alerting_ready": True,
                 "notification_center_optional": True,
                 "last_test_time": "2026-04-25T00:00:00+00:00",
                 "last_test_result": "PASS",
-                "notification_status": "security alerts ready (overlay/dialog; notification center optional)",
+                "notification_status": "security alerts ready (AlertOverlayManager)",
                 "readiness_json": {},
-                "permission_note": "Notification Center is optional; overlay/dialog are sufficient for security alerting.",
+                "permission_note": "AlertOverlayManager is authoritative; Notification Center and dialogs are optional fallback channels only.",
                 "event_id": "notification-readiness-1",
             }
 
@@ -4591,7 +4679,7 @@ def test_monitor_test_notification_command_logs_result(tmp_path: Path, monkeypat
     assert exit_code == 0
     assert '"overall_status": "PASS"' in captured.out
     assert '"notification_center": {' in captured.out
-    assert '"notification_status": "security alerts ready (overlay/dialog; notification center optional)"' in captured.out
+    assert '"notification_status": "security alerts ready (AlertOverlayManager)"' in captured.out
 
 
 def test_monitor_test_dialog_command_logs_result(tmp_path: Path, monkeypatch, capsys) -> None:

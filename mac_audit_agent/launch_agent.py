@@ -241,15 +241,21 @@ def verify_protected_monitor_integrity(*, scope: str = "system") -> dict[str, An
     paths = default_launch_agent_paths(scope)
     location_status = system_monitor_location_status(paths) if scope == "system" else {"valid": True, "message": "User monitor mode."}
     manifest = load_protected_monitor_manifest(scope=scope)
-    expected = manifest or build_protected_monitor_manifest(scope=scope)
+    expected = manifest
     evidence: list[str] = []
     expected_owner, expected_group, runtime_mode = _expected_lockdown_owner_mode(scope)
     expected_mode = "0o644"
     tamper_detected = False
+    overall_status = "unknown"
     severity = "low"
     confidence = "low"
     observed_plist: dict[str, Any] = {}
-    manifest_digest_status = "legacy" if not manifest else "not verified"
+    manifest_digest_status = "missing" if not manifest else "not verified"
+    if not manifest:
+        evidence.append(f"missing trusted runtime manifest: {protected_monitor_manifest_path(scope)}")
+        tamper_detected = scope == "system"
+        severity = "critical" if scope == "system" else "high"
+        confidence = "high"
     if not location_status.get("valid"):
         evidence.append(str(location_status.get("message", "invalid system LaunchDaemon path")))
         tamper_detected = True
@@ -329,6 +335,19 @@ def verify_protected_monitor_integrity(*, scope: str = "system") -> dict[str, An
                 system_lockdown_ok = False
     expected_hashes = expected.get("tracked_files", {}) if isinstance(expected.get("tracked_files", {}), dict) else {}
     observed_hashes: dict[str, str] = {}
+    expected_db_path = str(expected.get("db_path", "")) if isinstance(expected, dict) else ""
+    observed_db_path = str(default_monitor_db_path(scope))
+    if expected_db_path and expected_db_path != observed_db_path:
+        evidence.append(f"DB path mismatch: expected {expected_db_path}, observed {observed_db_path}")
+        tamper_detected = True
+        severity = "critical" if scope == "system" else "high"
+        confidence = "high"
+    expected_runtime_root = str(expected.get("runtime_root", "")) if isinstance(expected, dict) else ""
+    if expected_runtime_root and expected_runtime_root != str(runtime_root_path):
+        evidence.append(f"runtime path mismatch: expected {expected_runtime_root}, observed {runtime_root_path}")
+        tamper_detected = True
+        severity = "critical" if scope == "system" else "high"
+        confidence = "high"
     for rel_path, details in expected_hashes.items():
         candidate = runtime_package_path / rel_path
         try:
@@ -370,11 +389,16 @@ def verify_protected_monitor_integrity(*, scope: str = "system") -> dict[str, An
                 confidence = "high"
         else:
             manifest_digest_status = "legacy"
-    recommendation = (
-        "Reinstall protected monitor from trusted copy and review recent admin and persistence changes."
-        if tamper_detected
-        else "Protected monitor integrity appears consistent."
-    )
+    if not manifest:
+        recommendation = "No trusted runtime manifest exists. Reinstall or repair from a trusted source, then explicitly create a trusted runtime manifest."
+        overall_status = "unknown"
+    else:
+        recommendation = (
+            "Reinstall protected monitor from trusted copy and review recent admin and persistence changes."
+            if tamper_detected
+            else "Protected monitor integrity matches the trusted manifest."
+        )
+        overall_status = "modified" if tamper_detected else "verified"
     if scope == "system" and observed_plist:
         lockdown_compliant = (
             system_lockdown_ok
@@ -401,6 +425,7 @@ def verify_protected_monitor_integrity(*, scope: str = "system") -> dict[str, An
         "observed_hashes": observed_hashes,
         "observed_plist": observed_plist,
         "tamper_detected": tamper_detected,
+        "overall_status": overall_status,
         "lockdown_compliant": lockdown_compliant,
         "manifest_digest_status": manifest_digest_status,
         "severity": severity,
@@ -464,6 +489,11 @@ def build_launch_agent_plist(
     python_executable: str | None = None,
     scope: str = "user",
     mode: str | None = None,
+    run_at_load: bool = True,
+    keep_alive: bool = True,
+    auto_restart: bool = True,
+    stdout_path: Path | None = None,
+    stderr_path: Path | None = None,
 ) -> dict:
     scope = launch_scope(scope)
     launch_mode = (mode or "").strip().lower()
@@ -480,8 +510,8 @@ def build_launch_agent_plist(
     payload = {
         "Label": LAUNCH_AGENT_LABEL,
         "ProgramArguments": program_arguments,
-        "RunAtLoad": True,
-        "KeepAlive": True,
+        "RunAtLoad": bool(run_at_load),
+        "KeepAlive": bool(keep_alive and auto_restart),
         "WorkingDirectory": str(root),
         "EnvironmentVariables": {
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
@@ -490,8 +520,8 @@ def build_launch_agent_plist(
             MAC_AUDIT_AGENT_ENV_LOG_ROOT: str(monitor_log_root(scope)),
             MAC_AUDIT_AGENT_ENV_DB_PATH: str(db_path),
         },
-        "StandardOutPath": str(paths.stdout_path),
-        "StandardErrorPath": str(paths.stderr_path),
+        "StandardOutPath": str(stdout_path or paths.stdout_path),
+        "StandardErrorPath": str(stderr_path or paths.stderr_path),
     }
     if launch_mode in {MONITOR_ROLE_USER, MONITOR_ROLE_SYSTEM}:
         payload["EnvironmentVariables"][MAC_AUDIT_AGENT_ENV_ROLE] = launch_mode
@@ -531,20 +561,50 @@ class LaunchAgentManager:
             return MONITOR_ROLE_SYSTEM
         return MONITOR_ROLE_USER
 
-    def _effective_db_path(self) -> Path:
+    def _effective_db_path(self, db_path: Path | None = None) -> Path:
+        if db_path is not None:
+            return db_path
         if self.scope == "system":
             return default_monitor_db_path("system")
         return self.db_path
 
-    def _install_with_mode(self, poll_interval_seconds: int = 15, mode: str | None = None) -> Path:
+    def _install_with_mode(
+        self,
+        poll_interval_seconds: int = 15,
+        mode: str | None = None,
+        *,
+        run_at_load: bool = True,
+        keep_alive: bool = True,
+        auto_restart: bool = True,
+        db_path: Path | None = None,
+        log_path: Path | None = None,
+    ) -> Path:
         if self.scope == "system" and os.geteuid() != 0:
             raise RuntimeError("System LaunchDaemon installation requires root privileges.")
-        payload = build_launch_agent_plist(db_path=self._effective_db_path(), poll_interval_seconds=poll_interval_seconds, scope=self.scope, mode=mode)
+        stdout_path = log_path if log_path else None
+        stderr_path = None
+        if log_path:
+            suffix = log_path.suffix or ".log"
+            stderr_path = log_path.with_name(f"{log_path.stem}.stderr{suffix}")
+        effective_db_path = self._effective_db_path(db_path)
+        payload = build_launch_agent_plist(
+            db_path=effective_db_path,
+            poll_interval_seconds=poll_interval_seconds,
+            scope=self.scope,
+            mode=mode,
+            run_at_load=run_at_load,
+            keep_alive=keep_alive,
+            auto_restart=auto_restart,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+        )
         if payload.get("Label") != LAUNCH_AGENT_LABEL:
             raise RuntimeError(f"Invalid LaunchAgent Label: expected {LAUNCH_AGENT_LABEL}, got {payload.get('Label')}")
         self._ensure_install_paths()
+        if log_path:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
         self._install_runtime_files()
-        self._ensure_db_path()
+        self._ensure_db_path(effective_db_path)
         self.paths.plist_path.write_bytes(plistlib.dumps(payload))
         os.chmod(self.paths.plist_path, 0o644)
         current_user = pwd.getpwuid(user_launchctl_uid() if self.scope == "user" else os.getuid())
@@ -554,30 +614,30 @@ class LaunchAgentManager:
         os.chown(self.paths.plist_path, target_uid, target_gid)
         self._run([PLUTIL_BIN, "-lint", str(self.paths.plist_path)])
         if self.scope == "system":
-            self._write_protected_monitor_manifest()
+            self._write_protected_monitor_manifest(db_path=effective_db_path)
             self.lock_down_protected_files()
         return self.paths.plist_path
 
-    def install(self, poll_interval_seconds: int = 15) -> Path:
+    def install(self, poll_interval_seconds: int = 15, **install_options: Any) -> Path:
         if self.scope == "system":
-            return self.install_system_monitor(poll_interval_seconds=poll_interval_seconds)
-        return self.install_user_notifier(poll_interval_seconds=poll_interval_seconds)
+            return self.install_system_monitor(poll_interval_seconds=poll_interval_seconds, **install_options)
+        return self.install_user_notifier(poll_interval_seconds=poll_interval_seconds, **install_options)
 
-    def install_system_monitor(self, poll_interval_seconds: int = 15) -> Path:
+    def install_system_monitor(self, poll_interval_seconds: int = 15, **install_options: Any) -> Path:
         if self.scope != "system":
             raise RuntimeError("System monitor installation requires a system LaunchDaemon manager.")
         location_status = system_monitor_location_status(self.paths)
         if not location_status["valid"]:
             raise RuntimeError(str(location_status["message"]))
-        return self._install_with_mode(poll_interval_seconds=poll_interval_seconds, mode=MONITOR_ROLE_SYSTEM)
+        return self._install_with_mode(poll_interval_seconds=poll_interval_seconds, mode=MONITOR_ROLE_SYSTEM, **install_options)
 
-    def install_user_notifier(self, poll_interval_seconds: int = 15) -> Path:
+    def install_user_notifier(self, poll_interval_seconds: int = 15, **install_options: Any) -> Path:
         if self.scope != "user":
             raise RuntimeError("User notifier installation requires a user LaunchAgent manager.")
-        return self._install_with_mode(poll_interval_seconds=poll_interval_seconds, mode=MONITOR_ROLE_USER)
+        return self._install_with_mode(poll_interval_seconds=poll_interval_seconds, mode=MONITOR_ROLE_USER, **install_options)
 
-    def install_protected_mode(self, poll_interval_seconds: int = 15) -> Path:
-        return self.install_system_monitor(poll_interval_seconds=poll_interval_seconds)
+    def install_protected_mode(self, poll_interval_seconds: int = 15, **install_options: Any) -> Path:
+        return self.install_system_monitor(poll_interval_seconds=poll_interval_seconds, **install_options)
 
     def uninstall(self) -> None:
         if self.paths.plist_path.exists():
@@ -599,10 +659,10 @@ class LaunchAgentManager:
                 if candidate.exists():
                     shutil.rmtree(candidate, ignore_errors=True)
 
-    def _write_protected_monitor_manifest(self) -> Path:
+    def _write_protected_monitor_manifest(self, *, db_path: Path | None = None) -> Path:
         manifest_path = protected_monitor_manifest_path(self.scope)
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest = build_protected_monitor_manifest(db_path=self._effective_db_path(), scope=self.scope)
+        manifest = build_protected_monitor_manifest(db_path=self._effective_db_path(db_path), scope=self.scope)
         manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
         current_user = pwd.getpwuid(user_launchctl_uid() if self.scope == "user" else os.getuid())
         target_group = "wheel" if self.scope == "system" else "staff"
@@ -658,7 +718,7 @@ class LaunchAgentManager:
     def protected_monitor_manifest_path(self) -> Path:
         return protected_monitor_manifest_path(self.scope)
 
-    def repair(self, poll_interval_seconds: int = 15) -> tuple[Path, list[str]]:
+    def repair(self, poll_interval_seconds: int = 15, **install_options: Any) -> tuple[Path, list[str]]:
         notes: list[str] = []
         for command in self._bootout_commands():
             try:
@@ -677,13 +737,13 @@ class LaunchAgentManager:
                     notes.append(f"removed: {candidate}")
             except OSError as exc:
                 notes.append(f"remove failed: {candidate} | {exc}")
-        plist_path = self._install_with_mode(poll_interval_seconds=poll_interval_seconds, mode=self._default_monitor_role())
+        plist_path = self._install_with_mode(poll_interval_seconds=poll_interval_seconds, mode=self._default_monitor_role(), **install_options)
         self.start()
         verify = self.status()
         notes.append(f"verify: loaded={verify.loaded} running={verify.running} pid={verify.process_pid}")
         return plist_path, notes
 
-    def force_reinstall(self, poll_interval_seconds: int = 15) -> tuple[Path, list[str]]:
+    def force_reinstall(self, poll_interval_seconds: int = 15, **install_options: Any) -> tuple[Path, list[str]]:
         notes: list[str] = []
         for command in self._bootout_commands():
             try:
@@ -697,7 +757,7 @@ class LaunchAgentManager:
                 notes.append(f"removed: {self.paths.plist_path}")
         except OSError as exc:
             notes.append(f"remove failed: {self.paths.plist_path} | {exc}")
-        plist_path = self._install_with_mode(poll_interval_seconds=poll_interval_seconds, mode=self._default_monitor_role())
+        plist_path = self._install_with_mode(poll_interval_seconds=poll_interval_seconds, mode=self._default_monitor_role(), **install_options)
         notes.append(f"recreated: {plist_path}")
         self.start()
         verify = self.status()
@@ -835,8 +895,8 @@ class LaunchAgentManager:
                     f"Repair: sudo chown -R {('root' if self.scope == 'system' else current_user.pw_name)}:{target_group} {directory}"
                 )
 
-    def _ensure_db_path(self) -> None:
-        db_path = self._effective_db_path()
+    def _ensure_db_path(self, db_path: Path | None = None) -> None:
+        db_path = self._effective_db_path(db_path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
         if self.scope != "system":
             return

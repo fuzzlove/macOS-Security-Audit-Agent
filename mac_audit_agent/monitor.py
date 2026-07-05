@@ -52,6 +52,7 @@ from mac_audit_agent.persistence_monitor import PersistenceMonitor, PersistenceS
 from mac_audit_agent.network_monitor import NetworkMonitor, NetworkStateObserver, NetworkMonitorSnapshot
 from mac_audit_agent.notification_manager import ACTIVITY_OVERLAY_EVENT_TYPES, NotificationManager
 from mac_audit_agent.models import NotificationCapabilities
+from mac_audit_agent.monitor_settings import CATEGORY_EVENT_TYPES, load_settings
 from mac_audit_agent.privacy_monitor import PrivacyMonitor, PrivacyMonitorSnapshot
 from mac_audit_agent.native_event_bridge import NativeEventBridge
 from mac_audit_agent.session_monitor import SessionMonitor, SessionSnapshot, SessionStateObserver
@@ -64,6 +65,33 @@ from mac_audit_agent.version import APP_VERSION
 LOGGER = logging.getLogger(__name__)
 MONITOR_VERSION = APP_VERSION
 TRUSTED_USB_DEVICES_STATE_KEY = "trusted_usb_devices_json"
+USB_CONTEXT_CORRELATION_EVENT_TYPES = {
+    "idle_resume_detected",
+    "mouse_or_keyboard_activity_after_idle",
+    "screen_unlocked",
+    "lid_opened",
+    "new_admin_user_detected",
+    "launchagent_added",
+    "launchdaemon_added",
+    "new_network_connection_detected",
+    "protected_monitor_tamper_detected",
+    "hidden_localhost_port_detected",
+    "localhost_hidden_port_detected",
+    "suspicious_process_observed",
+    "alert_storm_detected",
+    "monitoring_coverage_degraded",
+}
+USB_CLASS_EVENT_TYPES = {
+    "storage": "usb_storage_device_connected",
+    "hid": "usb_hid_device_connected",
+    "keyboard": "usb_keyboard_connected",
+    "mouse": "usb_mouse_connected",
+    "trackpad": "usb_trackpad_connected",
+    "network_adapter": "usb_network_adapter_connected",
+    "camera": "usb_camera_connected",
+    "microphone": "usb_microphone_connected",
+    "unknown": "usb_unknown_class_connected",
+}
 DISCLAIMER = (
     "This monitor records local security events and privacy indicators. "
     "It does not record camera, microphone, screen contents, keystrokes, or packet contents."
@@ -91,6 +119,7 @@ IMPORTANT_EVENT_TYPES = {
     "persistence_item_created_high_risk",
     "persistence_item_created",
     "protected_monitor_tamper_detected",
+    "user_notifier_integrity_mismatch",
     "major_security_event",
     "alert_storm_detected",
     "monitor_self_impact_warning",
@@ -382,6 +411,8 @@ class BackgroundMonitorService:
         self._last_heartbeat_written = 0.0
         self._last_sharing_poll = 0.0
         self._last_integrity_poll = 0.0
+        self.monitor_settings = load_settings(self.db)
+        self._last_settings_snapshot: tuple[bool, bool, bool, bool, bool, int] | None = None
         self.enabled_detectors = [
             "camera_process_detector",
             "screen_session_detector",
@@ -417,9 +448,15 @@ class BackgroundMonitorService:
             if self.user_notifier_mode:
                 self.notifications.start_cfaa_login_acknowledgment()
             if not self.user_notifier_mode:
-                self.session_observer.start()
-                self.network_observer.start()
-                self.usb_observer.start()
+                if self._persistent_local_edr_enabled():
+                    self.session_observer.start()
+                    self.network_observer.start()
+                else:
+                    self._mark_all_detectors_disabled("Persistent Local EDR disabled by settings.")
+                if self._persistent_local_edr_enabled() and self._usb_monitoring_enabled():
+                    self.usb_observer.start()
+                else:
+                    self._mark_detector_disabled("usb_device_detector", "Persistent Local EDR disabled by settings." if not self._persistent_local_edr_enabled() else "USB monitoring disabled by settings.")
                 observers_started = True
             while True:
                 if self.user_notifier_mode:
@@ -447,12 +484,43 @@ class BackgroundMonitorService:
                 self._write_log_line(f"observer stop failed: {name}: {exc}")
                 self.db.set_background_monitor_state(f"{name}_stop_error", str(exc))
 
+    def _sync_usb_observer_settings(self) -> None:
+        if self.user_notifier_mode:
+            return
+        usb_enabled = bool(self.monitor_settings.event_categories.usb_monitoring_enabled)
+        try:
+            if usb_enabled and not self.usb_observer.running:
+                self.usb_observer.start()
+                self.db.set_background_monitor_state("usb_observer_enabled", "1")
+                self._write_log_line("USB observer started because usb_monitoring_enabled=true.")
+            elif not usb_enabled and self.usb_observer.running:
+                self.usb_observer.stop()
+                drained = self.usb_observer.drain()
+                self.db.set_background_monitor_state("usb_observer_enabled", "0")
+                self.db.set_background_monitor_state("usb_observer_discarded_events", str(len(drained)))
+                self._write_log_line("USB observer stopped because usb_monitoring_enabled=false.")
+            elif not usb_enabled:
+                drained = self.usb_observer.drain()
+                self.db.set_background_monitor_state("usb_observer_enabled", "0")
+                self.db.set_background_monitor_state("usb_observer_discarded_events", str(len(drained)))
+        except Exception as exc:
+            self.db.set_background_monitor_state("usb_observer_settings_error", str(exc))
+            self._write_log_line(f"USB observer settings sync failed: {exc}")
+
     def run_once(self) -> list[BackgroundMonitorEvent]:
         if self.user_notifier_mode:
             self.record_heartbeat()
             return self.process_pending_notifications()
         cycle_started = time.monotonic()
         self._update_runtime_state()
+        if not self._persistent_local_edr_enabled():
+            reason = "Persistent Local EDR disabled by settings."
+            self._mark_all_detectors_disabled(reason)
+            self.db.set_background_monitor_state("persistent_local_edr_status", "Disabled by settings")
+            self.db.set_background_monitor_state("detector_last_run_timestamp", "")
+            self.db.set_background_monitor_state("detector_last_run_counts", "{}")
+            self._write_log_line(reason)
+            return []
         all_events: list[BackgroundMonitorEvent] = []
         all_events.extend(self.native_event_bridge.drain())
         all_events.extend(process_deployment_event_flow_request(self.db))
@@ -479,6 +547,16 @@ class BackgroundMonitorService:
             "hardware_device_detector": "no USB topology change or explicit moisture marker found",
             "protected_monitor_integrity_detector": "no protected monitor integrity change",
         }
+        if not self._network_activity_monitoring_enabled():
+            zero_reason_map["network_state_detector"] = "Network activity monitoring disabled by settings."
+        if not self._admin_persistence_monitoring_enabled():
+            zero_reason_map["persistence_detector"] = "Admin/Persistence monitoring disabled by settings."
+        if not self._usb_monitoring_enabled() and not self._bluetooth_monitoring_enabled():
+            zero_reason_map["hardware_device_detector"] = "USB and Bluetooth monitoring disabled by settings."
+        elif not self._usb_monitoring_enabled():
+            zero_reason_map["hardware_device_detector"] = "USB monitoring disabled by settings."
+        elif not self._bluetooth_monitoring_enabled():
+            zero_reason_map["hardware_device_detector"] = "Bluetooth monitoring disabled by settings."
         for name, detector in detector_specs:
             self._write_log_line(f"detector started: {name}")
             try:
@@ -617,7 +695,7 @@ class BackgroundMonitorService:
             "stderr": event.notification_error,
             "osascript_exists": Path("/usr/bin/osascript").exists(),
             "notification_status": self.db.get_background_monitor_state("notification_status", ""),
-            "permission_note": "Permission status cannot be confirmed directly. Check System Settings > Notifications for Terminal/Python/osascript or the packaged app.",
+            "permission_note": "AlertOverlayManager is authoritative; Notification Center and dialogs are optional fallback channels only.",
             "event_id": event.event_id,
         }
 
@@ -644,7 +722,7 @@ class BackgroundMonitorService:
             "last_test_result": readiness["last_test_result"],
             "notification_status": self.db.get_background_monitor_state("notification_status", ""),
             "readiness_json": readiness,
-            "permission_note": "Notification Center is optional; overlay/dialog are sufficient for security alerting.",
+            "permission_note": "AlertOverlayManager is authoritative; Notification Center and dialogs are optional fallback channels only.",
             "event_id": f"notification-readiness-{utc_now_iso()}",
         }
 
@@ -956,14 +1034,24 @@ class BackgroundMonitorService:
         event.original_event_type = original_event_type
         event.normalized_event_type = canonical_type
         event.event_type = canonical_type
+        if self._is_usb_event(event):
+            event = self._classify_usb_monitor_event(event)
+            canonical_type = event.event_type
         preference = self.notifications.preference_for(event.event_type)
-        if not bool(preference.get("enabled", True)):
+        monitoring_disabled_reason = self._monitoring_disabled_reason_for_event(event.event_type)
+        if monitoring_disabled_reason:
+            event.suppression_reason = monitoring_disabled_reason
+            event.last_suppression_reason = monitoring_disabled_reason
+        if not bool(preference.get("enabled", True)) and not self._is_usb_event(event) and not monitoring_disabled_reason:
             self.db.set_background_monitor_state(
                 f"suppress_disabled:{event.event_type}",
                 str(int(self.db.get_background_monitor_state(f"suppress_disabled:{event.event_type}", "0") or "0") + 1),
             )
             return None
-        event.severity = str(preference.get("severity", event.severity))
+        severity_rank = {"info": 0, "low": 0, "medium": 1, "high": 2, "critical": 3}
+        preferred_severity = str(preference.get("severity", event.severity))
+        if severity_rank.get(preferred_severity, 0) > severity_rank.get(event.severity, 0):
+            event.severity = preferred_severity
         try:
             stored = self.db.record_monitor_event(event, dedupe_window_seconds=DEDUPE_SECONDS)
         except Exception as exc:
@@ -982,10 +1070,15 @@ class BackgroundMonitorService:
                     event_type=event.event_type,
                     original_event_type=original_event_type,
                     normalized_event_type=canonical_type,
+                    canonical_event_type=canonical_type,
+                    severity=event.severity,
                     detector_source=getattr(event, "trigger_source", "") or event.source,
                     created_at=event.timestamp,
                     stored_db_path=str(self.db.path),
                     stored_success=bool(stored),
+                    event_written_to_db=bool(stored),
+                    event_db_path=str(self.db.path),
+                    daemon_settings_version=self.db.get_background_monitor_state("settings_version", ""),
                     alert_queue_enqueued=bool(stored),
                     severity_before_policy=event.severity,
                     severity_after_policy=event.severity,
@@ -1412,7 +1505,123 @@ class BackgroundMonitorService:
             return
         self._write_log_line(f"heartbeat: timestamp={timestamp}")
 
+    def _admin_persistence_monitoring_enabled(self) -> bool:
+        try:
+            self.monitor_settings = load_settings(self.db)
+            return bool(self.monitor_settings.event_categories.admin_persistence_monitoring_enabled)
+        except Exception as exc:
+            self.db.set_background_monitor_state("monitor_settings_last_error", str(exc))
+            return self.db.get_background_monitor_state("admin_persistence_monitoring_enabled", "1") != "0"
+
+    def _network_activity_monitoring_enabled(self) -> bool:
+        try:
+            self.monitor_settings = load_settings(self.db)
+            return bool(self.monitor_settings.event_categories.network_activity_monitoring_enabled)
+        except Exception as exc:
+            self.db.set_background_monitor_state("monitor_settings_last_error", str(exc))
+            return self.db.get_background_monitor_state("network_activity_monitoring_enabled", "1") != "0"
+
+    def _persistent_local_edr_enabled(self) -> bool:
+        try:
+            self.monitor_settings = load_settings(self.db)
+            return bool(self.monitor_settings.local_edr.persistent_local_edr_enabled)
+        except Exception as exc:
+            self.db.set_background_monitor_state("monitor_settings_last_error", str(exc))
+            return self.db.get_background_monitor_state("persistent_local_edr_enabled", "1") != "0"
+
+    def _usb_monitoring_enabled(self) -> bool:
+        try:
+            self.monitor_settings = load_settings(self.db)
+            return bool(self.monitor_settings.event_categories.usb_monitoring_enabled)
+        except Exception as exc:
+            self.db.set_background_monitor_state("monitor_settings_last_error", str(exc))
+            return self.db.get_background_monitor_state("usb_monitoring_enabled", "1") != "0"
+
+    def _bluetooth_monitoring_enabled(self) -> bool:
+        try:
+            self.monitor_settings = load_settings(self.db)
+            return bool(self.monitor_settings.event_categories.bluetooth_monitoring_enabled)
+        except Exception as exc:
+            self.db.set_background_monitor_state("monitor_settings_last_error", str(exc))
+            return self.db.get_background_monitor_state("bluetooth_monitoring_enabled", "1") != "0"
+
+    def _monitoring_disabled_reason_for_event(self, event_type: str) -> str:
+        event_type = canonical_event_type(event_type)
+        if not self._persistent_local_edr_enabled():
+            self.db.set_background_monitor_state("last_suppression_reason", "persistent_local_edr_disabled")
+            return "persistent_local_edr_disabled"
+        if event_type in CATEGORY_EVENT_TYPES["usb"] and not self._usb_monitoring_enabled():
+            self.db.set_background_monitor_state("last_suppressed_usb_alert_reason", "usb_monitoring_disabled")
+            return "usb_monitoring_disabled"
+        if event_type in CATEGORY_EVENT_TYPES["bluetooth"] and not self._bluetooth_monitoring_enabled():
+            self.db.set_background_monitor_state("last_suppressed_bluetooth_alert_reason", "bluetooth_monitoring_disabled")
+            return "bluetooth_monitoring_disabled"
+        if event_type in CATEGORY_EVENT_TYPES["network"] and not self._network_activity_monitoring_enabled():
+            self.db.set_background_monitor_state("last_suppressed_network_alert_reason", "network_activity_monitoring_disabled")
+            return "network_activity_monitoring_disabled"
+        if (
+            event_type in CATEGORY_EVENT_TYPES["admin"] or event_type in CATEGORY_EVENT_TYPES["persistence"]
+        ) and not self._admin_persistence_monitoring_enabled():
+            return "admin_persistence_monitoring_disabled"
+        return ""
+
+    def _mark_detector_disabled(self, detector_name: str, reason: str) -> None:
+        enabled_key = {
+            "network_state_detector": "detector_enabled_network",
+            "persistence_detector": "detector_enabled_persistence",
+            "usb_device_detector": "detector_enabled_usb",
+            "bluetooth_device_detector": "detector_enabled_bluetooth",
+        }.get(detector_name)
+        if enabled_key:
+            self.db.set_background_monitor_state(enabled_key, "0")
+        self.db.set_background_monitor_state(f"detector_disabled_reason:{detector_name}", reason)
+        self.db.set_background_monitor_state("detector_last_zero_reason", reason)
+        self._write_log_line(reason)
+
+    def _mark_all_detectors_disabled(self, reason: str) -> None:
+        for detector_name in [
+            "camera_process_detector",
+            "screen_session_detector",
+            "network_state_detector",
+            "persistence_detector",
+            "sharing_service_detector",
+            "suspicious_process_detector",
+            "hardware_device_detector",
+            "protected_monitor_integrity_detector",
+            "usb_device_detector",
+            "bluetooth_device_detector",
+        ]:
+            self._mark_detector_disabled(detector_name, reason)
+
     def _update_runtime_state(self) -> None:
+        self.monitor_settings = load_settings(self.db)
+        settings_version = int(getattr(self.monitor_settings, "settings_version", 0) or 0)
+        current_settings_snapshot = (
+            bool(self.monitor_settings.local_edr.persistent_local_edr_enabled),
+            bool(self.monitor_settings.event_categories.usb_monitoring_enabled),
+            bool(self.monitor_settings.event_categories.bluetooth_monitoring_enabled),
+            bool(self.monitor_settings.event_categories.network_activity_monitoring_enabled),
+            bool(self.monitor_settings.event_categories.admin_persistence_monitoring_enabled),
+            settings_version,
+        )
+        if self._last_settings_snapshot != current_settings_snapshot:
+            verb = "loaded" if self._last_settings_snapshot is None else "reloaded"
+            self._write_log_line(
+                f"Monitor settings {verb}: persistent_local_edr_enabled={current_settings_snapshot[0]} "
+                f"usb_monitoring_enabled={current_settings_snapshot[1]} "
+                f"bluetooth_monitoring_enabled={current_settings_snapshot[2]} "
+                f"network_activity_monitoring_enabled={current_settings_snapshot[3]} "
+                f"admin_persistence_monitoring_enabled={current_settings_snapshot[4]} "
+                f"settings_version={settings_version}"
+            )
+            self._last_settings_snapshot = current_settings_snapshot
+        self.db.set_background_monitor_state("settings_version", str(settings_version))
+        self.db.set_background_monitor_state("settings_last_reload_time", utc_now_iso())
+        self.db.set_background_monitor_state("runtime_persistent_local_edr_enabled", "1" if self.monitor_settings.local_edr.persistent_local_edr_enabled else "0")
+        self.db.set_background_monitor_state("runtime_usb_monitoring_enabled", "1" if self.monitor_settings.event_categories.usb_monitoring_enabled else "0")
+        self.db.set_background_monitor_state("runtime_bluetooth_monitoring_enabled", "1" if self.monitor_settings.event_categories.bluetooth_monitoring_enabled else "0")
+        self.db.set_background_monitor_state("runtime_network_activity_monitoring_enabled", "1" if self.monitor_settings.event_categories.network_activity_monitoring_enabled else "0")
+        self._sync_usb_observer_settings()
         launchctl_status = self._launchctl_service_status()
         launchctl_loaded = bool(launchctl_status.get("loaded"))
         self.db.set_background_monitor_state("enabled", "1")
@@ -1433,7 +1642,14 @@ class BackgroundMonitorService:
                 heartbeat_fresh=True,
             ),
         )
-        for key, value in self._detector_enabled_flags.items():
+        flags = dict(self._detector_enabled_flags)
+        if not self._persistent_local_edr_enabled():
+            flags = {key: "0" for key in flags}
+        if not self._admin_persistence_monitoring_enabled():
+            flags["detector_enabled_persistence"] = "0"
+        if not self._network_activity_monitoring_enabled():
+            flags["detector_enabled_network"] = "0"
+        for key, value in flags.items():
             self.db.set_background_monitor_state(key, value)
         now = time.monotonic()
         if self._last_heartbeat_written == 0.0 or now - self._last_heartbeat_written >= HEARTBEAT_SECONDS:
@@ -1566,6 +1782,17 @@ class BackgroundMonitorService:
         return recorded
 
     def _run_network_detector(self) -> list[BackgroundMonitorEvent]:
+        if not self._network_activity_monitoring_enabled():
+            self._mark_detector_disabled(
+                "network_state_detector",
+                "Network activity monitoring disabled by settings.",
+            )
+            self.db.set_background_monitor_state("network_detector_last_skip_reason", "Network activity monitoring disabled by settings.")
+            return []
+        self.db.set_background_monitor_state("detector_enabled_network", "1")
+        self.db.set_background_monitor_state("detector_disabled_reason:network_state_detector", "")
+        self.db.set_background_monitor_state("network_detector_last_skip_reason", "")
+        self.db.set_background_monitor_state("network_detector_last_run", utc_now_iso())
         if self.network_observer.running:
             current = self.network_observer.current_snapshot or self.network_monitor.collect_snapshot()
             events = self.network_observer.drain()
@@ -1586,6 +1813,7 @@ class BackgroundMonitorService:
             recorded = []
             for event in events:
                 if self.record_monitor_event(event):
+                    self.db.set_background_monitor_state("network_detector_last_emitted_event", event.event_type)
                     recorded.append(event)
             self.previous_network = current
             return recorded
@@ -1609,10 +1837,19 @@ class BackgroundMonitorService:
         recorded = []
         for event in events:
             if self.record_monitor_event(event):
+                self.db.set_background_monitor_state("network_detector_last_emitted_event", event.event_type)
                 recorded.append(event)
         return recorded
 
     def _run_persistence_detector(self) -> list[BackgroundMonitorEvent]:
+        if not self._admin_persistence_monitoring_enabled():
+            self._mark_detector_disabled(
+                "persistence_detector",
+                "Admin/Persistence monitoring disabled by settings.",
+            )
+            return []
+        self.db.set_background_monitor_state("detector_enabled_persistence", "1")
+        self.db.set_background_monitor_state("detector_disabled_reason:persistence_detector", "")
         current = self.persistence_monitor.collect_snapshot()
         had_previous = self.previous_persistence is not None
         previous_inventory = self.persistence_monitor.summarize_inventory(self.previous_persistence) if self.previous_persistence else {"launch_daemons": [], "launch_agents": [], "login_items": []}
@@ -1699,7 +1936,40 @@ class BackgroundMonitorService:
         return events
 
     def _run_hardware_detector(self) -> list[BackgroundMonitorEvent]:
-        current = self.hardware_monitor.collect_snapshot()
+        usb_enabled = self._usb_monitoring_enabled()
+        bluetooth_enabled = self._bluetooth_monitoring_enabled()
+        if not usb_enabled:
+            self._mark_detector_disabled("usb_device_detector", "USB monitoring disabled by settings.")
+            self.db.set_background_monitor_state("physical_device_usb_detector_status", "Disabled by settings")
+            self.db.set_background_monitor_state("physical_device_last_usb_skip_reason", "USB monitoring disabled by settings.")
+        else:
+            self.db.set_background_monitor_state("detector_enabled_usb", "1")
+            self.db.set_background_monitor_state("physical_device_last_usb_skip_reason", "")
+            self._write_log_line("USB detector cycle started.")
+        if not bluetooth_enabled:
+            self._mark_detector_disabled("bluetooth_device_detector", "Bluetooth monitoring disabled by settings.")
+            self.db.set_background_monitor_state("physical_device_bluetooth_detector_status", "Disabled by settings")
+            self.db.set_background_monitor_state("physical_device_last_bluetooth_skip_reason", "Bluetooth monitoring disabled by settings.")
+        else:
+            self.db.set_background_monitor_state("detector_enabled_bluetooth", "1")
+            self.db.set_background_monitor_state("physical_device_last_bluetooth_skip_reason", "")
+            self._write_log_line("Bluetooth detector cycle started.")
+        if not usb_enabled and not bluetooth_enabled:
+            self.db.set_background_monitor_state("detector_enabled_hardware", "0")
+            self.latest_snapshot.update({"usb_devices": [], "bluetooth_devices": []})
+            self._store_current_snapshot()
+            return []
+        self.db.set_background_monitor_state("detector_enabled_hardware", "1")
+        current = self.hardware_monitor.collect_snapshot(include_usb=usb_enabled, include_bluetooth=bluetooth_enabled)
+        timestamp = utc_now_iso()
+        if usb_enabled:
+            self.db.set_background_monitor_state("physical_device_usb_detector_status", "active")
+            self.db.set_background_monitor_state("physical_device_last_usb_scan", timestamp)
+            self.db.set_background_monitor_state("physical_device_current_usb_count", str(len(current.usb_devices)))
+        if bluetooth_enabled:
+            self.db.set_background_monitor_state("physical_device_bluetooth_detector_status", "active")
+            self.db.set_background_monitor_state("physical_device_last_bluetooth_scan", timestamp)
+            self.db.set_background_monitor_state("physical_device_current_bluetooth_count", str(len(current.bluetooth_devices)))
         self.latest_snapshot.update(
             {
                 "usb_devices": current.usb_devices,
@@ -1709,14 +1979,35 @@ class BackgroundMonitorService:
             }
         )
         self._store_current_snapshot()
-        events = self.hardware_monitor.evaluate(self.previous_hardware, current, include_usb=not self.usb_observer.running)
-        events.extend(self._classify_usb_observer_events(self.usb_observer.drain(), current.usb_devices))
+        if self.previous_hardware is None and usb_enabled:
+            self._seed_usb_baseline(current.usb_devices, timestamp=utc_now_iso())
+        events = self.hardware_monitor.evaluate(
+            self.previous_hardware,
+            current,
+            include_usb=usb_enabled and not self.usb_observer.running,
+            include_bluetooth=bluetooth_enabled,
+        )
+        if usb_enabled:
+            events.extend(self._classify_usb_observer_events(self.usb_observer.drain(), current.usb_devices))
         self.previous_hardware = current
         recorded = []
         for event in events:
             if self.record_monitor_event(event):
                 recorded.append(event)
         return recorded
+
+    def _seed_usb_baseline(self, devices: list[dict[str, str]], *, timestamp: str) -> None:
+        for item in devices:
+            identity = self.hardware_monitor.usb_device_identity(item, now=timestamp)
+            if self.db.get_usb_device_identity(identity.device_id) is None:
+                identity.baseline_status = "known"
+                identity.trust_status = "unknown"
+                self.db.upsert_usb_device_identity(identity)
+        self.db.set_background_monitor_state("physical_device_usb_detector_status", "active")
+        self.db.set_background_monitor_state("physical_device_last_usb_scan", timestamp)
+        self.db.set_background_monitor_state("physical_device_current_usb_count", str(len(devices)))
+        self.db.set_background_monitor_state("physical_device_known_usb_count", str(len(self.db.list_usb_device_identities(limit=10000))))
+        self.db.set_background_monitor_state("physical_device_trust_store_path", str(self.db.path))
 
     def _run_integrity_detector(self) -> list[BackgroundMonitorEvent]:
         now = time.monotonic()
@@ -1740,6 +2031,34 @@ class BackgroundMonitorService:
         self.db.set_background_monitor_state("monitor_protection_integrity_fingerprint", fingerprint)
         self.latest_snapshot["monitor_protection_integrity"] = combined_integrity
         self._store_current_snapshot()
+        notifier_integrity = verify_protected_monitor_integrity(scope="user")
+        notifier_fingerprint = evidence_hash(notifier_integrity)
+        previous_notifier_fingerprint = self.db.get_background_monitor_state("user_notifier_integrity_fingerprint", "")
+        self.db.set_background_monitor_state("user_notifier_integrity_json", json.dumps(notifier_integrity, sort_keys=True))
+        self.db.set_background_monitor_state("user_notifier_integrity_fingerprint", notifier_fingerprint)
+        if notifier_integrity.get("tamper_detected") and notifier_fingerprint != previous_notifier_fingerprint:
+            notifier_event = self._build_event(
+                "user_notifier_integrity_mismatch",
+                "; ".join(str(item) for item in notifier_integrity.get("evidence", [])) or "User notifier integrity changed from the trusted manifest.",
+                severity=str(notifier_integrity.get("severity", "high")),
+                confidence=str(notifier_integrity.get("confidence", "high")),
+                source="integrity_check",
+                process_name="com.mac-audit-agent.monitor",
+                trigger_subsource="user_notifier_runtime_integrity",
+                previous_state="trusted notifier manifest expectation",
+                current_state="user notifier integrity drift observed",
+                related_path=str(notifier_integrity.get("plist_path", "")),
+                related_user=getpass.getuser(),
+            )
+            notifier_event.metadata_json = json.dumps(notifier_integrity, sort_keys=True)
+            notifier_event.recommendation = str(
+                notifier_integrity.get(
+                    "recommendation",
+                    "Review alert pipeline diagnostics and reinstall the user notifier from a trusted source if the change was not approved.",
+                )
+            )
+            if self.record_monitor_event(notifier_event, notify_force=True):
+                events.append(notifier_event)
         if not combined_integrity.get("tamper_detected") or fingerprint == previous_fingerprint:
             return events
         evidence_items = [str(item) for item in combined_integrity.get("evidence", [])]
@@ -1898,33 +2217,7 @@ class BackgroundMonitorService:
         events: list[BackgroundMonitorEvent],
         current_devices: list[dict[str, str]],
     ) -> list[BackgroundMonitorEvent]:
-        raw_trusted = self.db.get_background_monitor_state(TRUSTED_USB_DEVICES_STATE_KEY, "")
-        current_identities = {self.hardware_monitor.usb_physical_key(item) for item in current_devices}
-        if not raw_trusted:
-            self._store_trusted_usb_identities(current_identities)
-            return self._coalesce_usb_observer_events(events)
-        try:
-            trusted = set(json.loads(raw_trusted))
-        except json.JSONDecodeError:
-            trusted = set()
-        new_events = [event for event in events if self._usb_event_physical_key(event) not in trusted]
-        if not new_events:
-            return self._coalesce_usb_observer_events(events)
-        trusted.update(self._usb_event_physical_key(event) for event in new_events)
-        self._store_trusted_usb_identities(trusted)
-        labels = sorted({self._usb_observer_label(event) for event in new_events})
-        summary = "; ".join(labels[:4])
-        if len(labels) > 4:
-            summary += f"; and {len(labels) - 4} more"
-        return [
-            self._build_event(
-                "new_usb_device_detected",
-                f"New USB device identity detected: {summary}.",
-                severity="critical",
-                confidence="high",
-                source="ioreg_usb_observer",
-            )
-        ]
+        return events
 
     def _usb_event_physical_key(self, event: BackgroundMonitorEvent) -> str:
         try:
@@ -2154,6 +2447,170 @@ class BackgroundMonitorService:
             return False
         return False
 
+    def _is_usb_event(self, event: BackgroundMonitorEvent) -> bool:
+        return event.event_type.startswith("usb_") or event.event_type in {
+            "new_usb_device_detected",
+            "trusted_usb_device_connected",
+            "untrusted_usb_device_connected",
+        }
+
+    def _classify_usb_monitor_event(self, event: BackgroundMonitorEvent) -> BackgroundMonitorEvent:
+        try:
+            metadata = json.loads(event.metadata_json or "{}")
+        except json.JSONDecodeError:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        if event.event_type == "usb_inventory_changed":
+            self.db.set_background_monitor_state("physical_device_usb_detector_status", "active")
+            self.db.set_background_monitor_state("physical_device_last_usb_scan", event.timestamp)
+            self.db.set_background_monitor_state("physical_device_current_usb_count", str(metadata.get("device_count", "")))
+            self.db.set_background_monitor_state("physical_device_last_emitted_event", event.event_type)
+            event.metadata_json = json.dumps({**metadata, "canonical_event_type": "usb_inventory_changed"}, sort_keys=True)
+            return event
+        identity = self.hardware_monitor.usb_device_identity(metadata, now=event.timestamp)
+        existing = self.db.get_usb_device_identity(identity.device_id) if identity.device_id else None
+        previous_location = existing.location_id if existing else ""
+        if event.event_type == "usb_device_removed":
+            identity.current_connected = False
+            identity.last_removed = event.timestamp
+            identity.baseline_status = existing.baseline_status if existing else "known"
+            identity.trust_status = existing.trust_status if existing else "unknown"
+            event.severity = "low" if identity.trust_status == "trusted" else "low"
+            canonical = "usb_device_removed"
+        else:
+            trust_status = existing.trust_status if existing else "unknown"
+            baseline_status = "new" if existing is None else "known"
+            if trust_status == "trusted":
+                baseline_status = "trusted"
+                canonical = "trusted_usb_device_connected"
+                event.severity = "info"
+            elif trust_status == "untrusted":
+                baseline_status = "untrusted"
+                canonical = "untrusted_usb_device_connected"
+                event.severity = "high"
+            elif existing is None:
+                kind = self.hardware_monitor.usb_device_kind(metadata)
+                canonical = USB_CLASS_EVENT_TYPES.get(kind, "new_usb_device_detected")
+                event.severity = "high"
+            elif previous_location and identity.location_id and previous_location != identity.location_id:
+                baseline_status = "changed"
+                canonical = "usb_device_changed"
+                event.severity = "medium"
+            else:
+                canonical = "usb_device_reconnected"
+                event.severity = "low"
+            identity.current_connected = True
+            identity.baseline_status = baseline_status
+            identity.trust_status = trust_status
+        correlation_reason = self._usb_correlation_reason(event, canonical)
+        if correlation_reason:
+            event.severity = "critical"
+            metadata["correlation_reason"] = correlation_reason
+            event.recommendation = (
+                "Preserve evidence, verify the physical device, and review nearby timeline events before trusting or using this USB device."
+            )
+        identity.last_seen = event.timestamp
+        identity.last_event_id = event.event_id
+        identity.last_event_type = canonical
+        metadata.update(
+            {
+                "device_id": identity.device_id,
+                "serial_number": identity.serial_number,
+                "serial_present": bool(identity.serial_number),
+                "device_name": identity.device_name,
+                "manufacturer": identity.manufacturer,
+                "device_class": identity.device_class,
+                "device_type": self.hardware_monitor.usb_device_kind(metadata),
+                "baseline_status": identity.baseline_status,
+                "trust_status": identity.trust_status,
+                "previous_location_id": previous_location,
+                "location_id": identity.location_id,
+                "confidence": identity.confidence,
+                "canonical_event_type": canonical,
+                "source_method": identity.source_method,
+            }
+        )
+        event.event_type = canonical
+        event.normalized_event_type = canonical
+        event.metadata_json = json.dumps(metadata, sort_keys=True)
+        event.confidence = identity.confidence if identity.confidence in {"medium", "low"} and not identity.serial_number else event.confidence
+        event.baseline_status = identity.baseline_status
+        event.current_state = f"{identity.device_name or 'USB device'} trust={identity.trust_status} baseline={identity.baseline_status}"
+        event.rule_id = rule_for_event(canonical).rule_id
+        event.rule_name = rule_for_event(canonical).name
+        event.trigger_rule_id = event.rule_id
+        event.trigger_rule_name = event.rule_name
+        event.evidence = self._usb_alert_evidence(event, metadata)
+        event.source_trace = f"Detector=hardware_detector; USBRiskEngine={canonical}; DeviceID={identity.device_id}; Trust={identity.trust_status}; Baseline={identity.baseline_status}"
+        self.db.upsert_usb_device_identity(identity)
+        self.db.record_usb_device_history(identity, event_id=event.event_id, event_type=canonical, timestamp=event.timestamp, severity=event.severity)
+        self._update_usb_detector_health(event, metadata)
+        return event
+
+    def _usb_alert_evidence(self, event: BackgroundMonitorEvent, metadata: dict[str, object]) -> str:
+        name = str(metadata.get("device_name") or metadata.get("name") or "unknown USB device")
+        device_type = str(metadata.get("device_type") or "unknown")
+        trust = str(metadata.get("trust_status") or "unknown")
+        baseline = str(metadata.get("baseline_status") or "unknown")
+        location = str(metadata.get("location_id") or "")
+        reason = str(metadata.get("correlation_reason") or "")
+        parts = [
+            f"USB device: {name}",
+            f"type={device_type}",
+            f"baseline={baseline}",
+            f"trust={trust}",
+            f"location={location}" if location else "",
+            f"why={reason}" if reason else "",
+        ]
+        return "; ".join(part for part in parts if part) + "."
+
+    def _usb_correlation_reason(self, event: BackgroundMonitorEvent, canonical_event_type: str) -> str:
+        try:
+            event_time = datetime.fromisoformat(event.timestamp)
+        except ValueError:
+            return ""
+        if event_time.tzinfo is None:
+            event_time = event_time.replace(tzinfo=timezone.utc)
+        kind_sensitive = canonical_event_type in {
+            "usb_hid_device_connected",
+            "usb_keyboard_connected",
+            "usb_mouse_connected",
+            "usb_trackpad_connected",
+            "usb_network_adapter_connected",
+            "untrusted_usb_device_connected",
+        }
+        for recent in self.db.latest_monitor_events(limit=200):
+            if recent.event_id == event.event_id:
+                continue
+            if recent.event_type not in USB_CONTEXT_CORRELATION_EVENT_TYPES:
+                continue
+            try:
+                recent_time = datetime.fromisoformat(recent.timestamp)
+            except ValueError:
+                continue
+            if recent_time.tzinfo is None:
+                recent_time = recent_time.replace(tzinfo=timezone.utc)
+            if abs((event_time - recent_time).total_seconds()) > 600:
+                continue
+            if recent.event_type in {"idle_resume_detected", "mouse_or_keyboard_activity_after_idle", "screen_unlocked", "lid_opened"} and kind_sensitive:
+                return f"{canonical_event_type} occurred within 10 minutes of {recent.event_type}."
+            if recent.event_type not in {"idle_resume_detected", "mouse_or_keyboard_activity_after_idle"}:
+                return f"USB event occurred within 10 minutes of {recent.event_type}."
+        return ""
+
+    def _update_usb_detector_health(self, event: BackgroundMonitorEvent, metadata: dict[str, object]) -> None:
+        self.db.set_background_monitor_state("physical_device_usb_detector_status", "active")
+        self.db.set_background_monitor_state("physical_device_last_usb_scan", event.timestamp)
+        self.db.set_background_monitor_state("physical_device_last_emitted_event", event.event_type)
+        self.db.set_background_monitor_state("physical_device_last_alert_trace", f"trace-{event.event_id}")
+        self.db.set_background_monitor_state("physical_device_trust_store_path", str(self.db.path))
+        self.db.set_background_monitor_state("physical_device_last_device_id", str(metadata.get("device_id", "")))
+        try:
+            self.db.set_background_monitor_state("physical_device_known_usb_count", str(len(self.db.list_usb_device_identities(limit=10000))))
+        except Exception:
+            pass
+
     def _record_detector_error(self, detector_name: str, exc: Exception) -> None:
         message = f"run_once error: {exc} | detector={detector_name}"
         self.db.set_background_monitor_state("last_error", message)
@@ -2253,7 +2710,7 @@ class BackgroundMonitorService:
         self._ensure_log_paths()
 
     def _write_log_line(self, message: str) -> None:
-        timestamped = f"{utc_now_iso()} {message}\n"
+        timestamped = f"utc={utc_now_iso()} local={datetime.now().astimezone().isoformat()} {message}\n"
         for path in self._active_log_paths():
             try:
                 append_monitor_log_line(path, timestamped)

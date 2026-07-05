@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from mac_audit_agent.models import BackgroundMonitorEvent, utc_now_iso
+from mac_audit_agent.models import BackgroundMonitorEvent, USBDeviceIdentity, utc_now_iso
 from mac_audit_agent.rules import correlation_id_for, evidence_hash, normalized_signal, rule_for_event
 
 
@@ -50,9 +50,12 @@ class HardwareMonitor:
     def __init__(self, executor=run_command) -> None:
         self.executor = executor
 
-    def collect_snapshot(self) -> HardwareMonitorSnapshot:
-        usb_devices = self.collect_usb_devices()
-        bluetooth_devices, nearby_bluetooth_devices = self.collect_bluetooth_inventory()
+    def collect_snapshot(self, *, include_usb: bool = True, include_bluetooth: bool = True) -> HardwareMonitorSnapshot:
+        usb_devices = self.collect_usb_devices() if include_usb else []
+        if include_bluetooth:
+            bluetooth_devices, nearby_bluetooth_devices = self.collect_bluetooth_inventory()
+        else:
+            bluetooth_devices, nearby_bluetooth_devices = [], []
         hpm_code, hpm_stdout, _ = self.executor(["/usr/sbin/ioreg", "-r", "-c", "AppleHPMDevice", "-l", "-w", "0"])
         log_code, log_stdout, _ = self.executor(
             [
@@ -120,12 +123,13 @@ class HardwareMonitor:
         current: HardwareMonitorSnapshot,
         *,
         include_usb: bool = True,
+        include_bluetooth: bool = True,
     ) -> list[BackgroundMonitorEvent]:
         timestamp = utc_now_iso()
         events: list[BackgroundMonitorEvent] = []
         if include_usb and previous is not None:
             events.extend(self.usb_connection_events(previous.usb_devices, current.usb_devices, timestamp=timestamp))
-        if previous is not None:
+        if include_bluetooth and previous is not None:
             events.extend(self.bluetooth_connection_events(previous.bluetooth_devices, current.bluetooth_devices, timestamp=timestamp))
             events.extend(self.nearby_bluetooth_events(previous.nearby_bluetooth_devices, current.nearby_bluetooth_devices, timestamp=timestamp))
         previous_markers = previous.moisture_markers if previous else set()
@@ -321,6 +325,25 @@ class HardwareMonitor:
                     current_state="removed",
                 )
             )
+        if previous_usb != current_usb:
+            added = sorted(current_usb - previous_usb)
+            removed = sorted(previous_usb - current_usb)
+            events.append(
+                self._event(
+                    timestamp=timestamp,
+                    event_type="usb_inventory_changed",
+                    severity="medium",
+                    source="ioreg_usb_observer",
+                    evidence=f"USB inventory changed; added={len(added)} removed={len(removed)}.",
+                    confidence="high",
+                    recommendation="Review USB devices added or removed and correlate with nearby session activity.",
+                    metadata={"added": added, "removed": removed, "device_count": len(current_devices), "source_method": "ioreg USB inventory"},
+                    identity="usb_inventory",
+                    rule=rule_for_event("usb_inventory_changed"),
+                    previous_state=f"count={len(previous_devices)}",
+                    current_state=f"count={len(current_devices)}",
+                )
+            )
         return events
 
     def _parse_usb_devices(self, output: str) -> list[dict[str, str]]:
@@ -344,6 +367,10 @@ class HardwareMonitor:
                     "location_id": properties.get("locationID", match.group("location")),
                     "vendor_id": properties.get("idVendor", ""),
                     "product_id": properties.get("idProduct", ""),
+                    "device_class": properties.get("bDeviceClass", "") or properties.get("USB Device Class", ""),
+                    "subclass": properties.get("bDeviceSubClass", ""),
+                    "protocol": properties.get("bDeviceProtocol", ""),
+                    "transport": "USB",
                 }
             )
         return devices
@@ -425,8 +452,56 @@ class HardwareMonitor:
 
     def usb_physical_key(self, item: dict[str, str]) -> str:
         serial = str(item.get("serial", "")).strip()
-        keys = ["vendor_id", "product_id", "serial"] if serial else ["vendor_id", "product_id", "name", "location_id"]
+        keys = ["vendor_id", "product_id", "serial"] if serial else ["vendor_id", "product_id", "name", "vendor", "location_id"]
         return "|".join(str(item.get(key, "")).strip() for key in keys)
+
+    def usb_device_identity(self, item: dict[str, str], *, now: str = "") -> USBDeviceIdentity:
+        serial = str(item.get("serial") or item.get("serial_number") or "").strip()
+        device_id = self.usb_physical_key(item)
+        confidence = "high" if serial else ("medium" if item.get("vendor_id") and item.get("product_id") else "low")
+        return USBDeviceIdentity(
+            device_id=device_id,
+            vendor_id=str(item.get("vendor_id", "")).strip(),
+            product_id=str(item.get("product_id", "")).strip(),
+            serial_number=serial,
+            device_name=str(item.get("name") or item.get("device_name") or "").strip(),
+            manufacturer=str(item.get("vendor") or item.get("manufacturer") or "").strip(),
+            device_class=str(item.get("device_class", "")).strip(),
+            subclass=str(item.get("subclass", "")).strip(),
+            protocol=str(item.get("protocol", "")).strip(),
+            transport=str(item.get("transport", "USB") or "USB"),
+            location_id=str(item.get("location_id", "")).strip(),
+            current_connected=True,
+            first_seen=now,
+            last_seen=now,
+            baseline_status="unknown",
+            trust_status="unknown",
+            confidence=confidence,
+            source_method="ioreg USB inventory",
+        )
+
+    def usb_device_kind(self, item: dict[str, str]) -> str:
+        text = " ".join(
+            str(item.get(key, "")).lower()
+            for key in ["name", "vendor", "device_class", "subclass", "protocol"]
+        )
+        if any(token in text for token in ["keyboard"]):
+            return "keyboard"
+        if any(token in text for token in ["mouse"]):
+            return "mouse"
+        if any(token in text for token in ["trackpad", "touchpad"]):
+            return "trackpad"
+        if any(token in text for token in ["ethernet", "network", "lan", "wifi", "wi-fi", "802.11"]):
+            return "network_adapter"
+        if any(token in text for token in ["storage", "mass storage", "disk", "flash", "thumb drive"]):
+            return "storage"
+        if any(token in text for token in ["camera", "webcam", "video"]):
+            return "camera"
+        if any(token in text for token in ["microphone", "audio"]):
+            return "microphone"
+        if any(token in text for token in ["hid", "human interface"]):
+            return "hid"
+        return "unknown"
 
     def _bluetooth_key(self, item: dict[str, str]) -> str:
         address = str(item.get("address", "")).strip()
@@ -555,6 +630,7 @@ class USBReconnectObserver:
             if pending_previous is not None and pending_current is not None and time.monotonic() - last_topology_change >= self.quiet_window_seconds:
                 final_physical_keys = {self.monitor.usb_physical_key(item) for item in pending_current}
                 pending_events = self.monitor.usb_connection_events(pending_previous, pending_current)
+                skipped_transient_removal = False
                 for event in pending_events:
                     if event.event_type == "usb_device_removed":
                         try:
@@ -562,7 +638,10 @@ class USBReconnectObserver:
                         except json.JSONDecodeError:
                             metadata = {}
                         if self.monitor.usb_physical_key(metadata) in final_physical_keys:
+                            skipped_transient_removal = True
                             continue
+                    if event.event_type == "usb_inventory_changed" and skipped_transient_removal:
+                        continue
                     self.events.put(event)
                 pending_previous = None
                 pending_current = None

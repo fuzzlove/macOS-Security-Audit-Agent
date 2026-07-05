@@ -17,6 +17,12 @@ from mac_audit_agent.launch_agent import LaunchAgentManager, default_monitor_db_
 from mac_audit_agent.models import BackgroundMonitorEvent, EventAlertTrace, ScanResult, ScanSummary, utc_now_iso
 from mac_audit_agent.notification_manager import MANDATORY_VISIBLE_ALERT_EVENT_TYPES, NotificationManager
 from mac_audit_agent.operational_health import OperationalHealthEngine
+from mac_audit_agent.persistence_intelligence.baseline import PersistenceBaselineManager
+from mac_audit_agent.persistence_intelligence.chain_view import build_chain_view
+from mac_audit_agent.persistence_intelligence.diagnostics import build_diagnostics
+from mac_audit_agent.persistence_intelligence.report_adapter import export_persistence_report_html, export_persistence_report_json, export_persistence_report_markdown
+from mac_audit_agent.persistence_intelligence.scanner import PersistenceIntelligenceEngine, ScanContext, scanner_registry
+from mac_audit_agent.persistence_intelligence.timeline import build_timeline, export_timeline
 from mac_audit_agent.reliability import ReleaseReadinessEngine
 from mac_audit_agent.reporting import export_scan_result_html, export_scan_result_json
 from mac_audit_agent.rules import canonical_event_type
@@ -61,6 +67,73 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", type=Path, default=_default_db_path(), help="SQLite database path. Defaults to ~/.mac_audit_agent.sqlite3.")
     parser.add_argument("--no-gui", action="store_true", help="Do not launch the GUI when no action flags are provided.")
     return parser
+
+
+def _build_persistence_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="macos-security-audit-agent persistence", description="MSAA Persistence Intelligence CLI.")
+    parser.add_argument("command", choices=["scan", "coverage", "chains", "posture", "timeline", "malware-kb", "doctor", "baseline", "watch", "export"])
+    parser.add_argument("baseline_action", nargs="?", choices=["create", "compare", "list", "delete"], help="Baseline action.")
+    parser.add_argument("name", nargs="?", help="Baseline name.")
+    parser.add_argument("--all", action="store_true", help="Run all persistence scanners.")
+    parser.add_argument("--module", action="append", default=[], help="Scanner module to run, such as launchd or browser_extensions.")
+    parser.add_argument("--format", choices=["json", "html", "md", "markdown"], default="json")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--db", type=Path, default=_default_db_path())
+    parser.add_argument("--include-downloads", action="store_true")
+    parser.add_argument("--interval", type=int, default=30)
+    return parser
+
+
+def _run_persistence_cli(argv: list[str]) -> int:
+    parser = _build_persistence_parser()
+    args = parser.parse_args(argv)
+    context = ScanContext(include_downloads=bool(args.include_downloads))
+    modules = [] if args.all else list(args.module or [])
+    engine = PersistenceIntelligenceEngine(context)
+    report = engine.scan(modules=modules or None)
+    baseline_manager = PersistenceBaselineManager(args.db.expanduser().parent / "persistence_baselines")
+    if args.command == "scan":
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    elif args.command == "coverage":
+        print(json.dumps(report.coverage, indent=2, sort_keys=True))
+    elif args.command == "chains":
+        print(json.dumps(build_chain_view(report.items, report.findings), indent=2, sort_keys=True))
+    elif args.command == "posture":
+        print(json.dumps({"posture_score": report.posture_score, "items": len(report.items), "findings": len(report.findings)}, indent=2, sort_keys=True))
+    elif args.command == "timeline":
+        events = build_timeline(report.items)
+        if args.output:
+            path = export_timeline(events, args.output, args.format)
+            print(f"Persistence timeline written: {path}")
+        else:
+            print(json.dumps(events, indent=2, sort_keys=True))
+    elif args.command == "malware-kb":
+        from mac_audit_agent.persistence_intelligence.malware_kb import KB_ENTRIES
+
+        print(json.dumps([entry.to_dict() for entry in KB_ENTRIES], indent=2, sort_keys=True))
+    elif args.command == "doctor":
+        print(json.dumps(build_diagnostics(report), indent=2, sort_keys=True))
+    elif args.command == "baseline":
+        if args.baseline_action == "create" and args.name:
+            print(f"Baseline created: {baseline_manager.create_baseline(args.name, report.items)}")
+        elif args.baseline_action == "compare" and args.name:
+            print(json.dumps(baseline_manager.compare_baseline(args.name, report.items), indent=2, sort_keys=True))
+        elif args.baseline_action == "delete" and args.name:
+            print(json.dumps({"deleted": baseline_manager.delete_baseline(args.name), "name": args.name}, indent=2, sort_keys=True))
+        else:
+            print(json.dumps({"baselines": baseline_manager.list_baselines()}, indent=2, sort_keys=True))
+    elif args.command == "watch":
+        print(json.dumps({"status": "configured", "interval": args.interval, "read_only": True, "note": "Use MSAA monitor integration for continuous event logging."}, indent=2, sort_keys=True))
+    elif args.command == "export":
+        output = args.output or Path.cwd() / f"persistence_report.{args.format}"
+        if args.format == "html":
+            path = export_persistence_report_html(report, output)
+        elif args.format in {"md", "markdown"}:
+            path = export_persistence_report_markdown(report, output)
+        else:
+            path = export_persistence_report_json(report, output)
+        print(f"Persistence report written: {path}")
+    return 0
 
 
 def _scan_summary(collectors: CollectorSuite, scan_result: ScanResult, *, started_at: str, scan_mode: str) -> ScanSummary:
@@ -381,6 +454,8 @@ def _verify_clean_install(db: AuditDatabase, *, python_executable: Path, wheel_p
 
 
 def main(argv: list[str] | None = None) -> int:
+    if argv and argv[0] == "persistence":
+        return _run_persistence_cli(argv[1:])
     parser = _build_parser()
     args = parser.parse_args(argv)
     action_requested = any([args.safe_scan, args.aggressive_scan, args.report, args.json_report, args.system_health, args.release_readiness, args.release_readiness_expensive, args.verify_event_flow, args.verify_visible_alert, args.verify_clean_install])

@@ -14,6 +14,7 @@ This repository is intended to be understandable, auditable, and safe enough for
 - Supports optional user LaunchAgent mode and optional root-owned system LaunchDaemon mode
 - Exports HTML and JSON reports locally
 - Preserves evidence snapshots before cleanup or remediation
+- Provides Persistence Intelligence for read-only macOS persistence inventory, scoring, baselines, chain view, timeline, coverage, and reports
 
 
 ## What It Does Not Do
@@ -107,6 +108,12 @@ Targets localhost-only port enumeration and related local checks. This is intent
 TCP/UDP scan functionality can optionally use Nmap as an external scanning engine. Nmap is a separate open-source project maintained by the Nmap Project. MSAA invokes Nmap locally as a wrapper when available.
 
 https://nmap.org/
+
+## Acknowledgements
+
+MSAA Persistence Intelligence incorporates concepts and, where compatible, implementation ideas from macOS Persistence Radar, an open-source macOS persistence visibility and audit project.
+
+https://github.com/fuzzlove/macOS-Persistence-Radar
 
 ## Evidence Preservation
 

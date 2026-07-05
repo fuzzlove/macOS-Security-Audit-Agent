@@ -80,8 +80,13 @@ from mac_audit_agent.monitor_settings import (
     MonitorSettings,
     installed_monitor_values,
     load_settings,
+    reset_defaults,
     save_settings,
     settings_diagnostics,
+)
+from mac_audit_agent.user_notifier_installer import (
+    UserNotifierInstaller,
+    update_db_notifier_status,
 )
 from mac_audit_agent.storage import AuditDatabase
 from mac_audit_agent.system_monitor_readiness import SystemMonitorReadiness
@@ -356,6 +361,42 @@ class BackgroundMonitorPanel(QWidget):
     def _detector_manager(self) -> LaunchAgentManager:
         return self.system_launch_agent if self._system_mode_enabled() else self.launch_agent
 
+    def _install_options(self, *, scope: str) -> dict[str, object]:
+        settings = load_settings(self.db).installation
+        db_path_text = (settings.db_path or "").strip()
+        if not db_path_text:
+            db_path_text = str(default_monitor_db_path("system") if scope == "system" else self.db.path)
+        log_path_text = (settings.log_path or "").strip()
+        return {
+            "run_at_load": settings.run_at_load,
+            "keep_alive": settings.keep_alive,
+            "auto_restart": settings.auto_restart,
+            "db_path": Path(db_path_text).expanduser(),
+            "log_path": Path(log_path_text).expanduser() if log_path_text else None,
+        }
+
+    def _install_summary_text(self) -> str:
+        settings = load_settings(self.db)
+        installation = settings.installation
+        categories = settings.event_categories
+        return "\n".join(
+            [
+                f"Monitor mode: {installation.monitor_mode}",
+                f"Admin/Persistence monitoring: {'enabled' if categories.admin_persistence_monitoring_enabled else 'disabled'}",
+                f"Network Activity monitoring: {'enabled' if categories.network_activity_monitoring_enabled else 'disabled'}",
+                f"USB Monitoring: {'enabled' if categories.usb_monitoring_enabled else 'disabled'}",
+                f"Bluetooth Monitoring: {'enabled' if categories.bluetooth_monitoring_enabled else 'disabled'}",
+                f"Physical Device Alerts: {'enabled' if categories.usb_alerts_enabled or categories.bluetooth_alerts_enabled else 'disabled'}",
+                f"Settings Version: {self.db.get_background_monitor_state('monitor_settings_last_saved', '') or 'pending'}",
+                f"Notifier: {'enabled' if installation.notifier else 'disabled'}",
+                f"RunAtLoad: {'enabled' if installation.run_at_load else 'disabled'}",
+                f"KeepAlive: {'enabled' if installation.keep_alive else 'disabled'}",
+                f"Auto Restart: {'enabled' if installation.auto_restart else 'disabled'}",
+                f"DB Path: {installation.db_path or str(self.db.path)}",
+                f"Log Path: {installation.log_path or self._fallback_log_path_text()}",
+            ]
+        )
+
     def _stderr_log_path(self) -> Path:
         stderr_path = getattr(getattr(self._detector_manager(), "paths", None), "stderr_path", STDERR_MONITOR_LOG)
         return Path(stderr_path).expanduser()
@@ -397,6 +438,11 @@ class BackgroundMonitorPanel(QWidget):
         self.test_critical_alert_button = QPushButton("Test Critical Alert")
         self.test_idle_warning_button = QPushButton("Test Idle Activity Warning")
         self.repair_alerts_button = QPushButton("Repair Alerts / Notifier")
+        self.install_user_alert_agent_button = QPushButton("Install User Alert Agent")
+        self.restart_user_alert_agent_button = QPushButton("Restart User Alert Agent")
+        self.repair_user_alert_agent_button = QPushButton("Repair User Alert Agent")
+        self.remove_user_alert_agent_button = QPushButton("Remove User Alert Agent")
+        self.send_test_user_alert_button = QPushButton("Send Test Alert")
         self.event_priorities_button = QPushButton("Event Priorities")
         self.audit_deployment_button = QPushButton("Audit System Monitor Deployment")
         self.verify_event_flow_button = QPushButton("Verify Event Flow")
@@ -419,6 +465,11 @@ class BackgroundMonitorPanel(QWidget):
             self.test_critical_alert_button,
             self.test_idle_warning_button,
             self.repair_alerts_button,
+            self.install_user_alert_agent_button,
+            self.restart_user_alert_agent_button,
+            self.repair_user_alert_agent_button,
+            self.remove_user_alert_agent_button,
+            self.send_test_user_alert_button,
             self.event_priorities_button,
             self.audit_deployment_button,
             self.verify_event_flow_button,
@@ -428,141 +479,282 @@ class BackgroundMonitorPanel(QWidget):
         layout.addLayout(controls)
 
         settings_layout = QGridLayout()
-        settings_layout.addWidget(QLabel("Enable Continuous Monitoring"), 0, 0)
+        local_edr_title = QLabel("Local EDR / Persistent Monitor")
+        local_edr_title.setStyleSheet("font-weight: 700;")
+        settings_layout.addWidget(local_edr_title, 0, 0, 1, 2)
+        self.persistent_local_edr_label = QLabel("Enable Persistent Local EDR Monitor")
+        self.persistent_local_edr_label.setToolTip(
+            "Runs the local MSAA monitor continuously to detect security-relevant events such as persistence changes, admin changes, USB/Bluetooth devices, network activity, monitor health issues, and suspicious local activity. All data remains local unless explicitly exported by the user."
+        )
+        settings_layout.addWidget(self.persistent_local_edr_label, 1, 0)
+        self.persistent_local_edr_checkbox = QCheckBox()
+        self.persistent_local_edr_checkbox.setToolTip(self.persistent_local_edr_label.toolTip())
+        settings_layout.addWidget(self.persistent_local_edr_checkbox, 1, 1)
+        self.persistent_local_edr_helper = QLabel(
+            "When enabled, MSAA uses the configured LaunchAgent or LaunchDaemon to monitor local security events. When disabled, background monitoring stops but historical events remain visible."
+        )
+        self.persistent_local_edr_helper.setWordWrap(True)
+        settings_layout.addWidget(self.persistent_local_edr_helper, 2, 0, 1, 8)
+        settings_layout.addWidget(QLabel("Enable Continuous Monitoring"), 3, 0)
         self.continuous_monitoring_checkbox = QCheckBox()
-        settings_layout.addWidget(self.continuous_monitoring_checkbox, 0, 1)
-        settings_layout.addWidget(QLabel("Start at Login"), 0, 2)
+        settings_layout.addWidget(self.continuous_monitoring_checkbox, 3, 1)
+        settings_layout.addWidget(QLabel("Start at Login"), 3, 2)
         self.start_at_login_checkbox = QCheckBox()
-        settings_layout.addWidget(self.start_at_login_checkbox, 0, 3)
-        settings_layout.addWidget(QLabel("Popup only critical events"), 0, 4)
+        settings_layout.addWidget(self.start_at_login_checkbox, 3, 3)
+        settings_layout.addWidget(QLabel("Popup only critical events"), 3, 4)
         self.popup_only_severe_checkbox = QCheckBox()
         self.popup_only_severe_checkbox.setChecked(True)
-        settings_layout.addWidget(self.popup_only_severe_checkbox, 0, 5)
-        settings_layout.addWidget(QLabel("Alert on browser camera-capable processes"), 0, 6)
+        settings_layout.addWidget(self.popup_only_severe_checkbox, 3, 5)
+        settings_layout.addWidget(QLabel("Alert on browser camera-capable processes"), 3, 6)
         self.browser_capture_popup_checkbox = QCheckBox()
         self.browser_capture_popup_checkbox.setChecked(False)
-        settings_layout.addWidget(self.browser_capture_popup_checkbox, 0, 7)
+        settings_layout.addWidget(self.browser_capture_popup_checkbox, 3, 7)
         self.notify_all_checkbox = QCheckBox()
         self.notify_all_checkbox.setChecked(False)
-        settings_layout.addWidget(self.notify_all_checkbox, 1, 1)
-        settings_layout.addWidget(QLabel("Notify All Events"), 1, 0)
-        settings_layout.addWidget(QLabel("Notify Important Events"), 1, 2)
+        settings_layout.addWidget(self.notify_all_checkbox, 4, 1)
+        settings_layout.addWidget(QLabel("Notify All Events"), 4, 0)
+        settings_layout.addWidget(QLabel("Notify Important Events"), 4, 2)
         self.notify_important_checkbox = QCheckBox()
         self.notify_important_checkbox.setChecked(True)
-        settings_layout.addWidget(self.notify_important_checkbox, 1, 3)
-        settings_layout.addWidget(QLabel("Notify Min Severity"), 1, 4)
+        settings_layout.addWidget(self.notify_important_checkbox, 4, 3)
+        settings_layout.addWidget(QLabel("Notify Min Severity"), 4, 4)
         self.notify_min_severity_combo = QComboBox()
         for severity in ["info", "low", "medium", "high", "critical"]:
             self.notify_min_severity_combo.addItem(severity, severity)
-        settings_layout.addWidget(self.notify_min_severity_combo, 1, 5)
-        settings_layout.addWidget(QLabel("Duplicate Rate Limit Seconds"), 1, 8)
+        settings_layout.addWidget(self.notify_min_severity_combo, 4, 5)
+        settings_layout.addWidget(QLabel("Duplicate Rate Limit Seconds"), 4, 8)
         self.rate_limit_input = QLineEdit("10")
-        settings_layout.addWidget(self.rate_limit_input, 1, 9)
-        settings_layout.addWidget(QLabel("Notification Mode"), 1, 10)
+        settings_layout.addWidget(self.rate_limit_input, 4, 9)
+        settings_layout.addWidget(QLabel("Notification Mode"), 4, 10)
         self.notification_mode_combo = QComboBox()
-        for mode in ["none", "notification", "dialog", "both"]:
+        for mode in ["overlay", "none", "notification", "dialog", "both"]:
             self.notification_mode_combo.addItem(mode, mode)
-        settings_layout.addWidget(self.notification_mode_combo, 1, 11)
-        settings_layout.addWidget(QLabel("Notification Sound"), 1, 12)
+        settings_layout.addWidget(self.notification_mode_combo, 4, 11)
+        settings_layout.addWidget(QLabel("Notification Sound"), 4, 12)
         self.notification_sound_input = QLineEdit("Glass")
-        settings_layout.addWidget(self.notification_sound_input, 1, 13)
+        settings_layout.addWidget(self.notification_sound_input, 4, 13)
         self.save_settings_button = QPushButton("Save Notification Settings")
-        settings_layout.addWidget(self.save_settings_button, 1, 14)
-        settings_layout.addWidget(QLabel("Show Bottom-Right Alerts"), 2, 0)
+        settings_layout.addWidget(self.save_settings_button, 4, 14)
+        settings_layout.addWidget(QLabel("Enable bottom-right security alerts"), 5, 0)
         self.show_visible_alerts_checkbox = QCheckBox()
         self.show_visible_alerts_checkbox.setChecked(True)
-        settings_layout.addWidget(self.show_visible_alerts_checkbox, 2, 1)
-        settings_layout.addWidget(QLabel("Physical/Session"), 2, 2)
+        self.show_visible_alerts_checkbox.setToolTip(
+            "The user alert agent runs in your logged-in macOS session and displays MSAA bottom-right security alerts. It is required because background daemons cannot reliably show user interface alerts directly."
+        )
+        settings_layout.addWidget(self.show_visible_alerts_checkbox, 5, 1)
+        settings_layout.addWidget(QLabel("Install user notification agent automatically"), 5, 2)
+        self.auto_install_user_notifier_checkbox = QCheckBox()
+        self.auto_install_user_notifier_checkbox.setChecked(True)
+        self.auto_install_user_notifier_checkbox.setToolTip(self.show_visible_alerts_checkbox.toolTip())
+        settings_layout.addWidget(self.auto_install_user_notifier_checkbox, 5, 3)
+        settings_layout.addWidget(QLabel("Start notification agent at login"), 5, 4)
+        self.user_notifier_start_at_login_checkbox = QCheckBox()
+        self.user_notifier_start_at_login_checkbox.setChecked(True)
+        self.user_notifier_start_at_login_checkbox.setToolTip(self.show_visible_alerts_checkbox.toolTip())
+        settings_layout.addWidget(self.user_notifier_start_at_login_checkbox, 5, 5)
         self.show_physical_session_alerts_checkbox = QCheckBox()
         self.show_physical_session_alerts_checkbox.setChecked(True)
-        settings_layout.addWidget(self.show_physical_session_alerts_checkbox, 2, 3)
-        settings_layout.addWidget(QLabel("USB/Bluetooth"), 2, 4)
+        self.show_physical_session_alerts_checkbox.setVisible(False)
         self.show_usb_bluetooth_alerts_checkbox = QCheckBox()
         self.show_usb_bluetooth_alerts_checkbox.setChecked(True)
-        settings_layout.addWidget(self.show_usb_bluetooth_alerts_checkbox, 2, 5)
-        settings_layout.addWidget(QLabel("Network"), 2, 6)
+        self.show_usb_bluetooth_alerts_checkbox.setVisible(False)
+        self.network_monitoring_label = QLabel("Monitor Network Activity")
+        self.network_monitoring_label.setToolTip("Detect new network connections, new listening ports, DNS/gateway changes, VPN changes, localhost visibility mismatches, and suspicious network activity.")
+        settings_layout.addWidget(self.network_monitoring_label, 5, 6)
         self.show_network_change_alerts_checkbox = QCheckBox()
+        self.show_network_change_alerts_checkbox.setToolTip("Detect new network connections, new listening ports, DNS/gateway changes, VPN changes, localhost visibility mismatches, and suspicious network activity.")
         self.show_network_change_alerts_checkbox.setChecked(True)
-        settings_layout.addWidget(self.show_network_change_alerts_checkbox, 2, 7)
-        settings_layout.addWidget(QLabel("Admin/Persistence"), 2, 8)
+        settings_layout.addWidget(self.show_network_change_alerts_checkbox, 5, 7)
+        self.admin_persistence_monitoring_label = QLabel("Monitor Admin and Persistence Changes")
+        self.admin_persistence_monitoring_label.setToolTip("Detect new admin users, removed admin users, LaunchAgents, LaunchDaemons, login items, and other persistence changes.")
+        settings_layout.addWidget(self.admin_persistence_monitoring_label, 5, 8)
         self.show_admin_persistence_alerts_checkbox = QCheckBox()
+        self.show_admin_persistence_alerts_checkbox.setToolTip("Detect new admin users, removed admin users, LaunchAgents, LaunchDaemons, login items, and other persistence changes.")
         self.show_admin_persistence_alerts_checkbox.setChecked(True)
-        settings_layout.addWidget(self.show_admin_persistence_alerts_checkbox, 2, 9)
-        settings_layout.addWidget(QLabel("Apple Forecast"), 2, 10)
+        settings_layout.addWidget(self.show_admin_persistence_alerts_checkbox, 5, 9)
         self.show_apple_forecast_alerts_checkbox = QCheckBox()
         self.show_apple_forecast_alerts_checkbox.setChecked(True)
-        settings_layout.addWidget(self.show_apple_forecast_alerts_checkbox, 2, 11)
-        settings_layout.addWidget(QLabel("Idle Warning Minutes"), 2, 12)
+        self.show_apple_forecast_alerts_checkbox.setVisible(False)
+        settings_layout.addWidget(QLabel("Idle Warning Minutes"), 5, 12)
         self.idle_warning_minutes_input = QLineEdit("2")
-        settings_layout.addWidget(self.idle_warning_minutes_input, 2, 13)
-        settings_layout.addWidget(QLabel("CFAA Idle Warning"), 2, 14)
+        settings_layout.addWidget(self.idle_warning_minutes_input, 5, 13)
+        settings_layout.addWidget(QLabel("CFAA Idle Warning"), 5, 14)
         self.cfaa_idle_warning_checkbox = QCheckBox()
         self.cfaa_idle_warning_checkbox.setChecked(True)
-        settings_layout.addWidget(self.cfaa_idle_warning_checkbox, 2, 15)
-        settings_layout.addWidget(QLabel("Category Cooldown Seconds"), 3, 0)
+        settings_layout.addWidget(self.cfaa_idle_warning_checkbox, 5, 15)
+        settings_layout.addWidget(QLabel("Category Cooldown Seconds"), 6, 0)
         self.cooldown_seconds_input = QLineEdit("600")
-        settings_layout.addWidget(self.cooldown_seconds_input, 3, 1)
-        settings_layout.addWidget(QLabel("Dialogs"), 3, 2)
+        settings_layout.addWidget(self.cooldown_seconds_input, 6, 1)
+        settings_layout.addWidget(QLabel("Dialogs"), 6, 2)
         self.dialog_alerts_checkbox = QCheckBox()
-        settings_layout.addWidget(self.dialog_alerts_checkbox, 3, 3)
-        settings_layout.addWidget(QLabel("Notification Center"), 3, 4)
+        settings_layout.addWidget(self.dialog_alerts_checkbox, 6, 3)
+        settings_layout.addWidget(QLabel("Notification Center"), 6, 4)
         self.notification_center_checkbox = QCheckBox()
-        settings_layout.addWidget(self.notification_center_checkbox, 3, 5)
-        settings_layout.addWidget(QLabel("Persistent Alerts"), 3, 6)
+        settings_layout.addWidget(self.notification_center_checkbox, 6, 5)
+        settings_layout.addWidget(QLabel("Persistent Alerts"), 6, 6)
         self.persistent_alerts_checkbox = QCheckBox()
-        settings_layout.addWidget(self.persistent_alerts_checkbox, 3, 7)
-        settings_layout.addWidget(QLabel("Alert Sounds"), 3, 8)
+        settings_layout.addWidget(self.persistent_alerts_checkbox, 6, 7)
+        settings_layout.addWidget(QLabel("Alert Sounds"), 6, 8)
         self.enable_alert_sounds_checkbox = QCheckBox()
-        settings_layout.addWidget(self.enable_alert_sounds_checkbox, 3, 9)
-        settings_layout.addWidget(QLabel("Authorized Use Warning"), 3, 10)
+        settings_layout.addWidget(self.enable_alert_sounds_checkbox, 6, 9)
+        settings_layout.addWidget(QLabel("Authorized Use Warning"), 6, 10)
         self.authorized_use_warning_checkbox = QCheckBox()
-        settings_layout.addWidget(self.authorized_use_warning_checkbox, 3, 11)
-        settings_layout.addWidget(QLabel("Critical Overlay"), 3, 12)
+        settings_layout.addWidget(self.authorized_use_warning_checkbox, 6, 11)
+        settings_layout.addWidget(QLabel("Critical Overlay"), 6, 12)
         self.critical_overlay_checkbox = QCheckBox()
-        settings_layout.addWidget(self.critical_overlay_checkbox, 3, 13)
-        category_title = QLabel("Event Categories")
+        settings_layout.addWidget(self.critical_overlay_checkbox, 6, 13)
+        category_title = QLabel("Physical Monitoring Settings")
         category_title.setStyleSheet("font-weight: 700;")
-        settings_layout.addWidget(category_title, 4, 0, 1, 2)
+        settings_layout.addWidget(category_title, 7, 0, 1, 2)
+        physical_device_title = QLabel("Physical Device Monitoring")
+        physical_device_title.setStyleSheet("font-weight: 700;")
+        settings_layout.addWidget(physical_device_title, 8, 0, 1, 2)
+        physical_session_title = QLabel("Physical Session Monitoring")
+        physical_session_title.setStyleSheet("font-weight: 700;")
+        settings_layout.addWidget(physical_session_title, 10, 0, 1, 2)
+        other_categories_title = QLabel("Other Monitor Categories")
+        other_categories_title.setStyleSheet("font-weight: 700;")
+        settings_layout.addWidget(other_categories_title, 12, 0, 1, 2)
         self.category_checkboxes: dict[str, QCheckBox] = {}
         category_labels = [
-            ("usb", "USB"),
-            ("bluetooth", "Bluetooth"),
-            ("camera", "Camera"),
-            ("lid", "Lid"),
-            ("session", "Session"),
-            ("mouse", "Mouse"),
-            ("keyboard", "Keyboard"),
-            ("trackpad", "Trackpad"),
-            ("network", "Network"),
-            ("persistence", "Persistence"),
-            ("admin", "Admin"),
-            ("apple_exposure", "Apple Exposure"),
-            ("monitor_health", "Monitor Health"),
+            ("usb", "Monitor USB Devices", 9, 0),
+            ("bluetooth", "Monitor Bluetooth Devices", 9, 2),
+            ("lid", "Monitor lid open/close", 11, 0),
+            ("session", "Monitor screen lock/unlock", 11, 2),
+            ("mouse", "Monitor idle resume", 11, 4),
+            ("keyboard", "Monitor input activity after idle", 11, 6),
+            ("trackpad", "Monitor trackpad activity after idle", 11, 8),
+            ("camera", "Monitor camera/microphone activity", 13, 0),
+            ("network", "Monitor Network Activity", 13, 2),
+            ("persistence", "Monitor persistence changes", 13, 4),
+            ("admin", "Monitor admin changes", 13, 6),
+            ("apple_exposure", "Monitor Apple Exposure status", 14, 0),
+            ("monitor_health", "Monitor health / tamper detection", 14, 2),
         ]
-        for offset, (key, label) in enumerate(category_labels):
-            row = 5 + offset // 4
-            column = (offset % 4) * 2
+        for key, label, row, column in category_labels:
+            settings_layout.addWidget(QLabel(label), row, column)
+            checkbox = QCheckBox()
+            if key == "usb":
+                checkbox.setToolTip("Detect USB device connections, removals, new devices, HID devices, storage devices, USB network adapters, and USB inventory changes.")
+            elif key == "bluetooth":
+                checkbox.setToolTip("Detect Bluetooth device connections, removals, new devices, trusted devices, unknown devices, and Bluetooth inventory changes.")
+            elif key == "lid":
+                checkbox.setToolTip("Detect lid open and lid close events.")
+            elif key == "session":
+                checkbox.setToolTip("Detect screen lock, unlock, login, logout, sleep, and wake events.")
+            elif key in {"mouse", "keyboard", "trackpad"}:
+                checkbox.setToolTip("Detect input or idle-resume activity for Authorized Use monitoring.")
+            settings_layout.addWidget(checkbox, row, column + 1)
+            self.category_checkboxes[key] = checkbox
+        child_title = QLabel("Physical Device Alert Details")
+        child_title.setStyleSheet("font-weight: 700;")
+        settings_layout.addWidget(child_title, 15, 0, 1, 2)
+        self.child_category_checkboxes: dict[str, QCheckBox] = {}
+        physical_device_child_labels = [
+            ("usb_new_device_alerts_enabled", "Alert on new USB devices", "usb"),
+            ("usb_trusted_device_alerts_enabled", "Alert on trusted USB reconnects", "usb"),
+            ("usb_storage_alerts_enabled", "Alert on USB storage devices", "usb"),
+            ("usb_hid_alerts_enabled", "Alert on USB HID devices", "usb"),
+            ("usb_network_adapter_alerts_enabled", "Alert on USB network adapters", "usb"),
+            ("usb_unknown_device_alerts_enabled", "Alert on unknown USB devices", "usb"),
+            ("bluetooth_new_device_alerts_enabled", "Alert on new Bluetooth devices", "bluetooth"),
+            ("bluetooth_trusted_device_alerts_enabled", "Alert on trusted Bluetooth reconnects", "bluetooth"),
+            ("bluetooth_inventory_alerts_enabled", "Alert on Bluetooth inventory changes", "bluetooth"),
+            ("bluetooth_unknown_device_alerts_enabled", "Alert on unknown Bluetooth devices", "bluetooth"),
+        ]
+        other_child_labels = [
+            ("network_new_connection_alerts_enabled", "Alert on new outbound connections", "network"),
+            ("network_new_listener_alerts_enabled", "Alert on new listening ports", "network"),
+            ("network_dns_gateway_alerts_enabled", "Alert on DNS/gateway changes", "network"),
+            ("network_vpn_alerts_enabled", "Alert on VPN changes", "network"),
+            ("network_suspicious_connection_alerts_enabled", "Alert on suspicious connections", "network"),
+            ("network_localhost_visibility_alerts_enabled", "Alert on localhost visibility mismatches", "network"),
+            ("admin_user_monitoring_enabled", "Admin user changes", "admin_persistence"),
+            ("sudoers_monitoring_enabled", "sudoers changes", "admin_persistence"),
+            ("launchagent_monitoring_enabled", "LaunchAgents", "admin_persistence"),
+            ("launchdaemon_monitoring_enabled", "LaunchDaemons", "admin_persistence"),
+            ("login_item_monitoring_enabled", "Login items", "admin_persistence"),
+            ("profile_mdm_monitoring_enabled", "Profiles / MDM indicators", "admin_persistence"),
+        ]
+        child_labels = physical_device_child_labels + other_child_labels
+        self.child_category_parents = {key: parent for key, _label, parent in child_labels}
+        for offset, (key, label, _parent_key) in enumerate(physical_device_child_labels):
+            row = 16 + offset // 3
+            column = (offset % 3) * 2
             settings_layout.addWidget(QLabel(label), row, column)
             checkbox = QCheckBox()
             settings_layout.addWidget(checkbox, row, column + 1)
-            self.category_checkboxes[key] = checkbox
-        for widget in [
-            self.show_physical_session_alerts_checkbox,
-            self.show_usb_bluetooth_alerts_checkbox,
-            self.show_network_change_alerts_checkbox,
-            self.show_admin_persistence_alerts_checkbox,
-            self.show_apple_forecast_alerts_checkbox,
-        ]:
-            widget.setVisible(False)
-        for label in self.findChildren(QLabel):
-            if label.text() in {"Physical/Session", "USB/Bluetooth", "Network", "Admin/Persistence", "Apple Forecast"}:
-                label.setVisible(False)
+            self.child_category_checkboxes[key] = checkbox
+        other_child_title = QLabel("Other Monitor Alert Details")
+        other_child_title.setStyleSheet("font-weight: 700;")
+        settings_layout.addWidget(other_child_title, 20, 0, 1, 2)
+        for offset, (key, label, _parent_key) in enumerate(other_child_labels):
+            row = 21 + offset // 3
+            column = (offset % 3) * 2
+            settings_layout.addWidget(QLabel(label), row, column)
+            checkbox = QCheckBox()
+            settings_layout.addWidget(checkbox, row, column + 1)
+            self.child_category_checkboxes[key] = checkbox
+        install_title = QLabel("Installation Settings")
+        install_title.setStyleSheet("font-weight: 700;")
+        settings_layout.addWidget(install_title, 25, 0, 1, 2)
+        settings_layout.addWidget(QLabel("Monitor Mode"), 26, 0)
+        self.install_monitor_mode_combo = QComboBox()
+        for label, value in [("User LaunchAgent", "user"), ("System LaunchDaemon", "system"), ("Protected Mode", "protected")]:
+            self.install_monitor_mode_combo.addItem(label, value)
+        settings_layout.addWidget(self.install_monitor_mode_combo, 26, 1)
+        settings_layout.addWidget(QLabel("User LaunchAgent"), 26, 2)
+        self.install_user_launch_agent_checkbox = QCheckBox()
+        settings_layout.addWidget(self.install_user_launch_agent_checkbox, 26, 3)
+        settings_layout.addWidget(QLabel("System LaunchDaemon"), 26, 4)
+        self.install_system_launch_daemon_checkbox = QCheckBox()
+        settings_layout.addWidget(self.install_system_launch_daemon_checkbox, 26, 5)
+        settings_layout.addWidget(QLabel("Notifier"), 26, 6)
+        self.install_notifier_checkbox = QCheckBox()
+        settings_layout.addWidget(self.install_notifier_checkbox, 26, 7)
+        settings_layout.addWidget(QLabel("RunAtLoad"), 27, 0)
+        self.install_run_at_load_checkbox = QCheckBox()
+        settings_layout.addWidget(self.install_run_at_load_checkbox, 27, 1)
+        settings_layout.addWidget(QLabel("KeepAlive"), 27, 2)
+        self.install_keep_alive_checkbox = QCheckBox()
+        settings_layout.addWidget(self.install_keep_alive_checkbox, 27, 3)
+        settings_layout.addWidget(QLabel("Auto Restart"), 27, 4)
+        self.install_auto_restart_checkbox = QCheckBox()
+        settings_layout.addWidget(self.install_auto_restart_checkbox, 27, 5)
+        settings_layout.addWidget(QLabel("DB Path"), 28, 0)
+        self.install_db_path_input = QLineEdit()
+        settings_layout.addWidget(self.install_db_path_input, 28, 1, 1, 5)
+        settings_layout.addWidget(QLabel("Log Path"), 29, 0)
+        self.install_log_path_input = QLineEdit()
+        settings_layout.addWidget(self.install_log_path_input, 29, 1, 1, 5)
         layout.addLayout(settings_layout)
 
         layout.addWidget(QLabel("Settings Diagnostics"))
+        diagnostics_actions = QHBoxLayout()
+        self.save_monitor_settings_button = QPushButton("Save Settings")
+        self.save_monitor_settings_button.clicked.connect(self.save_monitor_settings_only)
+        diagnostics_actions.addWidget(self.save_monitor_settings_button)
+        self.apply_settings_button = QPushButton("Apply Settings")
+        self.apply_settings_button.clicked.connect(self.apply_monitor_settings_from_ui)
+        diagnostics_actions.addWidget(self.apply_settings_button)
+        self.apply_restart_settings_button = QPushButton("Apply and Restart Monitor")
+        self.apply_restart_settings_button.clicked.connect(self.apply_settings_and_restart_monitor)
+        diagnostics_actions.addWidget(self.apply_restart_settings_button)
+        self.reinstall_current_settings_button = QPushButton("Reinstall Monitor With Current Settings")
+        self.reinstall_current_settings_button.clicked.connect(self.reinstall_monitor_with_current_settings)
+        diagnostics_actions.addWidget(self.reinstall_current_settings_button)
         self.repair_settings_mismatch_button = QPushButton("Repair Settings Mismatch")
         self.repair_settings_mismatch_button.clicked.connect(self.repair_settings_mismatch)
-        layout.addWidget(self.repair_settings_mismatch_button)
+        diagnostics_actions.addWidget(self.repair_settings_mismatch_button)
+        self.preview_alert_styles_button = QPushButton("Preview Alert Styles")
+        self.preview_alert_styles_button.setToolTip("Render INFO, LOW, MEDIUM, HIGH, and CRITICAL bottom-right alerts through AlertOverlayManager.")
+        self.preview_alert_styles_button.clicked.connect(self.preview_alert_styles)
+        diagnostics_actions.addWidget(self.preview_alert_styles_button)
+        self.reset_monitor_settings_button = QPushButton("Reset to Defaults")
+        self.reset_monitor_settings_button.clicked.connect(self.reset_monitor_settings_to_defaults)
+        diagnostics_actions.addWidget(self.reset_monitor_settings_button)
+        diagnostics_actions.addStretch(1)
+        layout.addLayout(diagnostics_actions)
         self.settings_diagnostics_panel = QTextEdit()
         self.settings_diagnostics_panel.setReadOnly(True)
         layout.addWidget(self.settings_diagnostics_panel)
@@ -708,6 +900,11 @@ class BackgroundMonitorPanel(QWidget):
         self.test_critical_alert_button.clicked.connect(self.test_critical_alert)
         self.test_idle_warning_button.clicked.connect(self.test_idle_activity_warning)
         self.repair_alerts_button.clicked.connect(self.repair_alerts_notifier)
+        self.install_user_alert_agent_button.clicked.connect(self.install_user_alert_agent)
+        self.restart_user_alert_agent_button.clicked.connect(self.restart_user_alert_agent)
+        self.repair_user_alert_agent_button.clicked.connect(self.repair_user_alert_agent)
+        self.remove_user_alert_agent_button.clicked.connect(self.remove_user_alert_agent)
+        self.send_test_user_alert_button.clicked.connect(self.test_bottom_right_alert)
         self.event_priorities_button.clicked.connect(self.show_event_priorities_dialog)
         self.audit_deployment_button.clicked.connect(self.audit_system_monitor_deployment)
         self.verify_event_flow_button.clicked.connect(self.verify_system_monitor_event_flow)
@@ -735,6 +932,10 @@ class BackgroundMonitorPanel(QWidget):
             self.popup_only_severe_checkbox,
             self.browser_capture_popup_checkbox,
             self.show_visible_alerts_checkbox,
+            self.auto_install_user_notifier_checkbox,
+            self.user_notifier_start_at_login_checkbox,
+            self.show_network_change_alerts_checkbox,
+            self.show_admin_persistence_alerts_checkbox,
             self.dialog_alerts_checkbox,
             self.notification_center_checkbox,
             self.persistent_alerts_checkbox,
@@ -742,13 +943,35 @@ class BackgroundMonitorPanel(QWidget):
             self.authorized_use_warning_checkbox,
             self.critical_overlay_checkbox,
             self.cfaa_idle_warning_checkbox,
+            self.persistent_local_edr_checkbox,
+            self.install_user_launch_agent_checkbox,
+            self.install_system_launch_daemon_checkbox,
+            self.install_notifier_checkbox,
+            self.install_run_at_load_checkbox,
+            self.install_keep_alive_checkbox,
+            self.install_auto_restart_checkbox,
             *self.category_checkboxes.values(),
+            *self.child_category_checkboxes.values(),
         ]:
             widget.toggled.connect(lambda _checked, self=self: self.apply_monitor_settings_from_ui())
-        for combo in [self.notify_min_severity_combo, self.notification_mode_combo]:
+        self.notification_mode_combo.currentIndexChanged.connect(lambda _index, self=self: self._notification_mode_changed_from_ui())
+        self.install_monitor_mode_combo.currentIndexChanged.connect(lambda _index, self=self: self._installation_mode_changed_from_ui())
+        for combo in [self.notify_min_severity_combo]:
             combo.currentIndexChanged.connect(lambda _index, self=self: self.apply_monitor_settings_from_ui())
-        for line_edit in [self.rate_limit_input, self.notification_sound_input, self.idle_warning_minutes_input, self.cooldown_seconds_input]:
+        for line_edit in [
+            self.rate_limit_input,
+            self.notification_sound_input,
+            self.idle_warning_minutes_input,
+            self.cooldown_seconds_input,
+            self.install_db_path_input,
+            self.install_log_path_input,
+        ]:
             line_edit.editingFinished.connect(self.apply_monitor_settings_from_ui)
+        self.show_network_change_alerts_checkbox.toggled.connect(lambda _checked, self=self: self._update_monitoring_parent_child_state())
+        self.show_admin_persistence_alerts_checkbox.toggled.connect(lambda _checked, self=self: self._update_monitoring_parent_child_state())
+        self.category_checkboxes["usb"].toggled.connect(lambda _checked, self=self: self._update_monitoring_parent_child_state())
+        self.category_checkboxes["bluetooth"].toggled.connect(lambda _checked, self=self: self._update_monitoring_parent_child_state())
+        self.persistent_local_edr_checkbox.toggled.connect(lambda _checked, self=self: self._update_monitoring_parent_child_state())
 
     def _notification_mode_from_controls(self) -> str:
         if self.dialog_alerts_checkbox.isChecked() and self.notification_center_checkbox.isChecked():
@@ -757,21 +980,71 @@ class BackgroundMonitorPanel(QWidget):
             return "dialog"
         if self.notification_center_checkbox.isChecked():
             return "notification"
+        if self.show_visible_alerts_checkbox.isChecked():
+            return "overlay"
         return "none"
 
     def _sync_notification_delivery_controls(self) -> None:
         mode = str(self.notification_mode_combo.currentData() or self.monitor_settings.notification.notification_mode)
+        for widget in [self.show_visible_alerts_checkbox, self.dialog_alerts_checkbox, self.notification_center_checkbox]:
+            widget.blockSignals(True)
+        self.show_visible_alerts_checkbox.setChecked(mode != "none")
         self.dialog_alerts_checkbox.setChecked(mode in {"dialog", "both"})
         self.notification_center_checkbox.setChecked(mode in {"notification", "both"})
+        for widget in [self.show_visible_alerts_checkbox, self.dialog_alerts_checkbox, self.notification_center_checkbox]:
+            widget.blockSignals(False)
+
+    def _notification_mode_changed_from_ui(self) -> None:
+        if self._loading_monitor_settings:
+            return
+        self._sync_notification_delivery_controls()
+        self.apply_monitor_settings_from_ui()
+
+    def _sync_installation_mode_controls(self) -> None:
+        mode = str(self.install_monitor_mode_combo.currentData() or "user")
+        for widget in [self.install_user_launch_agent_checkbox, self.install_system_launch_daemon_checkbox]:
+            widget.blockSignals(True)
+        self.install_user_launch_agent_checkbox.setChecked(mode == "user")
+        self.install_system_launch_daemon_checkbox.setChecked(mode in {"system", "protected"})
+        for widget in [self.install_user_launch_agent_checkbox, self.install_system_launch_daemon_checkbox]:
+            widget.blockSignals(False)
+
+    def _installation_mode_changed_from_ui(self) -> None:
+        if self._loading_monitor_settings:
+            return
+        self._sync_installation_mode_controls()
+        self.apply_monitor_settings_from_ui()
 
     def _settings_from_ui(self) -> MonitorSettings:
         settings = load_settings(self.db)
+        mode = str(self.install_monitor_mode_combo.currentData() or "user")
+        settings.installation.monitor_mode = mode
+        settings.installation.protected_mode = mode == "protected"
+        settings.installation.user_launch_agent = self.install_user_launch_agent_checkbox.isChecked()
+        settings.installation.system_launch_daemon = self.install_system_launch_daemon_checkbox.isChecked()
+        settings.installation.notifier = self.install_notifier_checkbox.isChecked()
+        settings.installation.run_at_load = self.install_run_at_load_checkbox.isChecked()
+        settings.installation.keep_alive = self.install_keep_alive_checkbox.isChecked()
+        settings.installation.auto_restart = self.install_auto_restart_checkbox.isChecked()
+        settings.installation.db_path = self.install_db_path_input.text().strip()
+        settings.installation.log_path = self.install_log_path_input.text().strip()
+        settings.local_edr.persistent_local_edr_enabled = self.persistent_local_edr_checkbox.isChecked()
+        settings.local_edr.persistent_local_edr_alerts_enabled = self.show_visible_alerts_checkbox.isChecked()
+        settings.local_edr.persistent_local_edr_local_only = True
+        settings.local_edr.persistent_local_edr_mode = {
+            "user": "user_agent",
+            "system": "system_daemon",
+            "protected": "protected_system_daemon",
+        }.get(settings.installation.monitor_mode, "user_agent")
         settings.alerting.notify_all_events = self.notify_all_checkbox.isChecked()
         settings.alerting.notify_important_events = self.notify_important_checkbox.isChecked()
         settings.alerting.notify_min_severity = str(self.notify_min_severity_combo.currentData() or "info")
         settings.alerting.popup_only_severe_events = self.popup_only_severe_checkbox.isChecked()
         settings.alerting.browser_capture_process_popup = self.browser_capture_popup_checkbox.isChecked()
         settings.notification.bottom_right_alerts = self.show_visible_alerts_checkbox.isChecked()
+        settings.user_notifier.enabled = settings.notification.bottom_right_alerts
+        settings.user_notifier.auto_install = self.auto_install_user_notifier_checkbox.isChecked()
+        settings.user_notifier.start_at_login = self.user_notifier_start_at_login_checkbox.isChecked()
         settings.notification.dialogs = self.dialog_alerts_checkbox.isChecked()
         settings.notification.notification_center = self.notification_center_checkbox.isChecked()
         settings.notification.notification_mode = self._notification_mode_from_controls()
@@ -790,6 +1063,37 @@ class BackgroundMonitorPanel(QWidget):
         settings.performance.idle_warning_minutes = int(self.idle_warning_minutes_input.text().strip() or "2")
         for key, checkbox in self.category_checkboxes.items():
             setattr(settings.event_categories, key, checkbox.isChecked())
+        for key, checkbox in self.child_category_checkboxes.items():
+            setattr(settings.event_categories, key, checkbox.isChecked())
+        settings.event_categories.usb_monitoring_enabled = self.category_checkboxes["usb"].isChecked()
+        settings.event_categories.bluetooth_monitoring_enabled = self.category_checkboxes["bluetooth"].isChecked()
+        settings.event_categories.usb_alerts_enabled = any(
+            getattr(settings.event_categories, key)
+            for key in [
+                "usb_new_device_alerts_enabled",
+                "usb_trusted_device_alerts_enabled",
+                "usb_storage_alerts_enabled",
+                "usb_hid_alerts_enabled",
+                "usb_network_adapter_alerts_enabled",
+                "usb_unknown_device_alerts_enabled",
+            ]
+        )
+        settings.event_categories.bluetooth_alerts_enabled = any(
+            getattr(settings.event_categories, key)
+            for key in [
+                "bluetooth_new_device_alerts_enabled",
+                "bluetooth_trusted_device_alerts_enabled",
+                "bluetooth_inventory_alerts_enabled",
+                "bluetooth_unknown_device_alerts_enabled",
+            ]
+        )
+        network_parent_enabled = self.show_network_change_alerts_checkbox.isChecked()
+        admin_parent_enabled = self.show_admin_persistence_alerts_checkbox.isChecked()
+        settings.event_categories.network_activity_monitoring_enabled = network_parent_enabled
+        settings.event_categories.admin_persistence_monitoring_enabled = admin_parent_enabled
+        settings.event_categories.network = network_parent_enabled
+        settings.event_categories.admin = admin_parent_enabled
+        settings.event_categories.persistence = admin_parent_enabled
         settings.apple_exposure.enabled = settings.event_categories.apple_exposure
         settings.notification.authorized_use_warning = settings.notification.authorized_use_warning and self.cfaa_idle_warning_checkbox.isChecked()
         return settings
@@ -800,14 +1104,56 @@ class BackgroundMonitorPanel(QWidget):
         try:
             settings = self._settings_from_ui()
             self.monitor_settings = save_settings(self.db, settings)
-            self._active_monitor_db().set_background_monitor_state("notification_status", self._notification_service().notifications.status())
+            active_db = self._active_monitor_db()
+            if Path(active_db.path) != Path(self.db.path):
+                save_settings(active_db, settings, bump_version=False)
+                active_db.set_background_monitor_state("settings_synced_from_ui_at", utc_now_iso())
+                active_db.set_background_monitor_state("settings_synced_from_ui_db_path", str(self.db.path))
+                self.db.set_background_monitor_state("settings_synced_to_runtime_at", utc_now_iso())
+                self.db.set_background_monitor_state("settings_synced_to_runtime_db_path", str(active_db.path))
+                self.db.set_background_monitor_state("monitor_settings_runtime_apply_error", "")
+            notifier_message = self._ensure_user_notifier_for_alert_settings(settings, active_db)
+            if notifier_message:
+                active_db.set_background_monitor_state("notification_status", notifier_message)
+            else:
+                active_db.set_background_monitor_state("notification_status", self._notification_service().notifications.status())
             self._refresh_settings_diagnostics()
         except ValueError as exc:
             self.db.set_background_monitor_state("monitor_settings_last_error", str(exc))
             QMessageBox.warning(self, "Invalid Monitor Settings", str(exc))
         except Exception as exc:
             self.db.set_background_monitor_state("monitor_settings_last_error", str(exc))
+            self.db.set_background_monitor_state("monitor_settings_runtime_apply_error", str(exc))
             QMessageBox.warning(self, "Monitor Settings Failed", str(exc))
+
+    def save_monitor_settings_only(self) -> None:
+        if self._loading_monitor_settings:
+            return
+        try:
+            self.monitor_settings = save_settings(self.db, self._settings_from_ui())
+            self.db.set_background_monitor_state("monitor_settings_last_apply_mode", "saved_only")
+            self._refresh_settings_diagnostics()
+        except Exception as exc:
+            self.db.set_background_monitor_state("monitor_settings_last_error", str(exc))
+            QMessageBox.warning(self, "Save Monitor Settings Failed", str(exc))
+
+    def reset_monitor_settings_to_defaults(self) -> None:
+        if QMessageBox.question(
+            self,
+            "Reset Monitor Settings",
+            "Reset Monitor Settings to defaults? This saves defaults to the settings file. Use Apply Settings to push defaults to the running daemon/notifier.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        try:
+            self.monitor_settings = reset_defaults(self.db)
+            self._set_monitor_settings_controls(self.monitor_settings)
+            self.db.set_background_monitor_state("monitor_settings_last_apply_mode", "reset_defaults")
+            self._refresh_settings_diagnostics()
+        except Exception as exc:
+            self.db.set_background_monitor_state("monitor_settings_last_error", str(exc))
+            QMessageBox.warning(self, "Reset Monitor Settings Failed", str(exc))
 
     def _set_monitor_settings_controls(self, settings: MonitorSettings) -> None:
         self._loading_monitor_settings = True
@@ -820,6 +1166,11 @@ class BackgroundMonitorPanel(QWidget):
             self.popup_only_severe_checkbox.setChecked(settings.alerting.popup_only_severe_events)
             self.browser_capture_popup_checkbox.setChecked(settings.alerting.browser_capture_process_popup)
             self.show_visible_alerts_checkbox.setChecked(settings.notification.bottom_right_alerts)
+            self.auto_install_user_notifier_checkbox.setChecked(settings.user_notifier.auto_install)
+            self.user_notifier_start_at_login_checkbox.setChecked(settings.user_notifier.start_at_login)
+            self.persistent_local_edr_checkbox.setChecked(settings.local_edr.persistent_local_edr_enabled)
+            self.show_network_change_alerts_checkbox.setChecked(settings.event_categories.network_activity_monitoring_enabled)
+            self.show_admin_persistence_alerts_checkbox.setChecked(settings.event_categories.admin_persistence_monitoring_enabled)
             self.dialog_alerts_checkbox.setChecked(settings.notification.notification_mode in {"dialog", "both"})
             self.notification_center_checkbox.setChecked(settings.notification.notification_mode in {"notification", "both"})
             self.persistent_alerts_checkbox.setChecked(settings.notification.persistent_alerts)
@@ -831,31 +1182,225 @@ class BackgroundMonitorPanel(QWidget):
             self.cooldown_seconds_input.setText(str(settings.notification.cooldown_seconds))
             self.rate_limit_input.setText(str(settings.notification.duplicate_rate_limit_seconds))
             self.notification_sound_input.setText(str(settings.notification.notification_sound))
+            mode_index = self.install_monitor_mode_combo.findData(settings.installation.monitor_mode)
+            if mode_index >= 0:
+                self.install_monitor_mode_combo.setCurrentIndex(mode_index)
+            self.install_user_launch_agent_checkbox.setChecked(settings.installation.user_launch_agent)
+            self.install_system_launch_daemon_checkbox.setChecked(settings.installation.system_launch_daemon)
+            self.install_notifier_checkbox.setChecked(settings.installation.notifier)
+            self.install_run_at_load_checkbox.setChecked(settings.installation.run_at_load)
+            self.install_keep_alive_checkbox.setChecked(settings.installation.keep_alive)
+            self.install_auto_restart_checkbox.setChecked(settings.installation.auto_restart)
+            self.install_db_path_input.setText(settings.installation.db_path or str(self.db.path))
+            self.install_log_path_input.setText(settings.installation.log_path or self._fallback_log_path_text())
             mode_index = self.notification_mode_combo.findData(settings.notification.notification_mode)
             if mode_index >= 0:
                 self.notification_mode_combo.setCurrentIndex(mode_index)
             for key, checkbox in self.category_checkboxes.items():
+                if key == "usb":
+                    checkbox.setChecked(bool(settings.event_categories.usb_monitoring_enabled))
+                elif key == "bluetooth":
+                    checkbox.setChecked(bool(settings.event_categories.bluetooth_monitoring_enabled))
+                else:
+                    checkbox.setChecked(bool(getattr(settings.event_categories, key)))
+            for key, checkbox in self.child_category_checkboxes.items():
                 checkbox.setChecked(bool(getattr(settings.event_categories, key)))
+            self._sync_installation_mode_controls()
+            self._update_monitoring_parent_child_state()
         finally:
             self._loading_monitor_settings = False
 
+    def _update_monitoring_parent_child_state(self) -> None:
+        edr_enabled = self.persistent_local_edr_checkbox.isChecked()
+        network_enabled = self.show_network_change_alerts_checkbox.isChecked()
+        admin_enabled = self.show_admin_persistence_alerts_checkbox.isChecked()
+        edr_disabled_tooltip = "Disabled because Persistent Local EDR Monitor is turned off."
+        normal_parent_tooltips = {
+            "usb": "Detect USB device connections, removals, new devices, HID devices, storage devices, USB network adapters, and USB inventory changes.",
+            "bluetooth": "Detect Bluetooth device connections, removals, new devices, trusted devices, unknown devices, and Bluetooth inventory changes.",
+        }
+        edr_child_widgets = [
+            self.show_visible_alerts_checkbox,
+            self.auto_install_user_notifier_checkbox,
+            self.user_notifier_start_at_login_checkbox,
+            self.show_network_change_alerts_checkbox,
+            self.show_admin_persistence_alerts_checkbox,
+            self.show_apple_forecast_alerts_checkbox,
+            *self.category_checkboxes.values(),
+        ]
+        for widget in edr_child_widgets:
+            widget.setEnabled(edr_enabled)
+            if not edr_enabled:
+                widget.setToolTip(edr_disabled_tooltip)
+        if edr_enabled:
+            self.show_visible_alerts_checkbox.setToolTip("")
+            self.show_network_change_alerts_checkbox.setToolTip(self.network_monitoring_label.toolTip())
+            self.show_admin_persistence_alerts_checkbox.setToolTip(self.admin_persistence_monitoring_label.toolTip())
+            for key, tooltip in normal_parent_tooltips.items():
+                if key in self.category_checkboxes:
+                    self.category_checkboxes[key].setToolTip(tooltip)
+        disabled_tooltips = {
+            "network": "Disabled because Monitor Network Activity is off.",
+            "admin": "Disabled because Monitor Admin and Persistence Changes is off.",
+            "persistence": "Disabled because Monitor Admin and Persistence Changes is off.",
+        }
+        for key, enabled in {"network": network_enabled, "admin": admin_enabled, "persistence": admin_enabled}.items():
+            checkbox = self.category_checkboxes.get(key)
+            if checkbox is None:
+                continue
+            checkbox.setEnabled(edr_enabled and enabled)
+            if edr_enabled and enabled:
+                checkbox.setToolTip("")
+            else:
+                checkbox.setToolTip(edr_disabled_tooltip if not edr_enabled else disabled_tooltips[key])
+        child_parent_enabled = {
+            "usb": edr_enabled and self.category_checkboxes["usb"].isChecked(),
+            "bluetooth": edr_enabled and self.category_checkboxes["bluetooth"].isChecked(),
+            "network": edr_enabled and network_enabled,
+            "admin_persistence": edr_enabled and admin_enabled,
+        }
+        child_disabled_tooltips = {
+            "usb": "Disabled because parent monitoring category is off.",
+            "bluetooth": "Disabled because parent monitoring category is off.",
+            "network": "Disabled because parent monitoring category is off.",
+            "admin_persistence": "Disabled because parent monitoring category is off.",
+        }
+        for key, checkbox in self.child_category_checkboxes.items():
+            parent_key = self.child_category_parents.get(key, "")
+            enabled = child_parent_enabled.get(parent_key, True)
+            checkbox.setEnabled(enabled)
+            if enabled:
+                checkbox.setToolTip("")
+            elif parent_key in {"usb", "bluetooth"} and parent_key in self.category_checkboxes and not self.category_checkboxes[parent_key].isChecked():
+                checkbox.setToolTip(child_disabled_tooltips.get(parent_key, "Disabled by parent setting."))
+            elif not edr_enabled:
+                checkbox.setToolTip(edr_disabled_tooltip)
+            else:
+                checkbox.setToolTip(child_disabled_tooltips.get(parent_key, "Disabled by parent setting."))
+
     def _runtime_settings_values(self) -> dict[str, object]:
+        monitor_db = self._active_monitor_db()
         settings = self._notification_service().notifications.settings()
         return {
+            "settings_file_path": str(monitor_db.path),
+            "settings_version": monitor_db.get_background_monitor_state("settings_version", monitor_db.get_background_monitor_state("monitor_settings_last_saved", "")),
             "notify_min_severity": settings.get("notify_min_severity", ""),
             "notification_mode": settings.get("notification_mode", ""),
             "cooldown_seconds_per_category": settings.get("cooldown_seconds_per_category", ""),
             "duplicate_rate_limit_seconds": settings.get("duplicate_rate_limit_seconds", ""),
             "show_visible_alerts": settings.get("show_visible_alerts", ""),
+            "bottom_right_alerts_enabled": settings.get("show_visible_alerts", ""),
+            "minimum_alert_severity": settings.get("notify_min_severity", ""),
+            "persistent_local_edr_enabled": settings.get("persistent_local_edr_enabled", ""),
+            "persistent_local_edr_alerts_enabled": settings.get("persistent_local_edr_alerts_enabled", ""),
+            "persistent_local_edr_mode": settings.get("persistent_local_edr_mode", ""),
+            "runtime_persistent_local_edr_enabled": monitor_db.get_background_monitor_state("runtime_persistent_local_edr_enabled", ""),
+            "notifier_persistent_local_edr_enabled": settings.get("persistent_local_edr_enabled", ""),
+            "notifier_settings_version": settings.get("settings_version", ""),
+            "daemon_settings_version": monitor_db.get_background_monitor_state("settings_version", ""),
             "persistent_alerts": settings.get("persistent_alerts", ""),
             "enable_alert_sounds": settings.get("enable_alert_sounds", ""),
             "critical_overlay_enabled": settings.get("critical_overlay_enabled", ""),
             "show_physical_session_alerts": settings.get("show_physical_session_alerts", ""),
             "show_usb_bluetooth_alerts": settings.get("show_usb_bluetooth_alerts", ""),
+            "usb_monitoring_enabled": settings.get("usb_monitoring_enabled", ""),
+            "bluetooth_monitoring_enabled": settings.get("bluetooth_monitoring_enabled", ""),
+            "runtime_usb_monitoring_enabled": monitor_db.get_background_monitor_state("runtime_usb_monitoring_enabled", ""),
+            "runtime_bluetooth_monitoring_enabled": monitor_db.get_background_monitor_state("runtime_bluetooth_monitoring_enabled", ""),
+            "notifier_usb_monitoring_enabled": settings.get("usb_monitoring_enabled", ""),
+            "notifier_bluetooth_monitoring_enabled": settings.get("bluetooth_monitoring_enabled", ""),
+            "usb_new_device_alerts_enabled": settings.get("usb_new_device_alerts_enabled", ""),
+            "usb_trusted_device_alerts_enabled": settings.get("usb_trusted_device_alerts_enabled", ""),
+            "usb_hid_alerts_enabled": settings.get("usb_hid_alerts_enabled", ""),
+            "usb_storage_alerts_enabled": settings.get("usb_storage_alerts_enabled", ""),
+            "usb_network_adapter_alerts_enabled": settings.get("usb_network_adapter_alerts_enabled", ""),
+            "usb_unknown_device_alerts_enabled": settings.get("usb_unknown_device_alerts_enabled", ""),
+            "bluetooth_new_device_alerts_enabled": settings.get("bluetooth_new_device_alerts_enabled", ""),
+            "bluetooth_trusted_device_alerts_enabled": settings.get("bluetooth_trusted_device_alerts_enabled", ""),
+            "bluetooth_inventory_alerts_enabled": settings.get("bluetooth_inventory_alerts_enabled", ""),
+            "bluetooth_unknown_device_alerts_enabled": settings.get("bluetooth_unknown_device_alerts_enabled", ""),
+            "last_settings_reload_time": monitor_db.get_background_monitor_state("settings_last_reload_time", ""),
+            "last_usb_detector_run": monitor_db.get_background_monitor_state("physical_device_last_usb_scan", ""),
+            "last_bluetooth_detector_run": monitor_db.get_background_monitor_state("physical_device_last_bluetooth_scan", ""),
+            "last_usb_detector_skip_reason": monitor_db.get_background_monitor_state("physical_device_last_usb_skip_reason", ""),
+            "last_bluetooth_detector_skip_reason": monitor_db.get_background_monitor_state("physical_device_last_bluetooth_skip_reason", ""),
+            "last_emitted_usb_event": monitor_db.get_background_monitor_state("physical_device_last_emitted_event", ""),
+            "last_emitted_bluetooth_event": monitor_db.get_background_monitor_state("physical_device_last_bluetooth_event", ""),
+            "last_suppressed_usb_alert_reason": monitor_db.get_background_monitor_state("last_suppressed_usb_alert_reason", ""),
+            "last_suppressed_bluetooth_alert_reason": monitor_db.get_background_monitor_state("last_suppressed_bluetooth_alert_reason", ""),
+            "settings_synced_from_ui_at": monitor_db.get_background_monitor_state("settings_synced_from_ui_at", ""),
+            "runtime_apply_error": self.db.get_background_monitor_state("monitor_settings_runtime_apply_error", ""),
             "show_network_change_alerts": settings.get("show_network_change_alerts", ""),
             "show_admin_persistence_alerts": settings.get("show_admin_persistence_alerts", ""),
+            "admin_persistence_monitoring_enabled": settings.get("admin_persistence_monitoring_enabled", ""),
+            "network_activity_monitoring_enabled": settings.get("network_activity_monitoring_enabled", ""),
+            "runtime_network_activity_monitoring_enabled": monitor_db.get_background_monitor_state("runtime_network_activity_monitoring_enabled", ""),
+            "network_new_connection_alerts_enabled": settings.get("network_new_connection_alerts_enabled", ""),
+            "network_new_listener_alerts_enabled": settings.get("network_new_listener_alerts_enabled", ""),
+            "network_dns_gateway_alerts_enabled": settings.get("network_dns_gateway_alerts_enabled", ""),
+            "network_vpn_alerts_enabled": settings.get("network_vpn_alerts_enabled", ""),
+            "network_suspicious_connection_alerts_enabled": settings.get("network_suspicious_connection_alerts_enabled", ""),
+            "network_localhost_visibility_alerts_enabled": settings.get("network_localhost_visibility_alerts_enabled", ""),
+            "notifier_admin_persistence_monitoring_enabled": monitor_db.get_background_monitor_state("admin_persistence_monitoring_enabled", "1"),
+            "notifier_network_activity_monitoring_enabled": monitor_db.get_background_monitor_state("network_activity_monitoring_enabled", "1"),
+            "last_network_detector_run": monitor_db.get_background_monitor_state("network_detector_last_run", ""),
+            "last_network_detector_skip_reason": monitor_db.get_background_monitor_state("network_detector_last_skip_reason", monitor_db.get_background_monitor_state("detector_disabled_reason:network_state_detector", "")),
+            "last_emitted_network_event": monitor_db.get_background_monitor_state("network_detector_last_emitted_event", ""),
+            "last_suppressed_network_alert_reason": monitor_db.get_background_monitor_state("last_suppressed_network_alert_reason", ""),
             "show_apple_forecast_alerts": settings.get("show_apple_forecast_alerts", ""),
+            "monitor_mode": self.db.get_background_monitor_state("monitor_mode", ""),
+            "installation_run_at_load": self.db.get_background_monitor_state("installation_run_at_load", ""),
+            "installation_keep_alive": self.db.get_background_monitor_state("installation_keep_alive", ""),
+            "installation_auto_restart": self.db.get_background_monitor_state("installation_auto_restart", ""),
+            "installation_notifier": self.db.get_background_monitor_state("installation_notifier", ""),
+            "user_notifier_install_status": monitor_db.get_background_monitor_state("user_notifier_install_status", ""),
+            "user_notifier_loaded": monitor_db.get_background_monitor_state("user_notifier_loaded", ""),
+            "user_notifier_running": monitor_db.get_background_monitor_state("user_notifier_running", ""),
+            "user_notifier_launchctl_domain": monitor_db.get_background_monitor_state("user_notifier_launchctl_domain", ""),
+            "user_notifier_plist_path": monitor_db.get_background_monitor_state("user_notifier_plist_path", ""),
+            "user_notifier_program_arguments": monitor_db.get_background_monitor_state("user_notifier_program_arguments", ""),
+            "user_notifier_last_error": monitor_db.get_background_monitor_state("user_notifier_last_error", ""),
         }
+
+    def _user_notifier_installer(self, db: AuditDatabase | None = None) -> UserNotifierInstaller:
+        target_db = db or self._active_monitor_db()
+        return UserNotifierInstaller(db_path=Path(target_db.path))
+
+    def _ensure_user_notifier_for_alert_settings(self, settings: MonitorSettings, active_db: AuditDatabase) -> str:
+        required = (
+            bool(settings.local_edr.persistent_local_edr_enabled)
+            and bool(settings.notification.bottom_right_alerts)
+            and bool(settings.user_notifier.enabled)
+        )
+        if not required:
+            active_db.set_background_monitor_state("user_notifier_required", "0")
+            return ""
+        active_db.set_background_monitor_state("user_notifier_required", "1")
+        if not settings.user_notifier.auto_install:
+            status = self._user_notifier_installer(active_db).get_user_notifier_status()
+            update_db_notifier_status(active_db, status)
+            if status.install_status != "loaded":
+                raise RuntimeError(
+                    "Bottom-right alerts are enabled, but the user alert agent is not installed or loaded. "
+                    "Enable automatic install or use Install User Alert Agent."
+                )
+            return "User Alert Agent installed and running."
+        installer = self._user_notifier_installer(active_db)
+        status = installer.get_user_notifier_status()
+        if status.install_status == "missing":
+            status = installer.install_user_notifier(
+                run_at_load=bool(settings.user_notifier.start_at_login),
+                keep_alive=bool(settings.installation.keep_alive),
+                start=True,
+            )
+        elif status.install_status == "unloaded":
+            status = installer.load_user_notifier()
+        elif status.install_status == "broken":
+            status = installer.repair_user_notifier()
+        update_db_notifier_status(active_db, status)
+        if status.install_status != "loaded":
+            raise RuntimeError(f"User Alert Agent repair required: {status.last_error}")
+        return "User Alert Agent installed and running."
 
     def _refresh_settings_diagnostics(self) -> None:
         if not hasattr(self, "settings_diagnostics_panel"):
@@ -883,6 +1428,78 @@ class BackgroundMonitorPanel(QWidget):
         else:
             QMessageBox.information(self, "Repair Settings Mismatch", "Runtime settings were reapplied.")
         self._refresh_settings_diagnostics()
+
+    def apply_settings_and_restart_monitor(self) -> None:
+        self.apply_monitor_settings_from_ui()
+        self.restart_monitor()
+
+    def reinstall_monitor_with_current_settings(self) -> None:
+        self.apply_monitor_settings_from_ui()
+        mode = load_settings(self.db).installation.monitor_mode
+        if mode == "protected":
+            self.install_protected_mode()
+        elif mode == "system":
+            self.install_system_monitor()
+        else:
+            self.install_user_notifier()
+
+    def _record_installed_monitor_settings(self) -> None:
+        settings = load_settings(self.db)
+        targets = [self.db]
+        active_db = self._active_monitor_db()
+        if Path(active_db.path) != Path(self.db.path):
+            targets.append(active_db)
+        for target_db in targets:
+            target_db.set_background_monitor_state(
+                "installed_admin_persistence_monitoring_enabled",
+                "1" if settings.event_categories.admin_persistence_monitoring_enabled else "0",
+            )
+            target_db.set_background_monitor_state(
+                "installed_persistent_local_edr_enabled",
+                "1" if settings.local_edr.persistent_local_edr_enabled else "0",
+            )
+            target_db.set_background_monitor_state(
+                "installed_persistent_local_edr_alerts_enabled",
+                "1" if settings.local_edr.persistent_local_edr_alerts_enabled else "0",
+            )
+            target_db.set_background_monitor_state("installed_persistent_local_edr_mode", settings.local_edr.persistent_local_edr_mode)
+            target_db.set_background_monitor_state(
+                "installed_network_activity_monitoring_enabled",
+                "1" if settings.event_categories.network_activity_monitoring_enabled else "0",
+            )
+            target_db.set_background_monitor_state(
+                "installed_usb_monitoring_enabled",
+                "1" if settings.event_categories.usb_monitoring_enabled else "0",
+            )
+            target_db.set_background_monitor_state(
+                "installed_bluetooth_monitoring_enabled",
+                "1" if settings.event_categories.bluetooth_monitoring_enabled else "0",
+            )
+            target_db.set_background_monitor_state("installed_monitor_mode", settings.installation.monitor_mode)
+            target_db.set_background_monitor_state("installed_notifier", "1" if settings.installation.notifier else "0")
+            target_db.set_background_monitor_state("installed_run_at_load", "1" if settings.installation.run_at_load else "0")
+            target_db.set_background_monitor_state("installed_keep_alive", "1" if settings.installation.keep_alive else "0")
+            target_db.set_background_monitor_state("installed_auto_restart", "1" if settings.installation.auto_restart else "0")
+            target_db.set_background_monitor_state("installed_db_path", settings.installation.db_path or str(target_db.path))
+            target_db.set_background_monitor_state("installed_log_path", settings.installation.log_path or self._fallback_log_path_text())
+            target_db.set_background_monitor_state("installed_monitor_settings_version", self.db.get_background_monitor_state("monitor_settings_last_saved", ""))
+            target_db.set_background_monitor_state("installed_settings_version", str(settings.settings_version))
+            manifest = {
+                "monitor_mode": settings.installation.monitor_mode,
+                "settings_version": settings.settings_version,
+                "persistent_local_edr_enabled": settings.local_edr.persistent_local_edr_enabled,
+                "persistent_local_edr_alerts_enabled": settings.local_edr.persistent_local_edr_alerts_enabled,
+                "persistent_local_edr_mode": settings.local_edr.persistent_local_edr_mode,
+                "usb_monitoring_enabled": settings.event_categories.usb_monitoring_enabled,
+                "bluetooth_monitoring_enabled": settings.event_categories.bluetooth_monitoring_enabled,
+                "network_activity_monitoring_enabled": settings.event_categories.network_activity_monitoring_enabled,
+                "admin_persistence_monitoring_enabled": settings.event_categories.admin_persistence_monitoring_enabled,
+                "notifier_enabled": settings.installation.notifier,
+                "database_path": settings.installation.db_path or str(target_db.path),
+                "log_path": settings.installation.log_path or self._fallback_log_path_text(),
+                "installed_at": utc_now_iso(),
+            }
+            target_db.set_background_monitor_state("installed_monitor_settings_manifest_json", json.dumps(manifest, sort_keys=True))
 
     def developer_only_buttons(self) -> list[QWidget]:
         return [
@@ -1310,23 +1927,27 @@ class BackgroundMonitorPanel(QWidget):
             )
             return
         try:
-            plist_path = self.protected_launch_agent.install_protected_mode()
-            user_plist_path = self._system_user_notifier_manager().install_user_notifier()
+            plist_path = self.protected_launch_agent.install_protected_mode(**self._install_options(scope="system"))
+            user_plist_path = ""
+            if load_settings(self.db).installation.notifier:
+                user_plist_path = str(self._system_user_notifier_manager().install_user_notifier(**self._install_options(scope="user")))
             self.db.set_background_monitor_state("monitor_mode", "protected")
             self.db.set_background_monitor_state("monitor_install_mode", "protected")
             self.db.set_background_monitor_state("installed", "1")
+            self._record_installed_monitor_settings()
             self.db.set_background_monitor_state("enabled", "1")
             self.db.set_background_monitor_state("plist_path", str(plist_path))
             self.db.set_background_monitor_state("label", self.protected_launch_agent.status().label)
-            self.db.set_background_monitor_state("log_path", self.protected_launch_agent.show_logs())
-            self.db.set_background_monitor_state("db_path", str(default_monitor_db_path("system")))
+            installed_settings = load_settings(self.db).installation
+            self.db.set_background_monitor_state("log_path", installed_settings.log_path or self.protected_launch_agent.show_logs())
+            self.db.set_background_monitor_state("db_path", installed_settings.db_path or str(default_monitor_db_path("system")))
             self.db.set_background_monitor_state("current_launchctl_domain", self.protected_launch_agent.status().current_launchctl_domain)
             self.db.set_background_monitor_state("last_error", "")
             self.verify_monitor_protection()
             QMessageBox.information(
                 self,
                 "Protected Mode Installed",
-                f"Protected system daemon installed at:\n{plist_path}\n\nUser notification companion installed at:\n{user_plist_path}",
+                f"Protected system daemon installed at:\n{plist_path}\n\nUser notification companion: {user_plist_path or 'disabled by settings'}\n\n{self._install_summary_text()}",
             )
         except Exception as exc:
             self.db.set_background_monitor_state("last_error", str(exc))
@@ -1340,9 +1961,10 @@ class BackgroundMonitorPanel(QWidget):
             QMessageBox.warning(self, "Protected Mode Requires Admin", "Repairing Protected Mode requires administrator/root approval.")
             return
         try:
-            plist_path, notes = self.protected_launch_agent.repair()
+            plist_path, notes = self.protected_launch_agent.repair(**self._install_options(scope="system"))
             self.db.set_background_monitor_state("monitor_install_mode", "protected")
             self.db.set_background_monitor_state("installed", "1")
+            self._record_installed_monitor_settings()
             self.db.set_background_monitor_state("plist_path", str(plist_path))
             self.db.set_background_monitor_state("last_error", "")
             QMessageBox.information(self, "Protected Mode Repaired", "\n".join(notes))
@@ -1382,6 +2004,7 @@ class BackgroundMonitorPanel(QWidget):
             plist_path = self.protected_launch_agent.revert_to_user_mode()
             self.db.set_background_monitor_state("monitor_install_mode", "user")
             self.db.set_background_monitor_state("installed", "1")
+            self._record_installed_monitor_settings()
             self.db.set_background_monitor_state("enabled", "1")
             self.db.set_background_monitor_state("plist_path", str(plist_path))
             self.db.set_background_monitor_state("label", self.launch_agent.status().label)
@@ -1402,16 +2025,20 @@ class BackgroundMonitorPanel(QWidget):
             QMessageBox.warning(self, "System Monitor Requires Admin", "System Monitor Mode requires administrator/root approval.")
             return
         try:
-            plist_path = self.system_launch_agent.install_system_monitor()
-            user_plist_path = self._system_user_notifier_manager().install_user_notifier()
+            plist_path = self.system_launch_agent.install_system_monitor(**self._install_options(scope="system"))
+            user_plist_path = ""
+            if load_settings(self.db).installation.notifier:
+                user_plist_path = str(self._system_user_notifier_manager().install_user_notifier(**self._install_options(scope="user")))
             self.db.set_background_monitor_state("monitor_mode", "system")
             self.db.set_background_monitor_state("monitor_install_mode", "system")
             self.db.set_background_monitor_state("installed", "1")
+            self._record_installed_monitor_settings()
             self.db.set_background_monitor_state("enabled", "1")
             self.db.set_background_monitor_state("plist_path", str(plist_path))
             self.db.set_background_monitor_state("label", self.system_launch_agent.status().label)
-            self.db.set_background_monitor_state("log_path", self.system_launch_agent.show_logs())
-            self.db.set_background_monitor_state("db_path", str(default_monitor_db_path("system")))
+            installed_settings = load_settings(self.db).installation
+            self.db.set_background_monitor_state("log_path", installed_settings.log_path or self.system_launch_agent.show_logs())
+            self.db.set_background_monitor_state("db_path", installed_settings.db_path or str(default_monitor_db_path("system")))
             self.db.set_background_monitor_state("current_launchctl_domain", self.system_launch_agent.status().current_launchctl_domain)
             self.db.set_background_monitor_state("last_error", "")
             readiness = self._notification_service().test_notification()
@@ -1420,7 +2047,7 @@ class BackgroundMonitorPanel(QWidget):
             QMessageBox.information(
                 self,
                 "System Monitor Installed",
-                f"System daemon installed at:\n{plist_path}\n\nUser notification companion installed at:\n{user_plist_path}",
+                f"System daemon installed at:\n{plist_path}\n\nUser notification companion: {user_plist_path or 'disabled by settings'}\n\n{self._install_summary_text()}",
             )
         except Exception as exc:
             self.db.set_background_monitor_state("last_error", str(exc))
@@ -1479,10 +2106,11 @@ class BackgroundMonitorPanel(QWidget):
             QMessageBox.warning(self, "System Monitor Requires Admin", "Repairing System Monitor requires administrator/root approval.")
             return
         try:
-            plist_path, notes = self.system_launch_agent.repair()
+            plist_path, notes = self.system_launch_agent.repair(**self._install_options(scope="system"))
             self.db.set_background_monitor_state("monitor_mode", "system")
             self.db.set_background_monitor_state("monitor_install_mode", "system")
             self.db.set_background_monitor_state("installed", "1")
+            self._record_installed_monitor_settings()
             self.db.set_background_monitor_state("plist_path", str(plist_path))
             self.db.set_background_monitor_state("last_error", "")
             QMessageBox.information(self, "System Monitor Repaired", "\n".join(notes))
@@ -1510,27 +2138,84 @@ class BackgroundMonitorPanel(QWidget):
 
     def install_user_notifier(self) -> None:
         try:
-            plist_path = self.launch_agent.install_user_notifier()
+            plist_path = self.launch_agent.install_user_notifier(**self._install_options(scope="user"))
             current_mode = self.db.get_background_monitor_state("monitor_mode", "user")
             if current_mode not in {"protected", "system"}:
                 self.db.set_background_monitor_state("monitor_mode", "user")
                 self.db.set_background_monitor_state("monitor_install_mode", "user")
             self.db.set_background_monitor_state("installed", "1")
+            self._record_installed_monitor_settings()
             self.db.set_background_monitor_state("enabled", "1")
             self.db.set_background_monitor_state("plist_path", str(plist_path))
             self.db.set_background_monitor_state("label", self.launch_agent.status().label)
-            self.db.set_background_monitor_state("log_path", self.launch_agent.show_logs())
-            self.db.set_background_monitor_state("db_path", str(self.db.path))
+            installed_settings = load_settings(self.db).installation
+            self.db.set_background_monitor_state("log_path", installed_settings.log_path or self.launch_agent.show_logs())
+            self.db.set_background_monitor_state("db_path", installed_settings.db_path or str(self.db.path))
             self.db.set_background_monitor_state("current_launchctl_domain", self.launch_agent.status().current_launchctl_domain)
             self.db.set_background_monitor_state("last_error", "")
             readiness = self._notification_service().test_notification()
             self.db.set_background_monitor_state("notification_readiness_json", json.dumps(readiness, sort_keys=True))
             self.db.set_background_monitor_state("notification_status", self._notification_service().notifications.status())
-            QMessageBox.information(self, "User Notifier Installed", f"User Notifier installed at:\n{plist_path}")
+            QMessageBox.information(self, "User Notifier Installed", f"User Notifier installed at:\n{plist_path}\n\n{self._install_summary_text()}")
         except Exception as exc:
             self.db.set_background_monitor_state("last_error", str(exc))
             QMessageBox.warning(self, "User Notifier Install Failed", str(exc))
         self._refresh_monitor_protection_dialog()
+        self.refresh()
+
+    def install_user_alert_agent(self) -> None:
+        try:
+            db = self._active_monitor_db()
+            settings = load_settings(self.db)
+            status = self._user_notifier_installer(db).install_user_notifier(
+                run_at_load=bool(settings.user_notifier.start_at_login),
+                keep_alive=bool(settings.installation.keep_alive),
+                start=True,
+            )
+            update_db_notifier_status(db, status)
+            if status.install_status != "loaded":
+                raise RuntimeError(status.last_error or "User Alert Agent did not load.")
+            QMessageBox.information(self, "User Alert Agent Installed", "User Alert Agent installed and running.")
+        except Exception as exc:
+            self.db.set_background_monitor_state("user_notifier_last_error", str(exc))
+            QMessageBox.warning(self, "User Alert Agent Install Failed", str(exc))
+        self.refresh()
+
+    def restart_user_alert_agent(self) -> None:
+        try:
+            db = self._active_monitor_db()
+            status = self._user_notifier_installer(db).restart_user_notifier()
+            update_db_notifier_status(db, status)
+            if status.install_status != "loaded":
+                raise RuntimeError(status.last_error or "User Alert Agent did not restart.")
+            QMessageBox.information(self, "User Alert Agent Restarted", "User Alert Agent installed and running.")
+        except Exception as exc:
+            self.db.set_background_monitor_state("user_notifier_last_error", str(exc))
+            QMessageBox.warning(self, "User Alert Agent Restart Failed", str(exc))
+        self.refresh()
+
+    def repair_user_alert_agent(self) -> None:
+        try:
+            db = self._active_monitor_db()
+            status = self._user_notifier_installer(db).repair_user_notifier()
+            update_db_notifier_status(db, status)
+            if status.install_status != "loaded":
+                raise RuntimeError(status.last_error or "User Alert Agent repair did not load the service.")
+            QMessageBox.information(self, "User Alert Agent Repaired", "User Alert Agent installed and running.")
+        except Exception as exc:
+            self.db.set_background_monitor_state("user_notifier_last_error", str(exc))
+            QMessageBox.warning(self, "User Alert Agent Repair Failed", str(exc))
+        self.refresh()
+
+    def remove_user_alert_agent(self) -> None:
+        try:
+            db = self._active_monitor_db()
+            status = self._user_notifier_installer(db).uninstall_user_notifier()
+            update_db_notifier_status(db, status)
+            QMessageBox.information(self, "User Alert Agent Removed", "User Alert Agent removed. Historical events were not deleted.")
+        except Exception as exc:
+            self.db.set_background_monitor_state("user_notifier_last_error", str(exc))
+            QMessageBox.warning(self, "User Alert Agent Remove Failed", str(exc))
         self.refresh()
 
     def test_event_flow(self) -> None:
@@ -1645,9 +2330,29 @@ class BackgroundMonitorPanel(QWidget):
                     f"Detector last run counts: {db_status.detector_last_run_counts or '{}'}",
                     f"Detector enabled camera: {'yes' if db_status.detector_enabled_camera else 'no'}",
                     f"Detector enabled session: {'yes' if db_status.detector_enabled_session else 'no'}",
+                    f"Network Activity Monitor: {'enabled' if db_status.detector_enabled_network else 'Disabled by settings'}",
+                    f"Network Activity disabled reason: {monitor_db.get_background_monitor_state('detector_disabled_reason:network_state_detector', 'none') or 'none'}",
+                    f"Admin/Persistence Monitor: {'enabled' if db_status.detector_enabled_persistence else 'Disabled by settings'}",
+                    f"Admin/Persistence disabled reason: {monitor_db.get_background_monitor_state('detector_disabled_reason:persistence_detector', 'none') or 'none'}",
                     f"Detector enabled sharing: {'yes' if db_status.detector_enabled_sharing else 'no'}",
                     f"Detector enabled process: {'yes' if db_status.detector_enabled_process else 'no'}",
                     f"Detector enabled hardware: {'yes' if db_status.detector_enabled_hardware else 'no'}",
+                    f"USB Monitor: {'Disabled by settings' if monitor_db.get_background_monitor_state('usb_monitoring_enabled', '1') == '0' else 'enabled'}",
+                    f"Bluetooth Monitor: {'Disabled by settings' if monitor_db.get_background_monitor_state('bluetooth_monitoring_enabled', '1') == '0' else 'enabled'}",
+                    f"Physical Device Detector Health: {monitor_db.get_background_monitor_state('physical_device_usb_detector_status', 'unknown')}",
+                    f"USB detector last scan: {monitor_db.get_background_monitor_state('physical_device_last_usb_scan', 'never')}",
+                    f"USB detector skip reason: {monitor_db.get_background_monitor_state('physical_device_last_usb_skip_reason', 'none') or 'none'}",
+                    f"USB current device count: {monitor_db.get_background_monitor_state('physical_device_current_usb_count', '0')}",
+                    f"USB known device count: {monitor_db.get_background_monitor_state('physical_device_known_usb_count', '0')}",
+                    f"USB trust store path: {monitor_db.get_background_monitor_state('physical_device_trust_store_path', str(monitor_db.path))}",
+                    f"USB last emitted event: {monitor_db.get_background_monitor_state('physical_device_last_emitted_event', 'none')}",
+                    f"USB last alert trace: {monitor_db.get_background_monitor_state('physical_device_last_alert_trace', 'none')}",
+                    f"Bluetooth detector status: {monitor_db.get_background_monitor_state('physical_device_bluetooth_detector_status', 'unknown')}",
+                    f"Bluetooth detector last scan: {monitor_db.get_background_monitor_state('physical_device_last_bluetooth_scan', 'never')}",
+                    f"Bluetooth detector skip reason: {monitor_db.get_background_monitor_state('physical_device_last_bluetooth_skip_reason', 'none') or 'none'}",
+                    f"Bluetooth current device count: {monitor_db.get_background_monitor_state('physical_device_current_bluetooth_count', '0')}",
+                    f"Last suppressed USB alert reason: {monitor_db.get_background_monitor_state('last_suppressed_usb_alert_reason', 'none') or 'none'}",
+                    f"Last suppressed Bluetooth alert reason: {monitor_db.get_background_monitor_state('last_suppressed_bluetooth_alert_reason', 'none') or 'none'}",
                     f"Detector last zero reason: {db_status.detector_last_zero_reason or 'none'}",
                     f"Current snapshot: {db_status.current_snapshot or '{}'}",
                     f"Current snapshot keys: {', '.join(sorted(json.loads(db_status.current_snapshot or '{}').keys())) if db_status.current_snapshot else 'none'}",
@@ -1671,6 +2376,9 @@ class BackgroundMonitorPanel(QWidget):
                     f"Alert grouped total: {alert_health.get('grouped_alerts_count', 0)}",
                     f"Alert last failure stage: {alert_health.get('last_failure_stage', '') or 'none'}",
                     f"Alert last failed render reason: {alert_health.get('last_failed_render_reason', '') or 'none'}",
+                    f"Alert delivery degraded: {'yes' if alert_health.get('alert_delivery_degraded', False) else 'no'}",
+                    f"Alert last policy decision: {alert_health.get('last_policy_decision', 'none')}",
+                    f"Alert last rate limiter decision: {alert_health.get('last_rate_limiter_decision', 'none')}",
                     f"Alert rendering success rate: {alert_health.get('rendering_success_rate', 1.0)}",
                     f"Active cooldown entries: {alert_health.get('active_cooldown_entries', 0)}",
                     f"Alert overlay enabled: {monitor_db.get_background_monitor_state('show_visible_alerts', '1')}",
@@ -1679,6 +2387,13 @@ class BackgroundMonitorPanel(QWidget):
                     f"Notifier installed: {monitor_db.get_background_monitor_state('notifier_installed', '0')}",
                     f"Notifier loaded: {monitor_db.get_background_monitor_state('notifier_loaded', '0')}",
                     f"Notifier PID alive: {monitor_db.get_background_monitor_state('notifier_pid_alive', '0')}",
+                    f"Settings file admin_persistence_monitoring_enabled: {monitor_db.get_background_monitor_state('admin_persistence_monitoring_enabled', '1')}",
+                    f"Settings file network_activity_monitoring_enabled: {monitor_db.get_background_monitor_state('network_activity_monitoring_enabled', '1')}",
+                    f"Runtime admin_persistence_monitoring_enabled: {monitor_db.get_background_monitor_state('admin_persistence_monitoring_enabled', '1')}",
+                    f"Runtime network_activity_monitoring_enabled: {monitor_db.get_background_monitor_state('network_activity_monitoring_enabled', '1')}",
+                    f"Installed admin_persistence_monitoring_enabled: {monitor_db.get_background_monitor_state('installed_admin_persistence_monitoring_enabled', 'unknown')}",
+                    f"Installed network_activity_monitoring_enabled: {monitor_db.get_background_monitor_state('installed_network_activity_monitoring_enabled', 'unknown')}",
+                    f"Monitor settings last applied: {monitor_db.get_background_monitor_state('monitor_settings_last_saved', 'never')}",
                     f"Daemon DB path: {daemon_db_path}",
                     f"Notifier DB path: {notifier_db_path}",
                     f"UI DB path: {ui_db_path}",
@@ -1913,7 +2628,8 @@ class BackgroundMonitorPanel(QWidget):
             "Install System Monitor + User Notifier",
             f"{DISCLAIMER}\n\n"
             "The detector will be installed as a root-owned system LaunchDaemon under /Library/LaunchDaemons. "
-            "A user LaunchAgent companion will also be installed for GUI notifications after login.",
+            "A user LaunchAgent companion will also be installed for GUI notifications after login when Notifier is enabled.\n\n"
+            f"{self._install_summary_text()}",
         ) != QMessageBox.StandardButton.Yes:
             return
         self.install_system_monitor()
@@ -1970,8 +2686,9 @@ class BackgroundMonitorPanel(QWidget):
         try:
             if enabled:
                 install_helper = getattr(self.launch_agent, "install_user_notifier", self.launch_agent.install)
-                install_helper()
+                install_helper(**self._install_options(scope="user"))
                 self.db.set_background_monitor_state("installed", "1")
+                self._record_installed_monitor_settings()
                 self.db.set_background_monitor_state("enabled", "1")
             else:
                 try:
@@ -2051,9 +2768,9 @@ class BackgroundMonitorPanel(QWidget):
         try:
             stopped = self.service.stop_orphan_processes()
             manager = self._detector_manager()
-            plist_path, notes = manager.repair()
-            if self._system_mode_enabled():
-                self._system_user_notifier_manager().install_user_notifier()
+            plist_path, notes = manager.repair(**self._install_options(scope=manager.scope))
+            if self._system_mode_enabled() and load_settings(self.db).installation.notifier:
+                self._system_user_notifier_manager().install_user_notifier(**self._install_options(scope="user"))
             deadline = time.monotonic() + 10
             detector_updated = False
             baseline = self.db.get_background_monitor_status().detector_last_run_timestamp
@@ -2065,6 +2782,7 @@ class BackgroundMonitorPanel(QWidget):
                 QTimer.singleShot(0, lambda: None)
                 time.sleep(1)
             self.db.set_background_monitor_state("installed", "1")
+            self._record_installed_monitor_settings()
             self.db.set_background_monitor_state("plist_path", str(plist_path))
             self.db.set_background_monitor_state("last_error", "")
             QMessageBox.information(
@@ -2107,7 +2825,7 @@ class BackgroundMonitorPanel(QWidget):
             fail("remove old notifier plist", exc)
             return
         try:
-            plist_path = manager.install_user_notifier()
+            plist_path = manager.install_user_notifier(**self._install_options(scope="user"))
         except Exception as exc:
             fail("recreate notifier plist", exc)
             return
@@ -2186,10 +2904,11 @@ class BackgroundMonitorPanel(QWidget):
         try:
             stopped = self.service.stop_orphan_processes()
             manager = self._detector_manager()
-            plist_path, notes = manager.force_reinstall()
-            if self._system_mode_enabled():
-                self._system_user_notifier_manager().install_user_notifier()
+            plist_path, notes = manager.force_reinstall(**self._install_options(scope=manager.scope))
+            if self._system_mode_enabled() and load_settings(self.db).installation.notifier:
+                self._system_user_notifier_manager().install_user_notifier(**self._install_options(scope="user"))
             self.db.set_background_monitor_state("installed", "1")
+            self._record_installed_monitor_settings()
             self.db.set_background_monitor_state("plist_path", str(plist_path))
             self.db.set_background_monitor_state("last_error", "")
             QMessageBox.information(
@@ -2305,9 +3024,11 @@ class BackgroundMonitorPanel(QWidget):
         try:
             service = self._event_service()
             tests = [
-                ("protected_monitor_tamper_detected", "Critical bottom-right alert test", "critical", "critical_red"),
-                ("usb_device_connected", "High bottom-right alert test", "high", "high_orange"),
-                ("apple_security_forecast_elevated", "Neutral bottom-right alert test", "info", "neutral_grey"),
+                ("alert_preview_info", "Info bottom-right alert visual preview.", "info", "info_grey"),
+                ("alert_preview_low", "Low bottom-right alert visual preview.", "low", "low"),
+                ("alert_preview_medium", "Medium bottom-right alert visual preview.", "medium", "medium_blue"),
+                ("usb_device_connected", "High bottom-right alert visual preview.", "high", "high_orange"),
+                ("protected_monitor_tamper_detected", "Critical bottom-right alert visual preview.", "critical", "critical_red"),
             ]
             for event_type, evidence, severity, expected_style in tests:
                 event = BackgroundMonitorEvent(
@@ -2328,11 +3049,11 @@ class BackgroundMonitorPanel(QWidget):
                     trigger_source="alert_test",
                 )
                 service.db.record_monitor_event(event, dedupe_window_seconds=0)
-                service.notifications.show_visible_security_alert(event, reason="test_bottom_right_alert")
+                service.notifications.show_visible_security_alert(event, reason="preview_alert_styles", force=True)
                 event.visible_alert_shown = True
                 event.notification_sent = True
                 event.notification_decision = "sent"
-                event.notification_reason = "test_bottom_right_alert"
+                event.notification_reason = "preview_alert_styles"
                 event.popup_allowed = True
                 event.alert_style = expected_style
                 service.db.update_monitor_event_notification(
@@ -2349,10 +3070,13 @@ class BackgroundMonitorPanel(QWidget):
                     cooldown_suppressed=False,
                     last_suppression_reason="",
                 )
-            QMessageBox.information(self, "Bottom-Right Alert Test", "Generated critical, high, and neutral visible alert test events.")
+            QMessageBox.information(self, "Preview Alert Styles", "Generated INFO, LOW, MEDIUM, HIGH, and CRITICAL bottom-right alert previews.")
         except Exception as exc:
-            QMessageBox.warning(self, "Bottom-Right Alert Test Failed", str(exc))
+            QMessageBox.warning(self, "Preview Alert Styles Failed", str(exc))
         self.refresh()
+
+    def preview_alert_styles(self) -> None:
+        self.test_bottom_right_alert()
 
     def test_critical_alert(self) -> None:
         try:
