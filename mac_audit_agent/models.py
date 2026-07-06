@@ -910,6 +910,10 @@ class EventAlertTrace:
     visible_alert_id: str = ""
     displayed_at: str = ""
     acknowledged_at: str = ""
+    direct_render_test: bool = False
+    event_store_error: str = ""
+    trace_consistency_status: str = ""
+    render_verification_status: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -925,13 +929,47 @@ class EventAlertTrace:
         payload.setdefault("suppression_reason", self.alert_suppression_reason)
         payload["rate_limiter_result"] = self.rate_limiter_result or self.cooldown_result
         payload["overlay_render_attempted"] = self.overlay_render_attempted or self.overlay_dispatch_attempted
-        payload["overlay_render_success"] = self.overlay_render_success or self.overlay_dispatch_result == "shown"
+        payload["overlay_render_success"] = self.overlay_render_success or self.overlay_dispatch_result in {"shown", "verified"}
         payload["render_error"] = self.render_error or self.overlay_error
+        payload["trace_consistency_status"] = self.trace_consistency_status or _alert_trace_consistency(payload)
+        if not payload["render_verification_status"]:
+            dispatch_result = str(payload.get("overlay_dispatch_result", ""))
+            suppression_reason = str(payload.get("alert_suppression_reason", "") or payload.get("suppression_reason", ""))
+            if payload["overlay_render_success"] or (dispatch_result.upper() == "SUCCESS" and payload.get("displayed_at")):
+                payload["render_verification_status"] = "verified"
+            elif payload.get("alert_suppressed") and suppression_reason == "within_cooldown":
+                payload["render_verification_status"] = "skipped_within_cooldown"
+            elif payload.get("alert_suppressed") and suppression_reason == "grouped_within_cooldown":
+                payload["render_verification_status"] = "skipped_within_cooldown"
+            elif payload.get("alert_suppressed") and "disabled" in suppression_reason:
+                payload["render_verification_status"] = "skipped_alerts_disabled"
+            elif payload.get("alert_suppressed"):
+                payload["render_verification_status"] = "skipped_policy_suppressed"
+            elif payload["overlay_dispatch_attempted"] and dispatch_result.upper() == "SUCCESS":
+                payload["render_verification_status"] = "skipped_non_interactive"
+            elif not payload["overlay_dispatch_attempted"]:
+                payload["render_verification_status"] = "skipped_non_interactive"
+            else:
+                payload["render_verification_status"] = "failed"
         return payload
 
 
 AlertPipelineTrace = EventAlertTrace
 AlertDeliveryTrace = EventAlertTrace
+
+
+def _alert_trace_consistency(payload: dict[str, Any]) -> str:
+    stored = bool(payload.get("event_written_to_db") or payload.get("stored_success"))
+    direct = bool(payload.get("direct_render_test"))
+    overlay = bool(payload.get("overlay_dispatch_attempted"))
+    visible = bool(str(payload.get("visible_alert_id", "")).strip())
+    if not stored and not direct and (overlay or visible):
+        return "inconsistent_overlay_without_event_store"
+    if not stored:
+        return "event_store_failed"
+    if visible and not overlay:
+        return "inconsistent_visible_without_overlay_attempt"
+    return "consistent"
 
 
 @dataclass

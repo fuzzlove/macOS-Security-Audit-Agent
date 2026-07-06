@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import zipfile
 
 import pytest
 
@@ -95,6 +96,10 @@ def test_export_model_includes_findings_fixes_and_framework_mappings() -> None:
     assert data.findings[0]["validation_step"]
     assert data.findings[0]["false_positive_notes"]
     assert data.framework_mappings
+    assert data.cmmc_summary["total_requirements"] > 0
+    assert data.cmmc_evidence_matrix
+    assert data.cmmc_poam
+    assert data.cmmc_source_versions
     assert data.limitations == ["Test limitation."]
 
 
@@ -177,6 +182,10 @@ def test_word_export_creates_docx_when_dependency_available(tmp_path) -> None:
     path = export_assessment_word(_assessment(), tmp_path / "assessment.docx")
     assert path.exists()
     assert path.suffix == ".docx"
+    with zipfile.ZipFile(path) as archive:
+        document_xml = archive.read("word/document.xml").decode("utf-8")
+    assert "CMMC / NIST Readiness" in document_xml
+    assert "Evidence Matrix" in document_xml
 
 
 def test_excel_export_creates_xlsx_when_dependency_available(tmp_path) -> None:
@@ -185,3 +194,8 @@ def test_excel_export_creates_xlsx_when_dependency_available(tmp_path) -> None:
     path = export_assessment_excel(_assessment(), tmp_path / "assessment.xlsx")
     assert path.exists()
     assert path.suffix == ".xlsx"
+    with zipfile.ZipFile(path) as archive:
+        workbook_xml = archive.read("xl/workbook.xml").decode("utf-8")
+    assert "CMMC Summary" in workbook_xml
+    assert "Evidence Matrix" in workbook_xml
+    assert "POA&amp;M" in workbook_xml

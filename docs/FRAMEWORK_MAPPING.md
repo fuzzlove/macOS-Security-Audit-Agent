@@ -11,8 +11,13 @@ MSAA provides framework mappings for analyst context and reporting support. Thes
 - NIST Cybersecurity Framework 2.0
 - NIST SP 800-53 Rev. 5
 - NIST SP 800-61 Rev. 3
+- NIST SP 800-171 Rev. 2 / Rev. 3 readiness references where applicable
+- CMMC readiness and evidence support where applicable
 - MITRE ATT&CK Enterprise macOS techniques
+- CISA Cybersecurity Performance Goals and public guidance where applicable
 - CISA Known Exploited Vulnerabilities catalog where relevant
+- NSA public cybersecurity guidance where relevant
+- PCI DSS v4.0.1 readiness references where payment-card security relevance exists
 - NVD/CVE metadata where relevant
 
 ## Mapping Methodology
@@ -24,6 +29,10 @@ Mappings are assigned from three sources:
 - Vulnerability-level mappings when CVE identifiers, CVSS metadata, NVD references, or CISA KEV status are present.
 
 The mapping layer uses language such as "mapped to", "aligned with", "supports", and "references". It avoids certification or authorization claims.
+
+PCI DSS is an industry payment-card security standard, not a government framework. MSAA treats PCI references as optional industry readiness context only.
+
+MSAA is an independent project by Liquidsky Network Security. References to NIST, CISA, DoD, NSA, PCI SSC, MITRE, or other standards bodies are for standards mapping, source attribution, and public guidance alignment only. They do not imply endorsement, sponsorship, certification, or approval.
 
 ## Limitations
 

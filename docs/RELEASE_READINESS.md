@@ -13,6 +13,7 @@ MSAA is release-ready only when the application can prove operational behavior f
 
 ## Release Gates
 
+- Release verification uses Python 3.10 through Python 3.13. Python 3.14 may be used only for explicit forward-compatibility testing and should not be treated as release evidence until dependencies and tests support it.
 - `pytest` passes.
 - `python -m compileall -q mac_audit_agent` passes.
 - `python -m build` completes in a clean environment.
@@ -51,6 +52,12 @@ Run the clean install verifier after building the wheel with Python 3.10 or newe
 
 ```bash
 macos-security-audit-agent --db ~/.mac_audit_agent.sqlite3 --verify-clean-install --clean-install-python /path/to/python3.12 --no-gui
+```
+
+Equivalent module entry point:
+
+```bash
+python3 -m mac_audit_agent.quality.clean_install_verify --python /path/to/python3.12 --db ~/.mac_audit_agent.sqlite3
 ```
 
 The command defaults to the newest `dist/*.whl`, creates a temporary virtual environment, installs the wheel, checks imports and bundled assets, runs `macos-security-audit-agent --help`, runs installed release readiness, saves `clean_install_last_report_json`, and exits nonzero if any stage is `FAIL`.

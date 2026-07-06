@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import plistlib
 import pwd
 import re
@@ -21,11 +22,13 @@ from mac_audit_agent.launch_agent import (
     user_launchctl_uid,
 )
 from mac_audit_agent.models import utc_now_iso
+from mac_audit_agent.version import APP_VERSION, current_git_commit
 
 
 USER_NOTIFIER_LABEL = "com.mac-audit-agent.user-notifier"
 USER_NOTIFIER_STDOUT = "user_notifier.stdout.log"
 USER_NOTIFIER_STDERR = "user_notifier.stderr.log"
+MAC_AUDIT_AGENT_SETTINGS_PATH = "MAC_AUDIT_AGENT_SETTINGS_PATH"
 PID_RE = re.compile(r"\bpid = (\d+)\b")
 
 
@@ -50,6 +53,12 @@ class UserNotifierStatus:
     last_error: str = ""
     last_bootstrap_result: str = ""
     last_bootout_result: str = ""
+    runtime_manifest_path: str = ""
+    runtime_manifest_exists: bool = False
+    launchctl_print: str = ""
+    last_exit_status: str = ""
+    stderr_tail: str = ""
+    stdout_tail: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -166,6 +175,8 @@ class UserNotifierInstaller:
             stdout_path=str(self.stdout_path),
             stderr_path=str(self.stderr_path),
             logs_writable=os.access(self.log_dir, os.W_OK) if self.log_dir.exists() else False,
+            runtime_manifest_path=str(self.runtime_dir / "install_manifest.json"),
+            runtime_manifest_exists=(self.runtime_dir / "install_manifest.json").exists(),
         )
         if not self.plist_path.exists():
             status.install_status = "missing"
@@ -198,14 +209,16 @@ class UserNotifierInstaller:
             )
             return status
         result = self._run([LAUNCHCTL_BIN, "print", f"{self.launchctl_domain}/{USER_NOTIFIER_LABEL}"], check=False)
+        status.launchctl_print = (result.stdout or result.stderr or "")[-4000:]
         status.loaded = result.returncode == 0
         output = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
-        status.running = status.loaded and ("state = running" in output or "state = waiting" in output)
         pid_match = PID_RE.search(result.stdout or "")
         if pid_match:
             status.process_pid = int(pid_match.group(1))
+        status.running = status.loaded and ("state = running" in output or status.process_pid is not None)
         if status.loaded:
             status.install_status = "loaded"
+            status.last_exit_status = _extract_last_exit_status(status.launchctl_print)
         else:
             status.install_status = "unloaded"
             status.last_error = _failure(
@@ -214,6 +227,8 @@ class UserNotifierInstaller:
                 _result_text(result),
                 "Run Start or Repair User Alert Agent. The service must be loaded in gui/<uid>, not as a system LaunchDaemon.",
             )
+        status.stderr_tail = _tail_file(self.stderr_path)
+        status.stdout_tail = _tail_file(self.stdout_path)
         return status
 
     def build_plist(self, *, run_at_load: bool = True, keep_alive: bool = True) -> dict[str, Any]:
@@ -228,6 +243,7 @@ class UserNotifierInstaller:
                 "PATH": "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin",
                 "PYTHONPATH": pythonpath,
                 MAC_AUDIT_AGENT_ENV_DB_PATH: str(self.db_path),
+                MAC_AUDIT_AGENT_SETTINGS_PATH: str(self.db_path),
                 "MAC_AUDIT_AGENT_MONITOR_ROLE": "user-notifier",
             },
             "StandardOutPath": str(self.stdout_path),
@@ -239,6 +255,7 @@ class UserNotifierInstaller:
         source_root = project_root() / "mac_audit_agent"
         if not source_root.exists():
             return
+        self._reset_runtime_package_dir()
         shutil.copytree(
             source_root,
             self.runtime_package_dir,
@@ -246,6 +263,43 @@ class UserNotifierInstaller:
             ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "tests"),
             copy_function=shutil.copyfile,
         )
+        self._write_runtime_manifest()
+
+    def _reset_runtime_package_dir(self) -> None:
+        if not self.runtime_package_dir.exists():
+            return
+        for path in sorted(self.runtime_package_dir.rglob("*"), reverse=True):
+            try:
+                path.chmod(0o755 if path.is_dir() else 0o644)
+            except OSError:
+                pass
+        try:
+            self.runtime_package_dir.chmod(0o755)
+        except OSError:
+            pass
+        shutil.rmtree(self.runtime_package_dir)
+
+    def _write_runtime_manifest(self) -> None:
+        manifest = {
+            "schema": "UserNotifierIntegrityManifest",
+            "installed_at": utc_now_iso(),
+            "install_mode": "user_notifier",
+            "runtime_path": str(self.runtime_dir),
+            "plist_path": str(self.plist_path),
+            "db_path": str(self.db_path),
+            "settings_path": str(self.db_path),
+            "settings_version": "",
+            "program_arguments": [self.python_executable, "-m", "mac_audit_agent.user_notifier", "--run"],
+            "working_directory": str(self.runtime_dir),
+            "pythonpath": str(self.runtime_dir),
+            "owner_expected": self.user.pw_name,
+            "permissions_expected": "0644",
+            "package_version": APP_VERSION,
+            "app_version": APP_VERSION,
+            "git_commit": current_git_commit(),
+        }
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        (self.runtime_dir / "install_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
 
     def _run(self, command: list[str], *, check: bool = True):
         result = self.runner(command, capture_output=True, text=True)
@@ -273,6 +327,23 @@ def _format_command(command: list[str]) -> str:
 
 def _failure(cause: str, command: list[str], detail: str, fix: str) -> str:
     return f"{cause}\ncommand: {_format_command(command)}\ndetail: {detail or 'none'}\nrecommended fix: {fix}"
+
+
+def _tail_file(path: Path, max_chars: int = 4000) -> str:
+    try:
+        if not path.exists():
+            return ""
+        return path.read_text(encoding="utf-8", errors="replace")[-max_chars:]
+    except OSError:
+        return ""
+
+
+def _extract_last_exit_status(text: str) -> str:
+    for pattern in [r"last exit code = ([^\n]+)", r"last exit status = ([^\n]+)", r"exit status = ([^\n]+)"]:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    return ""
 
 
 def install_user_notifier(**kwargs) -> UserNotifierStatus:

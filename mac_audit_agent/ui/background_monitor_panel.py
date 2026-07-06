@@ -84,10 +84,12 @@ from mac_audit_agent.monitor_settings import (
     save_settings,
     settings_diagnostics,
 )
+from mac_audit_agent.settings.settings_sync import repair_settings_sync, update_installed_settings_manifest
 from mac_audit_agent.user_notifier_installer import (
     UserNotifierInstaller,
     update_db_notifier_status,
 )
+from mac_audit_agent.user_notifier_status import canonical_user_notifier_status, status_to_runtime_values
 from mac_audit_agent.storage import AuditDatabase
 from mac_audit_agent.system_monitor_readiness import SystemMonitorReadiness
 from mac_audit_agent.ui.context_dialog import ContextDialog
@@ -743,7 +745,7 @@ class BackgroundMonitorPanel(QWidget):
         self.reinstall_current_settings_button = QPushButton("Reinstall Monitor With Current Settings")
         self.reinstall_current_settings_button.clicked.connect(self.reinstall_monitor_with_current_settings)
         diagnostics_actions.addWidget(self.reinstall_current_settings_button)
-        self.repair_settings_mismatch_button = QPushButton("Repair Settings Mismatch")
+        self.repair_settings_mismatch_button = QPushButton("Repair Settings Sync")
         self.repair_settings_mismatch_button.clicked.connect(self.repair_settings_mismatch)
         diagnostics_actions.addWidget(self.repair_settings_mismatch_button)
         self.preview_alert_styles_button = QPushButton("Preview Alert Styles")
@@ -1112,6 +1114,9 @@ class BackgroundMonitorPanel(QWidget):
                 self.db.set_background_monitor_state("settings_synced_to_runtime_at", utc_now_iso())
                 self.db.set_background_monitor_state("settings_synced_to_runtime_db_path", str(active_db.path))
                 self.db.set_background_monitor_state("monitor_settings_runtime_apply_error", "")
+            active_db.set_background_monitor_state("settings_applied_event", json.dumps({"applied_at": utc_now_iso(), "settings_version": settings.settings_version, "source_db_path": str(self.db.path), "runtime_db_path": str(active_db.path)}, sort_keys=True))
+            active_db.set_background_monitor_state("settings_last_reload_time", utc_now_iso())
+            self._update_installed_settings_manifest(active_db, settings)
             notifier_message = self._ensure_user_notifier_for_alert_settings(settings, active_db)
             if notifier_message:
                 active_db.set_background_monitor_state("notification_status", notifier_message)
@@ -1125,6 +1130,9 @@ class BackgroundMonitorPanel(QWidget):
             self.db.set_background_monitor_state("monitor_settings_last_error", str(exc))
             self.db.set_background_monitor_state("monitor_settings_runtime_apply_error", str(exc))
             QMessageBox.warning(self, "Monitor Settings Failed", str(exc))
+
+    def _update_installed_settings_manifest(self, target_db: AuditDatabase, settings: MonitorSettings) -> None:
+        update_installed_settings_manifest(target_db, settings)
 
     def save_monitor_settings_only(self) -> None:
         if self._loading_monitor_settings:
@@ -1281,7 +1289,12 @@ class BackgroundMonitorPanel(QWidget):
     def _runtime_settings_values(self) -> dict[str, object]:
         monitor_db = self._active_monitor_db()
         settings = self._notification_service().notifications.settings()
-        return {
+        try:
+            notifier_status = canonical_user_notifier_status(db_path=monitor_db.path)
+            notifier_values = status_to_runtime_values(notifier_status)
+        except Exception as exc:
+            notifier_values = {"user_notifier_status_source": "live_status_error", "user_notifier_last_error": str(exc)}
+        values = {
             "settings_file_path": str(monitor_db.path),
             "settings_version": monitor_db.get_background_monitor_state("settings_version", monitor_db.get_background_monitor_state("monitor_settings_last_saved", "")),
             "notify_min_severity": settings.get("notify_min_severity", ""),
@@ -1361,6 +1374,8 @@ class BackgroundMonitorPanel(QWidget):
             "user_notifier_program_arguments": monitor_db.get_background_monitor_state("user_notifier_program_arguments", ""),
             "user_notifier_last_error": monitor_db.get_background_monitor_state("user_notifier_last_error", ""),
         }
+        values.update({key: value for key, value in notifier_values.items() if value not in {None, ""}})
+        return values
 
     def _user_notifier_installer(self, db: AuditDatabase | None = None) -> UserNotifierInstaller:
         target_db = db or self._active_monitor_db()
@@ -1412,22 +1427,29 @@ class BackgroundMonitorPanel(QWidget):
             installed_values=installed_monitor_values(self.db, launch_agent=self.launch_agent, system_launch_agent=self.system_launch_agent),
         )
         if diagnostics.get("mismatches"):
-            diagnostics["repair"] = "Runtime differs from installed monitor. Use Repair Background Monitor or reinstall the selected monitor mode."
+            diagnostics["repair"] = "Use Repair Settings Sync to apply the latest UI settings to runtime, restart stale components if needed, and rebuild stale installed manifest metadata."
         if hasattr(self, "repair_settings_mismatch_button"):
             self.repair_settings_mismatch_button.setEnabled(bool(diagnostics.get("mismatches")))
         self.settings_diagnostics_panel.setPlainText(json.dumps(diagnostics, indent=2, sort_keys=True, default=str))
 
     def repair_settings_mismatch(self) -> None:
-        self.monitor_settings = save_settings(self.db, load_settings(self.db))
-        if self.monitor_settings.installation.monitor_mode in {"system", "protected"}:
+        try:
+            result = repair_settings_sync(self.db, active_db_path=Path(self._active_monitor_db().path))
+            if result.status != "repaired":
+                raise RuntimeError(result.error or f"Repair failed at {result.first_failure_stage}")
+            settings = load_settings(self.db)
+            self.monitor_settings = settings
+            active_db = self._active_monitor_db()
+            notifier_message = self._ensure_user_notifier_for_alert_settings(settings, active_db)
+            self._refresh_settings_diagnostics()
             QMessageBox.information(
                 self,
-                "Repair Settings Mismatch",
-                "Runtime settings were reapplied. System LaunchDaemon installation settings require reinstall or repair with administrator approval.",
+                "Repair Settings Sync",
+                f"Settings version {result.settings_version} was reapplied to runtime. {notifier_message or 'No user alert agent repair was required.'}",
             )
-        else:
-            QMessageBox.information(self, "Repair Settings Mismatch", "Runtime settings were reapplied.")
-        self._refresh_settings_diagnostics()
+        except Exception as exc:
+            self.db.set_background_monitor_state("monitor_settings_runtime_apply_error", str(exc))
+            QMessageBox.warning(self, "Repair Settings Sync Failed", str(exc))
 
     def apply_settings_and_restart_monitor(self) -> None:
         self.apply_monitor_settings_from_ui()
@@ -2771,7 +2793,8 @@ class BackgroundMonitorPanel(QWidget):
             plist_path, notes = manager.repair(**self._install_options(scope=manager.scope))
             if self._system_mode_enabled() and load_settings(self.db).installation.notifier:
                 self._system_user_notifier_manager().install_user_notifier(**self._install_options(scope="user"))
-            deadline = time.monotonic() + 10
+            wait_seconds = float(getattr(self, "_repair_monitor_wait_seconds", 10))
+            deadline = time.monotonic() + max(0.0, wait_seconds)
             detector_updated = False
             baseline = self.db.get_background_monitor_status().detector_last_run_timestamp
             while time.monotonic() < deadline:

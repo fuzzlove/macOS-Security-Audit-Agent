@@ -502,6 +502,7 @@ def _render_professional_html_report(
         ("Apple Exposure", "apple-exposure"),
         ("Integrity Verification", "integrity-verification"),
         ("Framework Mapping", "framework-summary"),
+        ("Limitations", "limitations"),
         ("Appendices", "appendices"),
     ]
     toc = "".join(f'<a href="#{anchor}">{_e(label)}</a>' for label, anchor in nav_items)
@@ -522,6 +523,13 @@ def _render_professional_html_report(
         "Packet contents; packet capture reports include metadata and file paths only",
         "Formal compliance, certification, or authorization status",
     ]
+    report_limitations = artifacts.get("limitations", [])
+    if isinstance(report_limitations, str):
+        report_limitations = [report_limitations]
+    if not isinstance(report_limitations, list):
+        report_limitations = []
+    if not report_limitations:
+        report_limitations = ["No material limitations were recorded for this report."]
     top_concerns = [str(item.get("title", "Finding")) for item in top_priorities[:5]] or ["No findings were recorded."]
     immediate_actions = remediation["Immediate Actions"][:5] or remediation["Short-Term Actions"][:5]
     immediate_lines = [str(item["suggested_fix"]) for item in immediate_actions] or ["Continue routine monitoring and review any new changes."]
@@ -964,6 +972,13 @@ def _render_professional_html_report(
         {_compact_table(['Framework', 'Mapping', 'Findings'], framework_rows, empty='No framework mappings recorded.')}
         <h3>Unmapped Findings</h3>
         {_compact_table(['Category', 'Finding'], [[item.get('category', ''), item.get('title', '')] for item in framework_summary.get('unmapped_findings', [])], empty='No unmapped findings.')}
+        <a class="back-top" href="#top">Back to top</a>
+      </section>
+
+      <section id="limitations">
+        <h2>Limitations</h2>
+        <p>This section records known boundaries of the local audit so users do not overstate what the report proves.</p>
+        <ul>{''.join(f'<li>{_e(item)}</li>' for item in report_limitations)}</ul>
         <a class="back-top" href="#top">Back to top</a>
       </section>
 

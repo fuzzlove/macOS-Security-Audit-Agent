@@ -7,6 +7,9 @@ from typing import Any
 from mac_audit_agent.assessment import SecurityAssessment
 from mac_audit_agent.apple_exposure_guidance import build_apple_exposure_update_guide
 from mac_audit_agent.exporters.remediation import get_suggested_fix
+from mac_audit_agent.frameworks.cmmc import build_cmmc_readiness
+from mac_audit_agent.frameworks.cmmc_crosswalk import map_msaa_finding_to_cmmc
+from mac_audit_agent.frameworks.poam import poam_from_cmmc_readiness
 
 
 SEVERITIES = ["critical", "high", "medium", "low", "info"]
@@ -37,6 +40,12 @@ class ExportAssessmentData:
     physical_devices: list[dict[str, Any]] = field(default_factory=list)
     timeline: list[dict[str, Any]] = field(default_factory=list)
     framework_mappings: list[dict[str, Any]] = field(default_factory=list)
+    cmmc_summary: dict[str, Any] = field(default_factory=dict)
+    cmmc_requirements: list[dict[str, Any]] = field(default_factory=list)
+    cmmc_evidence_matrix: list[dict[str, Any]] = field(default_factory=list)
+    cmmc_poam: list[dict[str, Any]] = field(default_factory=list)
+    cmmc_source_versions: list[dict[str, Any]] = field(default_factory=list)
+    cmmc_manual_evidence: list[dict[str, Any]] = field(default_factory=list)
     visibility_integrity: list[dict[str, Any]] = field(default_factory=list)
     application_integrity: list[dict[str, Any]] = field(default_factory=list)
     limitations: list[str] = field(default_factory=list)
@@ -144,6 +153,106 @@ def _framework_rows(findings: list[dict[str, Any]], assessment: SecurityAssessme
             for key, value in values.items():
                 rows.append({"finding_id": "", "framework": framework, "control_id": key, "name": "", "category": "", "mapping_confidence": "", "notes": str(value)})
     return rows
+
+
+def _completed_check_ids(assessment: SecurityAssessment, findings: list[dict[str, Any]]) -> set[str]:
+    completed: set[str] = set()
+    diagnostics = assessment.diagnostics if isinstance(assessment.diagnostics, dict) else {}
+    for key, value in diagnostics.items():
+        if isinstance(value, dict) and str(value.get("status", "")).lower() in {"pass", "passed", "ready", "ok", "verified", "collected"}:
+            completed.add(str(key))
+        elif value:
+            completed.add(str(key))
+    if assessment.apple_exposure_summary:
+        completed.add("scan.apple_exposure")
+    if assessment.network_activity_summary:
+        completed.add("network_intelligence.collectors")
+        completed.add("network_intelligence.reports")
+    if assessment.admin_persistence_summary:
+        completed.add("persistence.workflow")
+    if assessment.physical_device_summary:
+        completed.add("scan.physical_devices")
+    if assessment.monitor_integrity_summary:
+        completed.add("scan.visibility_integrity")
+        completed.add("daemon.heartbeat")
+    for finding in findings:
+        for key in ("source_check_id", "check_id", "audit_check_id"):
+            if finding.get(key):
+                completed.add(str(finding[key]))
+    return completed
+
+
+def _build_cmmc_export_payload(assessment: SecurityAssessment, findings: list[dict[str, Any]]) -> dict[str, Any]:
+    if isinstance(getattr(assessment, "cmmc_readiness", None), dict) and assessment.cmmc_readiness:
+        payload = dict(assessment.cmmc_readiness)
+    else:
+        readiness = build_cmmc_readiness(
+            target_level=2,
+            scope_name=str((assessment.diagnostics or {}).get("cmmc_scope", "This Mac only")) if isinstance(assessment.diagnostics, dict) else "This Mac only",
+            completed_check_ids=_completed_check_ids(assessment, findings),
+        )
+        payload = readiness.to_dict()
+    requirements = payload.get("requirements", [])
+    evidence_matrix: list[dict[str, Any]] = []
+    for item in payload.get("evidence_items", []):
+        if not isinstance(item, dict):
+            continue
+        requirement = next((req for req in requirements if req.get("cmmc_id") == item.get("requirement_id")), {})
+        evidence_matrix.append(
+            {
+                "cmmc_level": requirement.get("level", ""),
+                "cmmc_requirement_id": item.get("requirement_id", ""),
+                "domain": requirement.get("domain", ""),
+                "requirement_summary": requirement.get("requirement_text", ""),
+                "related_nist_control": ", ".join(str(value) for value in requirement.get("mapped_nist_controls", [])),
+                "msaa_check": item.get("source_check_id", ""),
+                "evidence_collected": item.get("result_summary", ""),
+                "evidence_location": item.get("artifact_path", ""),
+                "evidence_status": item.get("evidence_status", ""),
+                "manual_evidence_needed": item.get("analyst_note", ""),
+                "suggested_fix": item.get("recommended_fix", ""),
+                "analyst_notes": item.get("analyst_note", ""),
+            }
+        )
+    for finding in findings:
+        for mapping in map_msaa_finding_to_cmmc(finding):
+            evidence_matrix.append(
+                {
+                    "cmmc_level": mapping.get("level", ""),
+                    "cmmc_requirement_id": mapping.get("requirement_id", ""),
+                    "domain": mapping.get("domain", ""),
+                    "requirement_summary": mapping.get("practice_id", ""),
+                    "related_nist_control": ", ".join(str(value) for value in mapping.get("related_nist_controls", [])),
+                    "msaa_check": mapping.get("source_check_id", finding.get("finding_id", "")),
+                    "evidence_collected": finding.get("evidence_summary", ""),
+                    "evidence_location": "",
+                    "evidence_status": "manual_review_required" if mapping.get("manual_evidence_required") else "partial",
+                    "manual_evidence_needed": "; ".join(str(value) for value in mapping.get("limitations", [])),
+                    "suggested_fix": finding.get("suggested_fix", ""),
+                    "analyst_notes": mapping.get("mapping_confidence", ""),
+                }
+            )
+    manual_evidence = [
+        {
+            "requirement_id": item.get("cmmc_id", ""),
+            "evidence_needed": "; ".join(str(value) for value in item.get("limitations", [])) or "Analyst confirmation required.",
+            "suggested_document_name": f"{item.get('domain', 'CMMC')} evidence record",
+            "owner": "",
+            "status": "manual_review_required",
+            "notes": item.get("discussion", ""),
+        }
+        for item in payload.get("top_gaps", [])
+        if isinstance(item, dict) and item.get("limitations")
+    ]
+    poam = [item.to_dict() for item in poam_from_cmmc_readiness(payload)]
+    return {
+        "summary": payload,
+        "requirements": requirements,
+        "evidence_matrix": evidence_matrix,
+        "poam": poam,
+        "source_versions": payload.get("source_versions", []),
+        "manual_evidence": manual_evidence,
+    }
 
 
 def _apple_exposure_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
@@ -313,6 +422,7 @@ def build_export_assessment_data(assessment: SecurityAssessment, options: Export
                     "suggested_fix": finding["suggested_fix"],
                 }
             )
+    cmmc_payload = _build_cmmc_export_payload(assessment, findings)
     return ExportAssessmentData(
         metadata=metadata,
         summary=summary,
@@ -324,6 +434,12 @@ def build_export_assessment_data(assessment: SecurityAssessment, options: Export
         physical_devices=_summary_items(assessment.physical_device_summary, "Physical Devices"),
         timeline=timeline,
         framework_mappings=_framework_rows(findings, assessment) if options.include_framework_mappings else [],
+        cmmc_summary=cmmc_payload["summary"],
+        cmmc_requirements=cmmc_payload["requirements"],
+        cmmc_evidence_matrix=cmmc_payload["evidence_matrix"],
+        cmmc_poam=cmmc_payload["poam"],
+        cmmc_source_versions=cmmc_payload["source_versions"],
+        cmmc_manual_evidence=cmmc_payload["manual_evidence"],
         visibility_integrity=_summary_items(assessment.monitor_integrity_summary, "Visibility Integrity"),
         application_integrity=_application_integrity_rows(assessment.monitor_integrity_summary),
         limitations=list(assessment.limitations) if options.include_limitations else [],

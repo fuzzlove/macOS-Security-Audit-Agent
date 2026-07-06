@@ -35,6 +35,7 @@ from mac_audit_agent.analyzers import (
 )
 from mac_audit_agent.command_registry import build_command_registry
 from mac_audit_agent.config import AuditConfig
+from mac_audit_agent.hardware_monitor import HardwareMonitor
 from mac_audit_agent.intrusion_methods import (
     analyze_launch_item_for_persistence,
     analyze_vmmap_output,
@@ -306,6 +307,10 @@ class CollectorSuite:
             "ssh_artifacts": ssh_artifacts,
             "baseline_diff": comparison.to_dict(),
         }
+        physical_devices = self._collect_physical_device_artifacts(system_info, command_results)
+        hardware = self._collect_hardware_artifact(system_info, command_results)
+        system_integrity_artifacts["physical_devices"] = physical_devices
+        system_integrity_artifacts["hardware"] = hardware
         system_integrity_report = SystemIntegrityEngine().analyze_artifacts(system_integrity_artifacts)
         findings.extend(system_integrity_report.findings)
         if not findings:
@@ -340,6 +345,8 @@ class CollectorSuite:
             "command_results": command_results,
             "network_info": network_info,
             "ssh_artifacts": ssh_artifacts,
+            "physical_devices": physical_devices,
+            "hardware": hardware,
             "system_integrity": system_integrity_report.to_dict(),
         }
         scan_result.baseline_diff = comparison.to_dict()
@@ -927,6 +934,62 @@ class CollectorSuite:
             elif command_id == "network.dns_settings":
                 network["dns_settings"] = text
         return network
+
+    def _collect_physical_device_artifacts(self, system_info: dict, command_results: list) -> dict:
+        del system_info
+        last_checked = utc_now_iso()
+        errors: list[str] = []
+        usb_text = ""
+        bluetooth_text = ""
+        for result in command_results:
+            command_id = self._result_command_id(result)
+            text = (get_stdout(result) or get_stderr(result)).strip()
+            if command_id in {"hardware.usb_devices", "system.usb_devices"}:
+                usb_text = text[:2000]
+            elif command_id in {"hardware.bluetooth_devices", "system.bluetooth_devices"}:
+                bluetooth_text = text[:2000]
+        usb_devices: list[dict[str, str]] = []
+        bluetooth_devices: list[dict[str, str]] = []
+        try:
+            snapshot = HardwareMonitor().collect_snapshot(include_usb=True, include_bluetooth=True)
+            usb_devices = snapshot.usb_devices
+            bluetooth_devices = snapshot.bluetooth_devices + snapshot.nearby_bluetooth_devices
+        except Exception as exc:
+            errors.append(f"Hardware inventory command failed: {exc}")
+        status = "collected" if usb_devices or bluetooth_devices or usb_text or bluetooth_text else "unavailable"
+        if status == "unavailable":
+            errors.append("Physical device runtime inventory was not available during Safe Scan; background hardware monitoring records live USB/Bluetooth events when enabled.")
+        return {
+            "usb_devices": usb_devices,
+            "bluetooth_devices": bluetooth_devices,
+            "hid_devices": [],
+            "storage_devices": [],
+            "network_adapters": [],
+            "known_usb_devices": usb_devices,
+            "trusted_usb_devices": [],
+            "untrusted_usb_devices": [],
+            "recent_device_alerts": [],
+            "source": "safe_scan_physical_device_inventory",
+            "last_checked": last_checked,
+            "status": status,
+            "errors": errors,
+            "usb_summary": usb_text,
+            "bluetooth_summary": bluetooth_text,
+        }
+
+    def _collect_hardware_artifact(self, system_info: dict, command_results: list) -> dict:
+        del command_results
+        architecture = str(system_info.get("architecture") or platform.machine() or "")
+        return {
+            "model": str(system_info.get("hardware_model") or platform.platform()),
+            "serial_redacted": "not collected",
+            "architecture": architecture,
+            "usb_controller_summary": "not collected by Safe Scan",
+            "bluetooth_available": "unknown",
+            "source": "safe_scan_system_info",
+            "last_checked": utc_now_iso(),
+            "status": "collected" if architecture else "unavailable",
+        }
 
     def _collect_ssh_artifacts(self, users: list[UserSnapshot]) -> dict:
         artifacts = {"users_with_authorized_keys": [], "recent_ssh_files": []}

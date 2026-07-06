@@ -378,10 +378,12 @@ def test_monitor_settings_diagnostics_reports_mismatch(tmp_path) -> None:
         installed_values={"system_launch_daemon_installed": False, "settings_version_installed": "5"},
     )
 
-    assert diagnostic["status"] == "mismatch"
+    assert diagnostic["status"] == "partially_applied"
+    assert diagnostic["settings_reconciliation"]["status"] == "partially_applied"
     assert "system_launch_daemon_installation" in diagnostic["mismatches"]
     assert "runtime_settings_version" in diagnostic["mismatches"]
     assert "installed_settings_version" in diagnostic["mismatches"]
+    assert any(item["component"] == "System Daemon Runtime" for item in diagnostic["detailed_mismatches"])
 
 
 def test_monitor_settings_ui_runtime_and_notifier_agree(tmp_path, monkeypatch) -> None:

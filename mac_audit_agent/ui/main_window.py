@@ -7,7 +7,6 @@ import os
 import random
 import subprocess
 import shlex
-import urllib.request
 from datetime import datetime
 from pathlib import Path
 import sys
@@ -48,7 +47,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from mac_audit_agent.assets import get_asset_path
+from mac_audit_agent.assets import get_asset_path, get_donation_qr_path
 from mac_audit_agent.assessment import (
     SecurityAssessment,
     build_security_assessment,
@@ -62,7 +61,9 @@ from mac_audit_agent.cases import CaseManager
 from mac_audit_agent.collectors import CollectorSuite
 from mac_audit_agent.command_registry import build_command_registry
 from mac_audit_agent.config import AuditConfig
+from mac_audit_agent.branding.support_links import SUPPORT_LINKS, canonical_support_url
 from mac_audit_agent.frameworks import rule_coverage_summary
+from mac_audit_agent.frameworks.cmmc import build_cmmc_readiness
 from mac_audit_agent.exporters import ExportOptions, export_assessment_excel, export_assessment_word
 from mac_audit_agent.help.contextual_help import make_help_button
 from mac_audit_agent.help.help_controller import DEFAULT_HELP_CONTROLLER, HelpController
@@ -154,7 +155,9 @@ from mac_audit_agent.ui.flight_recorder_panel import FlightRecorderPanel
 from mac_audit_agent.ui.intrusion_detection_panel import IntrusionDetectionPanel
 from mac_audit_agent.ui.logs_panel import LogsPanel
 from mac_audit_agent.ui.network_intelligence_panel import NetworkIntelligencePanel
+from mac_audit_agent.ui.navigation_registry import NavigationItem, ordered_navigation_items, validate_navigation_order
 from mac_audit_agent.ui.operational_health_panel import OperationalHealthPanel
+from mac_audit_agent.ui.page_header import PageHeader, SectionHeader
 from mac_audit_agent.ui.persistence_intelligence_panel import PersistenceIntelligencePanel
 from mac_audit_agent.ui.reliability_panel import ReliabilityPanel
 from mac_audit_agent.ui.system_recovery_panel import RecoveryEvidenceWarningDialog, SystemRecoveryPanel
@@ -173,8 +176,7 @@ from mac_audit_agent.quality.pre_uat_audit import run_pre_uat_audit
 
 LOGGER = logging.getLogger(__name__)
 APP_TITLE = "macOS Security Audit Agent"
-SUPPORT_IMAGE_URL = "https://github.com/user-attachments/assets/e7da53a1-36b2-40fb-9856-41c0c1409ab2"
-SUPPORT_PATREON_URL = "https://www.patreon.com/16166750/join"
+SUPPORT_PATREON_URL = canonical_support_url("patreon")
 ABOUT_TITLE = f"About {APP_TITLE}"
 USAGE_GUIDE_TITLE = f"How to Use {APP_TITLE}"
 RISK_COLORS = {"safe": "#238b45", "sensitive": "#d4a017", "dangerous": "#c0392b"}
@@ -501,6 +503,7 @@ class GuidedLongActionDialog(QDialog):
         layout.addWidget(self.progress_bar)
         self.close_button = QPushButton("Running...")
         self.close_button.setEnabled(False)
+        self.close_button.clicked.connect(self.accept)
         layout.addWidget(self.close_button)
         self.timer = QTimer(self)
         self.timer.setInterval(1200)
@@ -983,18 +986,15 @@ def create_fallback_qr_pixmap(size: int = 112, payload: str = "macOS Security Au
     return pixmap
 
 
-def load_support_image_pixmap(image_url: str = SUPPORT_IMAGE_URL, size: tuple[int, int] = (100, 100)) -> QPixmap:
+def load_support_image_pixmap(image_url: str = "", size: tuple[int, int] = (100, 100)) -> QPixmap:
     width, height = size
-    request = urllib.request.Request(image_url, headers={"User-Agent": "MacAuditAgent/1.0"})
-    try:
-        with urllib.request.urlopen(request, timeout=3) as response:
-            data = response.read()
-    except Exception:
+    path = get_donation_qr_path()
+    if not path.exists():
         return QPixmap()
     pixmap = QPixmap()
-    if not pixmap.loadFromData(data):
+    if not pixmap.load(str(path)):
         return QPixmap()
-    return pixmap.scaled(width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    return pixmap.scaled(width, height, Qt.KeepAspectRatio, Qt.FastTransformation)
 
 
 class MainWindow(QMainWindow):
@@ -1143,29 +1143,7 @@ class MainWindow(QMainWindow):
         self.global_help_button.clicked.connect(self.open_help_center)
 
         self.sidebar = QListWidget()
-        self.sidebar.addItems([
-            "Dashboard",
-            "Apple Exposure Assessment",
-            "Family & Safety",
-            "Intrusion Detection",
-            "Persistence Intelligence",
-            "Network Intelligence",
-            "Investigation Priorities",
-            "Flight Recorder",
-            "Logs",
-            "Reliability",
-            "System Recovery",
-            "Visibility Integrity",
-            "Framework Coverage",
-            "Settings",
-            "Skins",
-            "Scan Categories",
-            "Results",
-            "Assessment",
-            "Pre-UAT Audit",
-            "Investigation Notes",
-            "Command Preview",
-        ])
+        self.sidebar.setAccessibleName("Main Navigation")
         self.sidebar.setMaximumWidth(240)
         self.sidebar.setMinimumWidth(150)
         self.sidebar.currentRowChanged.connect(self._change_page)
@@ -1239,27 +1217,19 @@ class MainWindow(QMainWindow):
         self.system_recovery_panel.open_snapshots_requested.connect(self.open_system_recovery_snapshots_folder)
 
         self.pages = QStackedWidget()
-        self.pages.addWidget(self._wrap_in_scroll_area(self._build_dashboard_page(), resizable=True))
-        self.pages.addWidget(self._wrap_in_scroll_area(self._build_forecast_page(), resizable=True))
-        self.pages.addWidget(self._wrap_in_scroll_area(self._build_family_safety_page(), resizable=True))
-        self.pages.addWidget(self._wrap_in_scroll_area(self._build_intrusion_detection_page(), resizable=True))
-        self.pages.addWidget(self._wrap_in_scroll_area(self._build_help_panel_page("Persistence Intelligence", "persistence_intelligence", self.persistence_intelligence_panel), resizable=True))
-        self.pages.addWidget(self._wrap_in_scroll_area(self._build_help_panel_page("Network Intelligence", "network_intelligence", self.network_intelligence_panel), resizable=True))
-        self.pages.addWidget(self._wrap_in_scroll_area(self._build_investigation_priorities_page(), resizable=True))
-        self.pages.addWidget(self._wrap_in_scroll_area(self._build_flight_recorder_page(), resizable=True))
-        self.pages.addWidget(self._wrap_in_scroll_area(self._build_logs_page(), resizable=True))
-        self.pages.addWidget(self._wrap_in_scroll_area(self._build_reliability_page(), resizable=True))
-        self.pages.addWidget(self._wrap_in_scroll_area(self._build_system_recovery_page(), resizable=True))
-        self.pages.addWidget(self._wrap_in_scroll_area(self._build_visibility_integrity_page(), resizable=True))
-        self.pages.addWidget(self._wrap_in_scroll_area(self._build_framework_coverage_page(), resizable=True))
-        self.pages.addWidget(self._wrap_in_scroll_area(self._build_settings_page(), resizable=True))
-        self.pages.addWidget(self._wrap_in_scroll_area(self._build_skins_page(), resizable=True))
-        self.pages.addWidget(self._wrap_in_scroll_area(self._build_categories_page(), resizable=True))
-        self.pages.addWidget(self._wrap_in_scroll_area(self._build_results_page(), resizable=True))
-        self.pages.addWidget(self._wrap_in_scroll_area(self._build_assessment_page(), resizable=True))
-        self.pages.addWidget(self._wrap_in_scroll_area(self._build_pre_uat_audit_page(), resizable=True))
-        self.pages.addWidget(self._wrap_in_scroll_area(self._build_investigation_notes_page(), resizable=True))
-        self.pages.addWidget(self._wrap_in_scroll_area(self._build_preview_page(), resizable=True))
+        self.navigation_items = self._build_navigation_items()
+        navigation_errors = validate_navigation_order(self.navigation_items)
+        if navigation_errors:
+            raise RuntimeError("Invalid navigation order: " + "; ".join(navigation_errors))
+        for item in ordered_navigation_items(self.navigation_items):
+            sidebar_item = QListWidgetItem(item.title)
+            if item.id == "support_author":
+                sidebar_item.setData(Qt.AccessibleTextRole, "Support the Author")
+                sidebar_item.setData(Qt.AccessibleDescriptionRole, "Open support options for the MSAA author/developer")
+            self.sidebar.addItem(sidebar_item)
+            if item.widget_factory is None:
+                raise RuntimeError(f"Navigation item {item.id} does not define a widget factory.")
+            self.pages.addWidget(item.widget_factory())
         self.sidebar.setCurrentRow(0)
 
         self.details_panel = self._build_selected_command_panel()
@@ -1287,24 +1257,60 @@ class MainWindow(QMainWindow):
         scroll.setWidget(widget)
         return scroll
 
+    def _build_navigation_items(self) -> list[NavigationItem]:
+        return [
+            NavigationItem("dashboard", "Dashboard", lambda: self._wrap_in_scroll_area(self._build_dashboard_page(), resizable=True), 10),
+            NavigationItem("apple_exposure", "Apple Exposure Assessment", lambda: self._wrap_in_scroll_area(self._build_forecast_page(), resizable=True), 20),
+            NavigationItem("family_safety", "Family & Safety", lambda: self._wrap_in_scroll_area(self._build_family_safety_page(), resizable=True), 30),
+            NavigationItem("intrusion_detection", "Intrusion Detection", lambda: self._wrap_in_scroll_area(self._build_intrusion_detection_page(), resizable=True), 40),
+            NavigationItem(
+                "persistence_intelligence",
+                "Persistence Intelligence",
+                lambda: self._wrap_in_scroll_area(
+                    self._build_help_panel_page(
+                        "Persistence Intelligence",
+                        "persistence_intelligence",
+                        self.persistence_intelligence_panel,
+                        subtitle="Review read-only macOS persistence inventory, risks, baselines, chain view, scanner coverage, timeline, and reports.",
+                    ),
+                    resizable=True,
+                ),
+                50,
+            ),
+            NavigationItem(
+                "network_intelligence",
+                "Network Intelligence",
+                lambda: self._wrap_in_scroll_area(
+                    self._build_help_panel_page(
+                        "Network Intelligence",
+                        "network_intelligence",
+                        self.network_intelligence_panel,
+                        subtitle="Review local network posture, listeners, active connections, DNS, gateway, VPN, proxy state, and diagnostics.",
+                    ),
+                    resizable=True,
+                ),
+                60,
+            ),
+            NavigationItem("investigation_priorities", "Investigation Priorities", lambda: self._wrap_in_scroll_area(self._build_investigation_priorities_page(), resizable=True), 70),
+            NavigationItem("flight_recorder", "Flight Recorder", lambda: self._wrap_in_scroll_area(self._build_flight_recorder_page(), resizable=True), 80),
+            NavigationItem("logs", "Logs", lambda: self._wrap_in_scroll_area(self._build_logs_page(), resizable=True), 90),
+            NavigationItem("reliability", "Reliability", lambda: self._wrap_in_scroll_area(self._build_reliability_page(), resizable=True), 100),
+            NavigationItem("system_recovery", "System Recovery", lambda: self._wrap_in_scroll_area(self._build_system_recovery_page(), resizable=True), 110),
+            NavigationItem("visibility_integrity", "Visibility Integrity", lambda: self._wrap_in_scroll_area(self._build_visibility_integrity_page(), resizable=True), 120),
+            NavigationItem("framework_coverage", "Framework Coverage", lambda: self._wrap_in_scroll_area(self._build_framework_coverage_page(), resizable=True), 130),
+            NavigationItem("settings", "Settings", lambda: self._wrap_in_scroll_area(self._build_settings_page(), resizable=True), 140),
+            NavigationItem("skins", "Skins", lambda: self._wrap_in_scroll_area(self._build_skins_page(), resizable=True), 150),
+            NavigationItem("scan_categories", "Scan Categories", lambda: self._wrap_in_scroll_area(self._build_categories_page(), resizable=True), 160),
+            NavigationItem("results", "Results", lambda: self._wrap_in_scroll_area(self._build_results_page(), resizable=True), 170),
+            NavigationItem("assessment", "Assessment", lambda: self._wrap_in_scroll_area(self._build_assessment_page(), resizable=True), 180),
+            NavigationItem("pre_uat_audit", "Pre-UAT Audit", lambda: self._wrap_in_scroll_area(self._build_pre_uat_audit_page(), resizable=True), 190),
+            NavigationItem("investigation_notes", "Investigation Notes", lambda: self._wrap_in_scroll_area(self._build_investigation_notes_page(), resizable=True), 200),
+            NavigationItem("command_preview", "Command Preview", lambda: self._wrap_in_scroll_area(self._build_preview_page(), resizable=True), 210),
+            NavigationItem("support_author", "Support the Author", self._build_support_author_page, 9999, pinned_position="last"),
+        ]
+
     def _build_help_header(self, title: str, topic_id: str, *, subtitle: str = "") -> QWidget:
-        header = QWidget()
-        layout = QHBoxLayout(header)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
-        text_layout = QVBoxLayout()
-        text_layout.setContentsMargins(0, 0, 0, 0)
-        heading = QLabel(title)
-        heading.setStyleSheet("font-size: 18px; font-weight: 700;")
-        heading.setWordWrap(True)
-        text_layout.addWidget(heading)
-        if subtitle:
-            subtitle_label = QLabel(subtitle)
-            subtitle_label.setWordWrap(True)
-            text_layout.addWidget(subtitle_label)
-        layout.addLayout(text_layout, 1)
-        layout.addWidget(make_help_button(self, topic_id), alignment=Qt.AlignTop)
-        return header
+        return PageHeader(title, subtitle, parent=self, help_topic_id=topic_id)
 
     def _build_help_panel_page(self, title: str, topic_id: str, panel: QWidget, *, subtitle: str = "") -> QWidget:
         page = QWidget()
@@ -1315,12 +1321,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(panel)
         return page
 
-    def _build_support_section(self) -> QFrame:
+    def _build_support_section(self, *, full_page: bool = False) -> QFrame:
         frame = ClickableFrame()
         frame.setObjectName("supportAd")
         frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
-        frame.setMinimumHeight(286)
-        frame.setMinimumWidth(220)
+        frame.setMinimumHeight(420 if full_page else 286)
+        frame.setMinimumWidth(280 if full_page else 220)
+        frame.setMaximumWidth(820 if full_page else 16777215)
         frame.setStyleSheet(
             """
             QFrame#supportAd {
@@ -1352,45 +1359,92 @@ class MainWindow(QMainWindow):
         content.setObjectName("supportAdContent")
         content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(18, 18, 18, 18)
-        content_layout.setSpacing(12)
+        content_layout.setContentsMargins(28 if full_page else 18, 28 if full_page else 18, 28 if full_page else 18, 28 if full_page else 18)
+        content_layout.setSpacing(18 if full_page else 12)
 
         self.support_ad_image_label = QLabel()
-        self.support_ad_image_label.setMinimumSize(128, 128)
-        self.support_ad_image_label.setMaximumSize(160, 160)
+        qr_min = 180 if full_page else 128
+        qr_preferred = 240 if full_page else 160
+        qr_render = 240 if full_page else 128
+        self.support_ad_image_label.setMinimumSize(qr_min, qr_min)
+        self.support_ad_image_label.setMaximumSize(320 if full_page else 160, 320 if full_page else 160)
         self.support_ad_image_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.support_ad_image_label.setAlignment(Qt.AlignCenter)
         self.support_ad_image_label.setStyleSheet("background: white; border-radius: 10px;")
         self.support_ad_image_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        pixmap = load_support_image_pixmap(size=(160, 160))
+        self.support_ad_image_label.setAccessibleName("Donation QR Code")
+        self.support_ad_image_label.setAccessibleDescription("Scan to support MSAA development.")
+        self.support_ad_image_label.setToolTip("Scan to support MSAA development.")
+        pixmap = load_support_image_pixmap(size=(qr_preferred, qr_preferred))
         if pixmap.isNull():
-            pixmap = create_fallback_qr_pixmap(160, "macOS Security Audit Agent Support")
-        self.support_ad_image_label.setPixmap(pixmap.scaled(128, 128, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            pixmap = create_fallback_qr_pixmap(qr_preferred, "macOS Security Audit Agent Support")
+        self.support_ad_image_label.setPixmap(pixmap.scaled(qr_render, qr_render, Qt.KeepAspectRatio, Qt.FastTransformation))
 
         text_layout = QVBoxLayout()
         text_layout.setContentsMargins(0, 0, 0, 0)
         text_layout.setSpacing(6)
-        title = QLabel("Support the author")
+        title = QLabel("Support MSAA Development")
         title.setWordWrap(True)
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("font-size: 14px; font-weight: 700; color: #F8FAFC;")
-        body = QLabel("Simple support for the work behind the app.\nJoin if you'd like to help keep it going.")
+        body = QLabel(
+            f"MSAA is developed and maintained by {SUPPORT_LINKS['developer']}. "
+            "If this project helps you improve macOS security visibility, incident response, or defensive research, consider supporting ongoing development."
+        )
         body.setWordWrap(True)
         body.setAlignment(Qt.AlignCenter)
         body.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         body.setStyleSheet("color: #CBD5E1;")
+        note = QLabel("Support is optional. MSAA remains local-first and does not send telemetry or donation data.")
+        note.setWordWrap(True)
+        note.setAlignment(Qt.AlignCenter)
+        note.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        note.setStyleSheet("color: #CBD5E1;")
         title.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         body.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.support_ad_link_label = QLabel(f'<a href="{SUPPORT_PATREON_URL}">Support via Patreon or BuyMeACoffee</a>')
+        note.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.support_ad_link_label = QLabel(
+            f'<a href="{SUPPORT_LINKS["patreon"]}">Patreon</a> | '
+            f'<a href="{SUPPORT_LINKS["buy_me_a_coffee"]}">Buy Me a Coffee</a> | '
+            f'<a href="{SUPPORT_LINKS["github"]}">GitHub</a> | '
+            f'<a href="{SUPPORT_LINKS["website"]}">Website</a>'
+        )
         self.support_ad_link_label.setTextFormat(Qt.RichText)
         self.support_ad_link_label.setWordWrap(True)
         self.support_ad_link_label.setAlignment(Qt.AlignCenter)
         self.support_ad_link_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         self.support_ad_link_label.setStyleSheet("color: #93C5FD;")
         self.support_ad_link_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        button_layout = QGridLayout()
+        button_layout.setContentsMargins(0, 0, 0, 0)
+        button_layout.setSpacing(6)
+        self.support_ad_buttons = []
+        for index, (label, key, tooltip) in enumerate([
+            ("Patreon", "patreon", "Support the MSAA developer on Patreon."),
+            ("Buy Me a Coffee", "buy_me_a_coffee", "Support the MSAA developer on Buy Me a Coffee."),
+            ("GitHub", "github", "Open the MSAA developer GitHub profile."),
+            ("Website", "website", "Open the Liquidsky Network Security website."),
+        ]):
+            button = QPushButton(label)
+            button.setObjectName(f"support_{key}_button")
+            button.setToolTip(tooltip)
+            button.setAccessibleName(label)
+            button.setAccessibleDescription(tooltip)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            button.clicked.connect(lambda _checked=False, link_key=key: self._open_support_link(link_key))
+            self.support_ad_buttons.append(button)
+            button_layout.addWidget(button, index // 2, index % 2)
+        footer = QLabel(f"{SUPPORT_LINKS['developer']} © 2025-{datetime.now().year}")
+        footer.setWordWrap(True)
+        footer.setAlignment(Qt.AlignCenter)
+        footer.setStyleSheet("color: #94A3B8; font-size: 11px;")
+        footer.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         text_layout.addWidget(title)
         text_layout.addWidget(body)
+        text_layout.addWidget(note)
         text_layout.addWidget(self.support_ad_link_label)
+        text_layout.addLayout(button_layout)
+        text_layout.addWidget(footer)
 
         content_layout.addWidget(self.support_ad_image_label, alignment=Qt.AlignHCenter)
         content_layout.addLayout(text_layout)
@@ -1398,8 +1452,87 @@ class MainWindow(QMainWindow):
         ad_layout.addWidget(scroll)
         return frame
 
-    def _open_support_link(self) -> None:
-        QDesktopServices.openUrl(QUrl(SUPPORT_PATREON_URL))
+    def _build_support_author_page(self) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setObjectName("supportAuthorScrollArea")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        container = QWidget()
+        container.setObjectName("supportAuthorPage")
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(18)
+        header = PageHeader(
+            "Support the Author",
+            "Support ongoing development of MSAA and Liquidsky Network Security tools.",
+            parent=self,
+        )
+        header.setAccessibleName("Support the Author")
+        header.setAccessibleDescription("Open support options for the MSAA author/developer")
+        layout.addWidget(header)
+        layout.addWidget(self._build_support_acknowledgement_section())
+        layout.addStretch(1)
+        layout.addWidget(self._build_support_section(full_page=True), alignment=Qt.AlignHCenter)
+        layout.addStretch(1)
+        scroll.setWidget(container)
+        return scroll
+
+    def _build_support_acknowledgement_section(self) -> QFrame:
+        frame = QFrame()
+        frame.setObjectName("supportAcknowledgements")
+        frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        frame.setStyleSheet(
+            """
+            QFrame#supportAcknowledgements {
+                background: rgba(15, 23, 42, 150);
+                border: 1px solid rgba(148, 163, 184, 70);
+                border-radius: 8px;
+            }
+            """
+        )
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
+
+        author_title = QLabel("Author / Developer")
+        author_title.setObjectName("supportAuthorDeveloperTitle")
+        author_title.setStyleSheet("font-size: 14px; font-weight: 700; color: #F8FAFC;")
+        author_body = QLabel(f"{SUPPORT_LINKS['developer']}\nMSAA is developed and maintained independently.")
+        author_body.setObjectName("supportAuthorDeveloperBody")
+        author_body.setWordWrap(True)
+        author_body.setStyleSheet("color: #CBD5E1;")
+
+        acknowledgement_title = QLabel("Community Acknowledgements")
+        acknowledgement_title.setObjectName("supportCommunityAcknowledgementsTitle")
+        acknowledgement_title.setStyleSheet("font-size: 14px; font-weight: 700; color: #F8FAFC;")
+        acknowledgement_body = QLabel(
+            "Thank you to the NSA for helping the cybersecurity community through public cybersecurity guidance, research, and open-source contributions."
+        )
+        acknowledgement_body.setObjectName("supportCommunityAcknowledgementsBody")
+        acknowledgement_body.setWordWrap(True)
+        acknowledgement_body.setStyleSheet("color: #CBD5E1;")
+        acknowledgement_disclaimer = QLabel(
+            "This acknowledgement does not imply endorsement, affiliation, certification, or approval."
+        )
+        acknowledgement_disclaimer.setObjectName("supportCommunityAcknowledgementsDisclaimer")
+        acknowledgement_disclaimer.setWordWrap(True)
+        acknowledgement_disclaimer.setStyleSheet("color: #94A3B8;")
+
+        for widget in [
+            author_title,
+            author_body,
+            acknowledgement_title,
+            acknowledgement_body,
+            acknowledgement_disclaimer,
+        ]:
+            widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+            layout.addWidget(widget)
+        return frame
+
+    def _open_support_link(self, key: str = "patreon") -> None:
+        QDesktopServices.openUrl(QUrl(canonical_support_url(key)))
 
     def _developer_mode_enabled(self) -> bool:
         stored = self.db.get_background_monitor_state("developer_mode", "")
@@ -1987,7 +2120,7 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(8, 8, 8, 8)
-        layout.addWidget(self._build_help_header("Family & Safety Center", "family_safety"))
+        layout.addWidget(self._build_help_header("Family & Safety Center", "family_safety", subtitle="Guided, local checks for making this Mac safer for children, families, schools, caregivers, seniors, and users with special needs."))
         layout.addWidget(self.family_safety_panel)
         return page
 
@@ -2092,8 +2225,6 @@ class MainWindow(QMainWindow):
         self.nmap_advanced_mode_checkbox.stateChanged.connect(self._toggle_nmap_advanced_mode)
         self.nmap_run_button = QPushButton("Run Scan")
         self.nmap_run_button.clicked.connect(self.run_nmap_local_scan)
-        self.nmap_stop_button = QPushButton("Stop Scan")
-        self.nmap_stop_button.setEnabled(False)
         self.nmap_raw_xml_button = QPushButton("View Raw XML")
         self.nmap_raw_xml_button.clicked.connect(self.view_nmap_raw_xml)
         self.nmap_export_button = QPushButton("Export Results")
@@ -2105,7 +2236,6 @@ class MainWindow(QMainWindow):
         nmap_controls.addWidget(self.nmap_target_input)
         nmap_controls.addWidget(self.nmap_advanced_mode_checkbox)
         nmap_controls.addWidget(self.nmap_run_button)
-        nmap_controls.addWidget(self.nmap_stop_button)
         nmap_controls.addWidget(self.nmap_raw_xml_button)
         nmap_controls.addWidget(self.nmap_export_button)
         self.nmap_results_table = self._make_table(["Protocol", "Port", "State", "Service", "Product", "Version", "Reason", "Confidence"])
@@ -2525,7 +2655,7 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(8, 8, 8, 8)
-        layout.addWidget(self._build_help_header("Apple Exposure Assessment", "apple_exposure"))
+        layout.addWidget(self._build_help_header("Apple Exposure Assessment", "apple_exposure", subtitle="Local Apple exposure assessment based on this Mac, Apple advisories, and exploitation intelligence."))
         layout.addWidget(self.cve_radar_panel)
         return page
 
@@ -2585,6 +2715,10 @@ class MainWindow(QMainWindow):
         self.framework_csf_table = self._make_table(["NIST CSF Function", "Mapped Checks"])
         self.framework_mitre_table = self._make_table(["MITRE ATT&CK macOS Tactic", "Mapped Checks"])
         self.framework_controls_table = self._make_table(["NIST SP 800-53 Control", "Mapped Checks"])
+        self.framework_cmmc_summary_table = self._make_table(["CMMC Readiness Metric", "Value"])
+        self.framework_cmmc_domain_table = self._make_table(["Domain", "Requirements", "Mapped", "Evidence Collected", "Missing Evidence", "Manual Review", "Status"])
+        self.framework_cmmc_evidence_table = self._make_table(["CMMC Requirement", "MSAA Check", "Evidence Status", "Suggested Fix"])
+        self.framework_cmmc_sources_table = self._make_table(["Framework", "Official Source", "Version"])
         self.framework_unmapped_table = self._make_table(["Rule ID", "Title", "Category"])
         self.framework_confidence_table = self._make_table(["Mapping Confidence", "Count"])
         layout.addWidget(heading)
@@ -2595,6 +2729,14 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.framework_mitre_table)
         layout.addWidget(QLabel("NIST SP 800-53 Mapped Controls"))
         layout.addWidget(self.framework_controls_table)
+        layout.addWidget(QLabel("CMMC Readiness"))
+        layout.addWidget(self.framework_cmmc_summary_table)
+        layout.addWidget(QLabel("CMMC Domain Coverage"))
+        layout.addWidget(self.framework_cmmc_domain_table)
+        layout.addWidget(QLabel("CMMC Evidence Matrix"))
+        layout.addWidget(self.framework_cmmc_evidence_table)
+        layout.addWidget(QLabel("Official Source Versions"))
+        layout.addWidget(self.framework_cmmc_sources_table)
         layout.addWidget(QLabel("Checks Without Mappings"))
         layout.addWidget(self.framework_unmapped_table)
         layout.addWidget(QLabel("Mapping Confidence"))
@@ -2630,14 +2772,65 @@ class MainWindow(QMainWindow):
             self.framework_confidence_table,
             [[name, str(count)] for name, count in summary.get("mapping_confidence", {}).items()] or [["No mappings", "0"]],
         )
+        cmmc = build_cmmc_readiness(target_level=2).to_dict()
+        self._populate_table(
+            self.framework_cmmc_summary_table,
+            [
+                ["Target Level", str(cmmc.get("target_level", ""))],
+                ["Scope", str(cmmc.get("scope_name", ""))],
+                ["Readiness Score", f"{cmmc.get('readiness_score', 0)}%"],
+                ["Total Requirements", str(cmmc.get("total_requirements", 0))],
+                ["Mapped by MSAA", str(cmmc.get("mapped_requirements", 0))],
+                ["Evidence Missing", str(cmmc.get("evidence_missing_count", 0))],
+                ["Disclaimer", str(cmmc.get("disclaimer", ""))],
+            ],
+        )
+        self._populate_table(
+            self.framework_cmmc_domain_table,
+            [
+                [
+                    str(item.get("domain", "")),
+                    str(item.get("requirements", "")),
+                    str(item.get("mapped", "")),
+                    str(item.get("evidence_collected", "")),
+                    str(item.get("missing_evidence", "")),
+                    str(item.get("manual_review_required", "")),
+                    str(item.get("status", "")),
+                ]
+                for item in cmmc.get("domain_summaries", [])
+            ]
+            or [["No domains", "0", "0", "0", "0", "0", ""]],
+        )
+        self._populate_table(
+            self.framework_cmmc_evidence_table,
+            [
+                [
+                    str(item.get("requirement_id", "")),
+                    str(item.get("source_check_id", "")),
+                    str(item.get("evidence_status", "")),
+                    str(item.get("recommended_fix", "")),
+                ]
+                for item in cmmc.get("evidence_items", [])[:100]
+            ]
+            or [["No evidence rows", "", "", ""]],
+        )
+        self._populate_table(
+            self.framework_cmmc_sources_table,
+            [
+                [str(item.get("framework", "")), str(item.get("title", "")), str(item.get("version", ""))]
+                for item in cmmc.get("source_versions", [])[:50]
+            ]
+            or [["No sources", "", ""]],
+        )
 
     def _build_settings_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(8, 8, 8, 8)
-        layout.addWidget(self._build_help_header("Operational Health", "operational_health"))
+        layout.setSpacing(12)
+        layout.addWidget(self._build_help_header("Settings", "settings", subtitle="Review monitor settings, alert behavior, runtime health, integrity checks, and repairable MSAA configuration issues."))
         layout.addWidget(self.operational_health_panel)
-        layout.addWidget(self._build_help_header("Monitor Settings", "settings"))
+        layout.addWidget(SectionHeader("Monitor Settings", "Configure local monitoring, alert delivery, physical/session signals, network monitoring, and diagnostic controls.", parent=self))
         layout.addWidget(self.background_monitor_panel)
         return page
 
@@ -2804,15 +2997,6 @@ class MainWindow(QMainWindow):
         self.selected_finding_hint_label.setStyleSheet("color: #9DB0C9;")
         layout.addWidget(self.selected_finding_hint_label)
         layout.addWidget(self.review_actions_frame)
-        layout.addSpacing(14)
-        support_heading = QLabel("Support the author")
-        support_heading.setStyleSheet("font-weight: 700;")
-        support_heading.setWordWrap(True)
-        layout.addWidget(support_heading)
-        support_hint = QLabel("Simple support for the work behind the app.")
-        support_hint.setWordWrap(True)
-        layout.addWidget(support_hint)
-        layout.addWidget(self._build_support_section())
         layout.addStretch(1)
         self._clear_selected_finding_panel()
         return panel
@@ -4935,14 +5119,17 @@ class MainWindow(QMainWindow):
     ) -> None:
         if not hasattr(self, "cve_radar_panel"):
             return
+        self._persist_apple_exposure_freshness("attempt", {"manual": manual, "force": force, "initial_load": initial_load})
         if initial_load and not manual and not force and not self.config.auto_update_apple_security_forecast:
             LOGGER.info("Apple Exposure Assessment initial load from cache only")
             cached = self.cve_radar_engine.load_cached_state()
+            self._persist_apple_exposure_freshness("cache", cached)
             self._apply_cve_radar_payload(cached)
             self.statusBar().showMessage("Apple Exposure Assessment loaded from cache", 3000)
             return
         if not manual and not force and not self.config.auto_update_apple_security_forecast:
             cached = self.cve_radar_engine.load_cached_state()
+            self._persist_apple_exposure_freshness("cache", cached)
             self._apply_cve_radar_payload(cached)
             self.cve_radar_panel.set_status(str(cached.get("state_text", "Assessment not checked yet")))
             return
@@ -4955,6 +5142,7 @@ class MainWindow(QMainWindow):
             )
         except Exception as exc:
             LOGGER.exception("Failed to refresh Apple Exposure Assessment: %s", exc)
+            self._persist_apple_exposure_freshness("failed", {"last_error": str(exc)})
             self.statusBar().showMessage("Apple Exposure Assessment update failed", 5000)
             cached = self.cve_radar_engine.load_cached_state()
             if not cached.get("timestamp") and not cached.get("display_cards"):
@@ -4966,6 +5154,7 @@ class MainWindow(QMainWindow):
             self._apply_cve_radar_payload(cached)
             self.cve_radar_panel.set_status(str(cached.get("state_text", "Unable to update forecast — using cache")))
             return
+        self._persist_apple_exposure_freshness("success", radar_payload)
         self._apply_cve_radar_payload(radar_payload)
         LOGGER.info(
             "Apple Exposure Assessment rendered state=%s cards=%d",
@@ -4973,6 +5162,45 @@ class MainWindow(QMainWindow):
             len(radar_payload.get("display_cards", radar_payload.get("cards", []))),
         )
         self.statusBar().showMessage("Apple Exposure Assessment updated", 3000)
+
+    def _persist_apple_exposure_freshness(self, state: str, payload: dict | None = None) -> None:
+        if not hasattr(self, "db"):
+            return
+        payload = payload or {}
+        now = utc_now_iso()
+        try:
+            if state == "attempt":
+                self.db.set_background_monitor_state("apple_exposure_last_check_attempt_at", now)
+                self.db.set_background_monitor_state("last_check_attempt_at", now)
+                self.db.set_background_monitor_state("apple_exposure_update_status", "checking")
+                self.db.set_background_monitor_state("update_status", "checking")
+                self.db.set_background_monitor_state("apple_exposure_last_error", "")
+                return
+            cards = payload.get("display_cards", payload.get("cards", []))
+            record_count = len(cards) if isinstance(cards, list) else int(payload.get("record_count", 0) or 0)
+            catalog_status = str(payload.get("catalog_update_status", payload.get("source", state)) or state)
+            cache_used = catalog_status in {"cached", "offline-cache", "offline-rules"} or state == "cache"
+            self.db.set_background_monitor_state("apple_exposure_cache_used", "1" if cache_used else "0")
+            self.db.set_background_monitor_state("cache_used", "1" if cache_used else "0")
+            self.db.set_background_monitor_state("apple_exposure_update_status", catalog_status)
+            self.db.set_background_monitor_state("update_status", catalog_status)
+            self.db.set_background_monitor_state("apple_exposure_record_count", str(record_count))
+            self.db.set_background_monitor_state("record_count", str(record_count))
+            self.db.set_background_monitor_state("apple_exposure_last_error", str(payload.get("last_error", "")))
+            if state in {"success", "cache"}:
+                generated_at = str(payload.get("generated_at", payload.get("timestamp", now)) or now)
+                self.db.set_background_monitor_state("apple_exposure_last_successful_update_at", generated_at)
+                self.db.set_background_monitor_state("last_check_success_at", generated_at)
+                self.db.set_background_monitor_state("cve_radar_last_refresh_at", generated_at)
+                if catalog_status == "updated":
+                    self.db.set_background_monitor_state("apple_exposure_last_database_update_at", generated_at)
+                    self.db.set_background_monitor_state("last_database_update_at", generated_at)
+                self.db.set_background_monitor_state("last_source_download_at", generated_at if catalog_status == "updated" else "")
+            elif state == "failed":
+                self.db.set_background_monitor_state("apple_exposure_update_status", "failed")
+                self.db.set_background_monitor_state("apple_exposure_last_error", str(payload.get("last_error", "Apple Exposure refresh failed.")))
+        except Exception as exc:
+            LOGGER.warning("Failed to persist Apple Exposure freshness metadata: %s", exc)
 
     def refresh_cve_radar(self, manual: bool = False, force: bool = False) -> None:
         self.refresh_apple_security_forecast(manual=manual, force=force)
@@ -5241,6 +5469,7 @@ class MainWindow(QMainWindow):
             "monitoring_coverage": "Framework Coverage",
             "reports": "Results",
             "settings": "Settings",
+            "support_author": "Support the Author",
         }
         title = view_map.get(view_id)
         if not title:

@@ -11,6 +11,8 @@ from typing import Any
 from uuid import uuid4
 
 from mac_audit_agent.frameworks import framework_summary_for_findings
+from mac_audit_agent.frameworks.cmmc import build_cmmc_readiness
+from mac_audit_agent.frameworks.poam import poam_from_cmmc_readiness
 from mac_audit_agent.models import BackgroundMonitorEvent, BackgroundMonitorStatus, ScanResult, utc_now_iso
 from mac_audit_agent.reporting import get_reports_dir
 from mac_audit_agent.storage import json_safe
@@ -41,6 +43,7 @@ class SecurityAssessment:
     framework_summary: dict[str, Any] = field(default_factory=dict)
     mitre_summary: dict[str, Any] = field(default_factory=dict)
     nist_summary: dict[str, Any] = field(default_factory=dict)
+    cmmc_readiness: dict[str, Any] = field(default_factory=dict)
     apple_exposure_summary: dict[str, Any] = field(default_factory=dict)
     monitor_integrity_summary: dict[str, Any] = field(default_factory=dict)
     baseline_drift_summary: dict[str, Any] = field(default_factory=dict)
@@ -421,6 +424,24 @@ def build_security_assessment(
     severities = [str(item.get("severity", "info")).lower() for item in risks]
     risk_level = _risk_level(score, severities)
     framework_summary = framework_summary_for_findings([*findings, *persistence_findings]) if [*findings, *persistence_findings] else {}
+    completed_checks: set[str] = set()
+    if apple:
+        completed_checks.add("scan.apple_exposure")
+    if visibility:
+        completed_checks.add("scan.visibility_integrity")
+    if reliable:
+        completed_checks.add("daemon.heartbeat")
+    if persistence_payload:
+        completed_checks.add("persistence.workflow")
+    if physical_devices:
+        completed_checks.add("scan.physical_devices")
+    if events:
+        completed_checks.add("alert.delivery_trace")
+    if scan_result is not None:
+        completed_checks.update({"core.assessment_builder", "scan.baseline_drift"})
+        artifacts = scan_result.collected_artifacts if isinstance(scan_result.collected_artifacts, dict) else {}
+        if artifacts.get("network_intelligence") or artifacts.get("ports"):
+            completed_checks.update({"network_intelligence.collectors", "network_intelligence.reports"})
     hostname = scan_result.hostname if scan_result is not None else socket.gethostname()
     macos_version = platform.mac_ver()[0] or platform.platform()
     summary = _executive_summary(status, score, risk_level, groups, limitations)
@@ -449,6 +470,7 @@ def build_security_assessment(
             "mapped_to_nist_csf_2_0": framework_summary.get("nist_csf", {}),
             "aligned_with_nist_800_53": framework_summary.get("nist_800_53_controls", {}),
         },
+        cmmc_readiness=build_cmmc_readiness(target_level=2, completed_check_ids=completed_checks).to_dict(),
         apple_exposure_summary=apple or {"status": "unavailable", "summary": "Not collected"},
         monitor_integrity_summary=_monitor_summary(monitor, visibility, reliable),
         baseline_drift_summary=_baseline_summary(baseline),
@@ -568,6 +590,42 @@ def export_security_assessment_html(assessment: SecurityAssessment, output_path:
         for a in assessment.recommended_actions
     ) or "<li>No actions recorded.</li>"
     limitations = "".join(f"<li>{html.escape(item)}</li>" for item in assessment.limitations) or "<li>None recorded.</li>"
+    completed_checks = set()
+    if assessment.apple_exposure_summary:
+        completed_checks.add("scan.apple_exposure")
+    if assessment.network_activity_summary:
+        completed_checks.update({"network_intelligence.collectors", "network_intelligence.reports"})
+    if assessment.admin_persistence_summary:
+        completed_checks.add("persistence.workflow")
+    if assessment.physical_device_summary:
+        completed_checks.add("scan.physical_devices")
+    if assessment.monitor_integrity_summary:
+        completed_checks.update({"scan.visibility_integrity", "daemon.heartbeat"})
+    cmmc = assessment.cmmc_readiness or build_cmmc_readiness(target_level=2, completed_check_ids=completed_checks).to_dict()
+    cmmc_summary_rows = "".join(
+        f"<tr><td>{html.escape(label)}</td><td>{html.escape(str(value))}</td></tr>"
+        for label, value in [
+            ("Target Level", cmmc.get("target_level", "")),
+            ("Scope", cmmc.get("scope_name", "")),
+            ("Readiness Score", f"{cmmc.get('readiness_score', 0)}%"),
+            ("Total Requirements", cmmc.get("total_requirements", 0)),
+            ("Mapped by MSAA", cmmc.get("mapped_requirements", 0)),
+            ("Evidence Missing", cmmc.get("evidence_missing_count", 0)),
+            ("Manual Review Required", sum(1 for item in cmmc.get("evidence_items", []) if item.get("evidence_status") == "manual_review_required")),
+        ]
+    )
+    evidence_rows = "".join(
+        f"<tr><td>{html.escape(str(item.get('requirement_id', '')))}</td><td>{html.escape(str(item.get('source_check_id', '')))}</td><td>{html.escape(str(item.get('evidence_status', '')))}</td><td>{html.escape(str(item.get('recommended_fix', '')))}</td></tr>"
+        for item in cmmc.get("evidence_items", [])[:100]
+    ) or '<tr><td colspan="4">No CMMC evidence rows generated.</td></tr>'
+    poam_rows = "".join(
+        f"<tr><td>{html.escape(str(item.get('requirement_id', '')))}</td><td>{html.escape(str(item.get('weakness', '')))}</td><td>{html.escape(str(item.get('risk_level', '')))}</td><td>{html.escape(str(item.get('recommended_fix', '')))}</td></tr>"
+        for item in [poam.to_dict() for poam in poam_from_cmmc_readiness(cmmc)][:100]
+    ) or '<tr><td colspan="4">No CMMC POA&amp;M rows generated.</td></tr>'
+    source_rows = "".join(
+        f"<tr><td>{html.escape(str(item.get('framework', '')))}</td><td>{html.escape(str(item.get('title', '')))}</td><td>{html.escape(str(item.get('version', '')))}</td><td>{html.escape(str(item.get('source_url', '')))}</td></tr>"
+        for item in cmmc.get("source_versions", [])[:50]
+    )
     html_text = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>MSAA Security Assessment</title>
 <style>body{{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;margin:32px;line-height:1.45}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:8px;text-align:left}}.risk{{font-size:22px;font-weight:700}}</style></head>
@@ -578,6 +636,10 @@ def export_security_assessment_html(assessment: SecurityAssessment, output_path:
 <h2>Executive Summary</h2><p>{html.escape(assessment.executive_summary)}</p>
 <h2>Top Risks</h2><table><thead><tr><th>Severity</th><th>Title</th><th>Category</th><th>Recommended Action</th></tr></thead><tbody>{rows}</tbody></table>
 <h2>Framework Alignment</h2><p>Mapped to / aligned with frameworks for analyst context only. This is not a certification or authorization claim.</p><pre>{html.escape(json.dumps(assessment.framework_summary, indent=2, sort_keys=True))}</pre>
+<h2>CMMC Readiness Summary</h2><p>{html.escape(str(cmmc.get('disclaimer', 'MSAA provides CMMC/NIST readiness mapping and evidence support for analyst review.')))}</p><table><tbody>{cmmc_summary_rows}</tbody></table>
+<h2>CMMC/NIST Evidence Matrix</h2><table><thead><tr><th>CMMC Requirement</th><th>MSAA Check</th><th>Evidence Status</th><th>Suggested Fix</th></tr></thead><tbody>{evidence_rows}</tbody></table>
+<h2>POA&amp;M / Remediation</h2><table><thead><tr><th>Requirement</th><th>Weakness</th><th>Risk</th><th>Recommended Fix</th></tr></thead><tbody>{poam_rows}</tbody></table>
+<h2>Source Versions</h2><table><thead><tr><th>Framework</th><th>Source</th><th>Version</th><th>URL</th></tr></thead><tbody>{source_rows}</tbody></table>
 <h2>Recommended Next Actions</h2><ul>{actions}</ul>
 <h2>Limitations</h2><ul>{limitations}</ul>
 <h2>Diagnostics</h2><pre>{html.escape(json.dumps(assessment.diagnostics, indent=2, sort_keys=True))}</pre>

@@ -154,7 +154,65 @@ def _add_summary_section(doc, title: str, rows: list[dict[str, Any]]) -> None:
         if item.get("verification_steps"):
             doc.add_paragraph(f"Verification steps: {item.get('verification_steps')}")
         if item.get("official_references"):
-            doc.add_paragraph(f"Official references: {item.get('official_references')}")
+                doc.add_paragraph(f"Official references: {item.get('official_references')}")
+
+
+def _add_cmmc_readiness_section(doc, data: ExportAssessmentData) -> None:
+    _add_heading(doc, "CMMC / NIST Readiness", 1)
+    summary = data.cmmc_summary or {}
+    doc.add_paragraph(str(summary.get("disclaimer", "MSAA provides CMMC/NIST readiness mapping and evidence support for analyst review.")))
+    _add_key_value_table(
+        doc,
+        [
+            ("Target Level", summary.get("target_level", "")),
+            ("Scope", summary.get("scope_name", "")),
+            ("Readiness Score", f"{summary.get('readiness_score', 0)}%"),
+            ("Total Requirements", summary.get("total_requirements", 0)),
+            ("Mapped by MSAA", summary.get("mapped_requirements", 0)),
+            ("Evidence Missing", summary.get("evidence_missing_count", 0)),
+            ("Manual Review Required", sum(1 for item in data.cmmc_evidence_matrix if item.get("evidence_status") == "manual_review_required")),
+        ],
+    )
+
+    _add_heading(doc, "CMMC Evidence Matrix", 2)
+    if data.cmmc_evidence_matrix:
+        table = doc.add_table(rows=1, cols=6)
+        table.style = "Table Grid"
+        for idx, header in enumerate(["Level", "Requirement", "Domain", "NIST", "MSAA Check", "Evidence Status"]):
+            table.rows[0].cells[idx].text = header
+        for item in data.cmmc_evidence_matrix[:100]:
+            cells = table.add_row().cells
+            cells[0].text = str(item.get("cmmc_level", ""))
+            cells[1].text = str(item.get("cmmc_requirement_id", ""))
+            cells[2].text = str(item.get("domain", ""))
+            cells[3].text = str(item.get("related_nist_control", ""))
+            cells[4].text = str(item.get("msaa_check", ""))
+            cells[5].text = str(item.get("evidence_status", ""))
+    else:
+        doc.add_paragraph("No CMMC evidence matrix rows were generated.")
+
+    _add_heading(doc, "POA&M / Remediation", 2)
+    if data.cmmc_poam:
+        table = doc.add_table(rows=1, cols=5)
+        table.style = "Table Grid"
+        for idx, header in enumerate(["Requirement", "Weakness", "Risk", "Recommended Fix", "Evidence Needed"]):
+            table.rows[0].cells[idx].text = header
+        for item in data.cmmc_poam[:100]:
+            cells = table.add_row().cells
+            cells[0].text = str(item.get("requirement_id", ""))
+            cells[1].text = str(item.get("weakness", ""))
+            cells[2].text = str(item.get("risk_level", ""))
+            cells[3].text = str(item.get("recommended_fix", ""))
+            cells[4].text = str(item.get("evidence_needed", ""))
+    else:
+        doc.add_paragraph("No CMMC POA&M items were generated.")
+
+    _add_heading(doc, "Official Source Versions", 2)
+    for source in data.cmmc_source_versions[:25]:
+        doc.add_paragraph(
+            f"{source.get('framework', '')}: {source.get('title', '')} "
+            f"({source.get('version', '')}) - {source.get('source_url', '')}"
+        )
 
 
 def _build_document(data: ExportAssessmentData):
@@ -254,6 +312,8 @@ def _build_document(data: ExportAssessmentData):
             cells[4].text = str(item.get("notes", ""))
     else:
         doc.add_paragraph("No framework mappings were available.")
+
+    _add_cmmc_readiness_section(doc, data)
 
     _add_heading(doc, "Appendix", 1)
     doc.add_paragraph("Limitations")

@@ -1076,7 +1076,33 @@ class AppleSecurityForecastEngine:
         self.auto_update_enabled = bool(getattr(self.config, "auto_update_apple_security_forecast", False))
         self._last_diagnostics: dict[str, int] = {}
 
+    def _persist_freshness_metadata(self, state: str, payload: dict[str, Any] | None = None) -> None:
+        payload = payload or {}
+        now = utc_now_iso()
+        try:
+            self.db.set_background_monitor_state("apple_exposure_last_check_attempt_at", now)
+            cards = payload.get("display_cards", payload.get("cards", []))
+            record_count = len(cards) if isinstance(cards, list) else int(payload.get("record_count", 0) or 0)
+            catalog_status = str(payload.get("catalog_update_status", payload.get("source", state)) or state)
+            cache_used = catalog_status in {"cached", "offline-cache", "offline-rules"} or state == "cache"
+            self.db.set_background_monitor_state("apple_exposure_cache_used", "1" if cache_used else "0")
+            self.db.set_background_monitor_state("apple_exposure_update_status", catalog_status)
+            self.db.set_background_monitor_state("apple_exposure_record_count", str(record_count))
+            self.db.set_background_monitor_state("apple_exposure_last_error", str(payload.get("last_error", "")))
+            generated_at = str(payload.get("generated_at", payload.get("timestamp", "")) or "")
+            if state in {"success", "cache"} and generated_at:
+                self.db.set_background_monitor_state("apple_exposure_last_successful_update_at", generated_at)
+                self.db.set_background_monitor_state("cve_radar_last_refresh_at", generated_at)
+                if catalog_status == "updated":
+                    self.db.set_background_monitor_state("apple_exposure_last_database_update_at", generated_at)
+                    self.db.set_background_monitor_state("apple_exposure_last_source_download_at", generated_at)
+            elif state == "failed":
+                self.db.set_background_monitor_state("apple_exposure_update_status", "failed")
+        except Exception as exc:
+            LOGGER.warning("Failed to persist Apple Exposure freshness metadata: %s", exc)
+
     def load_cached_state(self, *, limit: int = 200) -> dict[str, Any]:
+        self._persist_freshness_metadata("attempt", {})
         forecast = self.db.latest_apple_security_forecast()
         cards = _normalize_card_list(self.db.list_apple_security_forecast_cards(limit=limit))
         forecast_payload = forecast.get("payload_json", {}) if forecast else {}
@@ -1107,7 +1133,7 @@ class AppleSecurityForecastEngine:
             len(display_cards),
             state_text,
         )
-        return {
+        payload = {
             "timestamp": forecast.get("generated_at", "") if forecast else legacy.get("updated_at", "") if legacy else "",
             "catalog_update_status": forecast_payload.get("catalog_update_status", "cached") if forecast else legacy_payload.get("catalog_update_status", legacy.get("source", "cached") if legacy else "cached"),
             "sources_used": forecast_payload.get("sources_used", []) if forecast else legacy_payload.get("sources_used", []),
@@ -1134,6 +1160,8 @@ class AppleSecurityForecastEngine:
             "last_successful_update_at": str(forecast.get("generated_at", "") if forecast else legacy.get("updated_at", "") if legacy else ""),
             "card_count": len(cards),
         }
+        self._persist_freshness_metadata("cache", payload)
+        return payload
 
     def _state_and_explanation(self, payload: dict[str, Any], cards: list[dict[str, Any]]) -> tuple[str, str]:
         if not payload and not cards:
@@ -1184,11 +1212,18 @@ class AppleSecurityForecastEngine:
         force: bool = False,
     ) -> dict[str, Any]:
         LOGGER.info("Apple Exposure Assessment update requested manual=%s force=%s", manual, force)
-        forecast = self.generate_forecast(current_scan_result=current_scan_result, manual=manual, force=force)
-        self.db.record_apple_security_forecast(forecast.to_dict())
-        self.db.record_apple_security_forecast_cards([_card_payload(card) for card in forecast.cards])
-        LOGGER.info("Apple Exposure Assessment stored forecast_id=%s cards=%d level=%s simulated=%s", forecast.forecast_id, len(forecast.cards), forecast.level, forecast.simulated)
-        return forecast.to_dict()
+        self._persist_freshness_metadata("attempt", {"manual": manual, "force": force})
+        try:
+            forecast = self.generate_forecast(current_scan_result=current_scan_result, manual=manual, force=force)
+            payload = forecast.to_dict()
+            self.db.record_apple_security_forecast(payload)
+            self.db.record_apple_security_forecast_cards([_card_payload(card) for card in forecast.cards])
+            self._persist_freshness_metadata("success", payload)
+            LOGGER.info("Apple Exposure Assessment stored forecast_id=%s cards=%d level=%s simulated=%s", forecast.forecast_id, len(forecast.cards), forecast.level, forecast.simulated)
+            return payload
+        except Exception as exc:
+            self._persist_freshness_metadata("failed", {"last_error": str(exc)})
+            raise
 
     def generate_forecast(
         self,

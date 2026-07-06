@@ -4713,6 +4713,8 @@ def test_repair_action_attempts_bootout_bootstrap_kickstart(tmp_path: Path, monk
     calls = []
     states = iter(["", "2026-04-25T00:00:05+00:00"])
     monkeypatch.setattr(panel.service, "stop_orphan_processes", lambda: [9001])
+    monkeypatch.setattr(panel, "_detector_manager", lambda: panel.launch_agent)
+    panel._repair_monitor_wait_seconds = 0
     monkeypatch.setattr(
         panel.launch_agent,
         "repair",
@@ -4722,8 +4724,11 @@ def test_repair_action_attempts_bootout_bootstrap_kickstart(tmp_path: Path, monk
     monkeypatch.setattr(panel.db, "get_background_monitor_status", lambda: type("Status", (), {"detector_last_run_timestamp": next(states, "2026-04-25T00:00:05+00:00")})())
     monkeypatch.setattr(panel, "refresh", lambda: None)
     monkeypatch.setattr("mac_audit_agent.ui.background_monitor_panel.QMessageBox.information", lambda *args, **kwargs: None)
+    warnings = []
+    monkeypatch.setattr("mac_audit_agent.ui.background_monitor_panel.QMessageBox.warning", lambda *args, **kwargs: warnings.append(args))
     panel.repair_monitor()
     assert calls == ["bootout/bootstrap/kickstart"]
+    assert warnings == []
     assert app is not None
 
 

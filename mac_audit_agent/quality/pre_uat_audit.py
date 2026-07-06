@@ -16,6 +16,7 @@ from mac_audit_agent.quality.export_auditor import run_export_audit
 from mac_audit_agent.quality.functional_registry import build_registry
 from mac_audit_agent.quality.scan_auditor import run_scan_audit
 from mac_audit_agent.quality.settings_auditor import run_settings_audit
+from mac_audit_agent.quality.ui_header_auditor import run_ui_header_audit
 from mac_audit_agent.quality.ui_control_auditor import run_ui_control_audit
 from mac_audit_agent.quality.notifier_auditor import run_notifier_audit
 from mac_audit_agent.quality.network_intelligence_auditor import run_network_intelligence_audit
@@ -24,6 +25,7 @@ from mac_audit_agent.quality.report_auditor import run_report_audit
 from mac_audit_agent.quality.data_freshness_auditor import run_freshness_audit
 from mac_audit_agent.quality.release_readiness import run_release_audit
 from mac_audit_agent.quality.check_models import PreUATAuditResult
+from mac_audit_agent.quality.cmmc_auditor import run_cmmc_audit
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reports", action="store_true", help="Run report audit.")
     parser.add_argument("--notifier", action="store_true", help="Run notifier audit.")
     parser.add_argument("--freshness", action="store_true", help="Run data freshness audit.")
+    parser.add_argument("--frameworks", action="store_true", help="Run CMMC/NIST framework readiness audit.")
     parser.add_argument("--release", action="store_true", help="Run release readiness audit.")
     parser.add_argument("--ui", action="store_true", help="Run UI control audit.")
     parser.add_argument("--scans", action="store_true", help="Run scan/framework/freshness audit.")
@@ -47,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=None, help="Report output directory.")
     parser.add_argument("--run-safe-scan", action="store_true", help="Allow a safe non-destructive scan if no latest scan is available.")
     parser.add_argument("--allow-alert-render", action="store_true", help="Attempt real visible alert render. Use only in logged-in GUI session.")
+    parser.add_argument("--interactive", action="store_true", help="Alias for --allow-alert-render when running alert verification from a logged-in GUI session.")
     return parser
 
 
@@ -56,41 +60,46 @@ def run_pre_uat_audit(context: AuditContext) -> AuditReport:
         selected = _selected_modes(context.mode)
         if "registry" in selected:
             for check in build_registry():
-                report.add(check.skipped("Registry entry declared; covered by specialized auditor or pending deeper automation.", "Implement a concrete behavior probe if this remains skipped."))
+                _add_unique_check(report, check.skipped("Registry entry declared; covered by specialized auditor or pending deeper automation.", "Implement a concrete behavior probe if this remains skipped."))
         if "settings" in selected:
             for check in run_settings_audit(context):
-                report.add(check)
+                _add_unique_check(report, check)
         if "daemon" in selected:
             for check in run_daemon_audit(context):
-                report.add(check)
+                _add_unique_check(report, check)
         if "notifier" in selected:
             for check in run_notifier_audit(context):
-                report.add(check)
+                _add_unique_check(report, check)
         if "alerts" in selected:
             for check in run_alert_audit(context):
-                report.add(check)
+                _add_unique_check(report, check)
         if "exports" in selected:
             for check in run_export_audit(context):
-                report.add(check)
+                _add_unique_check(report, check)
         if "reports" in selected:
             for check in run_report_audit(context):
-                report.add(check)
+                _add_unique_check(report, check)
         if "scans" in selected:
             for check in run_scan_audit(context):
-                report.add(check)
+                _add_unique_check(report, check)
             for check in run_network_intelligence_audit(context):
-                report.add(check)
+                _add_unique_check(report, check)
             for check in run_persistence_audit(context):
-                report.add(check)
+                _add_unique_check(report, check)
         if "ui" in selected:
+            for check in run_ui_header_audit(context):
+                _add_unique_check(report, check)
             for check in run_ui_control_audit(context):
-                report.add(check)
+                _add_unique_check(report, check)
         if "freshness" in selected:
             for check in run_freshness_audit(context):
-                report.add(check)
+                _add_unique_check(report, check)
+        if "frameworks" in selected:
+            for check in run_cmmc_audit(context):
+                _add_unique_check(report, check)
         if "release" in selected:
             for check in run_release_audit(context):
-                report.add(check)
+                _add_unique_check(report, check)
     except Exception as exc:
         report.crashed = True
         report.crash_error = str(exc)
@@ -100,9 +109,25 @@ def run_pre_uat_audit(context: AuditContext) -> AuditReport:
     return report
 
 
+def _add_unique_check(report: AuditReport, check) -> None:
+    existing_by_id = {item.check_id: index for index, item in enumerate(report.checks)}
+    if check.check_id not in existing_by_id:
+        report.add(check)
+        return
+    existing = report.checks[existing_by_id[check.check_id]]
+    rank = {"PASS": 0, "SKIPPED": 1, "WARN": 2, "FAIL": 3, "BLOCKER": 4}
+    if rank.get(check.status, 0) > rank.get(existing.status, 0):
+        existing.status = check.status
+        existing.actual_result = check.actual_result
+        existing.recommended_fix = check.recommended_fix
+        existing.failure_stage = check.failure_stage
+    existing.evidence.update({f"duplicate_{len(existing.evidence)}": check.evidence} if check.evidence and check.evidence != existing.evidence else {})
+    existing.evidence["duplicate_merged"] = True
+
+
 def _selected_modes(mode: str) -> set[str]:
     if mode == "full":
-        return {"settings", "daemon", "notifier", "alerts", "exports", "reports", "scans", "ui", "freshness", "release"}
+        return {"settings", "daemon", "notifier", "alerts", "exports", "reports", "scans", "ui", "freshness", "frameworks", "release"}
     return {mode}
 
 
@@ -124,7 +149,7 @@ def exit_code_for(report: AuditReport, *, fail_on_blocker: bool = False) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     mode = "full"
-    for candidate in ["settings", "alerts", "daemon", "notifier", "exports", "reports", "ui", "scans", "freshness", "release"]:
+    for candidate in ["settings", "alerts", "daemon", "notifier", "exports", "reports", "ui", "scans", "freshness", "frameworks", "release"]:
         if getattr(args, candidate):
             mode = candidate
             break
@@ -134,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
         db_path=args.db.expanduser(),
         output_dir=(args.output_dir.expanduser() if args.output_dir else default_output_dir()),
         mode=mode,
-        allow_alert_render=bool(args.allow_alert_render),
+        allow_alert_render=bool(args.allow_alert_render or args.interactive),
         allow_safe_scan=bool(args.run_safe_scan),
         fail_on_blocker=bool(args.fail_on_blocker),
     )

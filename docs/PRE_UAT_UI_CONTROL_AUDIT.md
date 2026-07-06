@@ -102,7 +102,7 @@
 | PASS | QPushButton | Apply Settings | True | False | True | Background Monitor |
 | PASS | QPushButton | Apply and Restart Monitor | True | False | True | Background Monitor |
 | PASS | QPushButton | Reinstall Monitor With Current Settings | True | False | True | Background Monitor |
-| PASS | QPushButton | Repair Settings Mismatch | True | False | True | Background Monitor |
+| PASS | QPushButton | Repair Settings Sync | False | False | True | Background Monitor |
 | PASS | QPushButton | Preview Alert Styles | True | True | True | Background Monitor |
 | PASS | QPushButton | Reset to Defaults | True | False | True | Background Monitor |
 | PASS | QComboBox | combo box | True | False | True | Background Monitor |

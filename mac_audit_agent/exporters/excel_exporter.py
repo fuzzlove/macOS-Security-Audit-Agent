@@ -126,6 +126,25 @@ def _build_workbook(data: ExportAssessmentData):
     _write_sheet(wb, "Admin Persistence", ["finding_id", "severity", "type", "path_user", "owner", "permissions", "signed_status", "first_seen", "baseline_status", "evidence", "suggested_fix"], _rows_from_dicts(data.admin_persistence, ["finding_id", "severity", "type", "path_user", "owner", "permissions", "signed_status", "first_seen", "baseline_status", "evidence", "suggested_fix"]))
     _write_sheet(wb, "Physical Devices", ["device_id", "severity", "device_type", "name", "manufacturer", "vendor_id", "product_id", "serial_present", "trust_status", "first_seen", "last_seen", "suggested_fix"], _rows_from_dicts(data.physical_devices, ["device_id", "severity", "device_type", "name", "manufacturer", "vendor_id", "product_id", "serial_present", "trust_status", "first_seen", "last_seen", "suggested_fix"]))
     _write_sheet(wb, "Framework Mapping", ["finding_id", "framework", "control_id", "name", "category", "mapping_confidence", "notes"], _rows_from_dicts(data.framework_mappings, ["finding_id", "framework", "control_id", "name", "category", "mapping_confidence", "notes"]), severity_column="")
+    cmmc_summary_rows = [[key, value] for key, value in (data.cmmc_summary or {}).items() if not isinstance(value, (list, dict))]
+    _write_sheet(wb, "CMMC Summary", ["field", "value"], cmmc_summary_rows or [["status", "No CMMC readiness data generated."]], severity_column="")
+    cmmc_requirement_columns = ["cmmc_id", "level", "domain", "practice_id", "title", "requirement_text", "source_id", "source_version", "implementation_status", "msaa_check_ids", "limitations"]
+    cmmc_requirement_rows = []
+    for item in data.cmmc_requirements:
+        row = dict(item)
+        row["msaa_check_ids"] = ", ".join(str(value) for value in row.get("msaa_check_ids", []))
+        row["limitations"] = "; ".join(str(value) for value in row.get("limitations", []))
+        cmmc_requirement_rows.append(row)
+    _write_sheet(wb, "CMMC Requirements", cmmc_requirement_columns, _rows_from_dicts(cmmc_requirement_rows, cmmc_requirement_columns), severity_column="")
+    evidence_columns = ["cmmc_level", "cmmc_requirement_id", "domain", "requirement_summary", "related_nist_control", "msaa_check", "evidence_collected", "evidence_location", "evidence_status", "manual_evidence_needed", "suggested_fix", "analyst_notes"]
+    _write_sheet(wb, "Evidence Matrix", evidence_columns, _rows_from_dicts(data.cmmc_evidence_matrix, evidence_columns), severity_column="evidence_status")
+    poam_columns = ["poam_id", "framework", "requirement_id", "weakness", "risk_level", "source_finding_id", "recommended_fix", "validation_step", "owner", "target_completion_date", "status", "evidence_needed", "notes"]
+    poam_ws = _write_sheet(wb, "POA&M", poam_columns, _rows_from_dicts(data.cmmc_poam, poam_columns), severity_column="risk_level")
+    _add_status_dropdown(poam_ws, poam_columns, len(data.cmmc_poam))
+    source_columns = ["source_id", "framework", "title", "version", "retrieved_at", "source_url", "normative"]
+    _write_sheet(wb, "Source Versions", source_columns, _rows_from_dicts(data.cmmc_source_versions, source_columns), severity_column="")
+    manual_columns = ["requirement_id", "evidence_needed", "suggested_document_name", "owner", "status", "notes"]
+    _write_sheet(wb, "Manual Evidence", manual_columns, _rows_from_dicts(data.cmmc_manual_evidence, manual_columns), severity_column="status")
     _write_sheet(wb, "Events Timeline", ["timestamp", "severity", "event_type", "source", "summary", "related_finding", "evidence", "suggested_fix"], _rows_from_dicts(data.timeline, ["timestamp", "severity", "event_type", "source", "summary", "related_finding", "evidence", "suggested_fix"]))
     _write_sheet(wb, "Visibility Integrity", ["component", "status", "last_success", "last_error", "evidence", "suggested_fix"], _rows_from_dicts(data.visibility_integrity, ["component", "status", "last_success", "last_error", "evidence", "suggested_fix"]), severity_column="")
     application_integrity_columns = ["scope", "status", "manifest_path", "checked_at", "verified_at", "verification_result_id", "manifest_source_type", "current_install_mode", "manifest_app_version", "current_app_version", "manifest_build_id", "current_build_id", "manifest_git_commit", "current_git_commit", "manifest_package_version", "current_package_version", "manifest_root_path", "current_root_path", "manifest_created_at", "manifest_hash", "cached_result", "cache_valid", "cache_invalidated_reason", "ignored_manifests", "matched_count", "mismatched_count", "missing_count", "extra_count", "relative_path", "mismatch_reasons", "exact_mismatch_reason", "recommended_action"]

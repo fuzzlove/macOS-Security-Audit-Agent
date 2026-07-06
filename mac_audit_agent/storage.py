@@ -981,7 +981,11 @@ class AuditDatabase:
                 overlay_dispatch_at TEXT NOT NULL DEFAULT '',
                 overlay_dispatch_result TEXT NOT NULL DEFAULT '',
                 overlay_error TEXT NOT NULL DEFAULT '',
-                visible_alert_id TEXT NOT NULL DEFAULT ''
+                visible_alert_id TEXT NOT NULL DEFAULT '',
+                direct_render_test INTEGER NOT NULL DEFAULT 0,
+                event_store_error TEXT NOT NULL DEFAULT '',
+                trace_consistency_status TEXT NOT NULL DEFAULT '',
+                render_verification_status TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS notification_capabilities (
                 scope TEXT PRIMARY KEY,
@@ -1217,6 +1221,10 @@ class AuditDatabase:
         self._ensure_column("event_alert_traces", "overlay_error", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("event_alert_traces", "visible_alert_id", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("event_alert_traces", "displayed_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("event_alert_traces", "direct_render_test", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("event_alert_traces", "event_store_error", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("event_alert_traces", "trace_consistency_status", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("event_alert_traces", "render_verification_status", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("notification_capabilities", "updated_at", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("notification_capabilities", "payload_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_column("alert_delivery_records", "alert_type", "TEXT NOT NULL DEFAULT ''")
@@ -2802,13 +2810,16 @@ class AuditDatabase:
         )
         self.conn.commit()
 
-    def record_monitor_heartbeat(self, timestamp: str) -> None:
+    def record_monitor_heartbeat(self, timestamp: str, status: dict | None = None) -> None:
+        status_json = json.dumps(status or {}, sort_keys=True)
         self.conn.execute(
             "INSERT INTO background_monitor_heartbeats (timestamp, status_json) VALUES (?, ?)",
-            (timestamp, "{}"),
+            (timestamp, status_json),
         )
         self.conn.commit()
         self.set_background_monitor_state("last_heartbeat", timestamp)
+        if status:
+            self.set_background_monitor_state("last_heartbeat_status_json", status_json)
 
     def latest_monitor_heartbeat(self) -> str:
         row = self.conn.execute("SELECT timestamp FROM background_monitor_heartbeats ORDER BY heartbeat_id DESC LIMIT 1").fetchone()
@@ -2965,11 +2976,21 @@ class AuditDatabase:
 
     def record_event_alert_trace(self, trace: EventAlertTrace | dict[str, Any]) -> None:
         payload = trace.to_dict() if hasattr(trace, "to_dict") else dict(trace)
+        stored = bool(payload.get("event_written_to_db") or payload.get("stored_success"))
+        direct = bool(payload.get("direct_render_test", False))
+        if not stored and not direct:
+            payload["overlay_dispatch_attempted"] = False
+            payload["overlay_dispatch_result"] = ""
+            payload["visible_alert_id"] = ""
+            payload["alert_queue_enqueued"] = False
+            payload["notification_policy_checked"] = False
+            payload["trace_consistency_status"] = "event_store_failed"
+            payload["render_verification_status"] = "skipped_non_interactive"
         self.conn.execute(
             """
             INSERT OR REPLACE INTO event_alert_traces
-            (trace_id, event_id, event_type, original_event_type, normalized_event_type, detector_source, created_at, stored_db_path, stored_success, notifier_db_path, notifier_poll_seen, notifier_poll_time, notifier_cursor_before, notifier_cursor_after, notifier_seen, notifier_seen_at, notification_policy_checked, notification_policy_result, notification_policy_reason, severity_before_policy, severity_after_policy, cooldown_checked, cooldown_result, alert_required, alert_suppressed, alert_suppression_reason, alert_queue_enqueued, alert_queue_length_before, alert_queue_length_after, overlay_dispatch_attempted, overlay_dispatch_at, overlay_dispatch_result, overlay_error, visible_alert_id, displayed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (trace_id, event_id, event_type, original_event_type, normalized_event_type, detector_source, created_at, stored_db_path, stored_success, notifier_db_path, notifier_poll_seen, notifier_poll_time, notifier_cursor_before, notifier_cursor_after, notifier_seen, notifier_seen_at, notification_policy_checked, notification_policy_result, notification_policy_reason, severity_before_policy, severity_after_policy, cooldown_checked, cooldown_result, alert_required, alert_suppressed, alert_suppression_reason, alert_queue_enqueued, alert_queue_length_before, alert_queue_length_after, overlay_dispatch_attempted, overlay_dispatch_at, overlay_dispatch_result, overlay_error, visible_alert_id, displayed_at, direct_render_test, event_store_error, trace_consistency_status, render_verification_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(payload.get("trace_id", "")),
@@ -3007,6 +3028,10 @@ class AuditDatabase:
                 str(payload.get("overlay_error", "")),
                 str(payload.get("visible_alert_id", "")),
                 str(payload.get("displayed_at", "")),
+                int(bool(payload.get("direct_render_test", False))),
+                str(payload.get("event_store_error", "")),
+                str(payload.get("trace_consistency_status", "")),
+                str(payload.get("render_verification_status", "")),
             ),
         )
         self.conn.commit()
@@ -3063,6 +3088,10 @@ class AuditDatabase:
             overlay_error=str(row["overlay_error"] or ""),
             visible_alert_id=str(row["visible_alert_id"] or ""),
             displayed_at=str(row["displayed_at"] or ""),
+            direct_render_test=bool(row["direct_render_test"]),
+            event_store_error=str(row["event_store_error"] or ""),
+            trace_consistency_status=str(row["trace_consistency_status"] or ""),
+            render_verification_status=str(row["render_verification_status"] or ""),
         )
 
     def latest_event_alert_traces(self, limit: int = 25) -> list[EventAlertTrace]:

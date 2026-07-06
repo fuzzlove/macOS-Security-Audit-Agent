@@ -55,6 +55,7 @@ from mac_audit_agent.models import NotificationCapabilities
 from mac_audit_agent.monitor_settings import CATEGORY_EVENT_TYPES, load_settings
 from mac_audit_agent.privacy_monitor import PrivacyMonitor, PrivacyMonitorSnapshot
 from mac_audit_agent.native_event_bridge import NativeEventBridge
+from mac_audit_agent.runtime.log_path_resolver import get_log_paths_for_role
 from mac_audit_agent.session_monitor import SessionMonitor, SessionSnapshot, SessionStateObserver
 from mac_audit_agent.self_impact_watchdog import MonitorSelfImpactWatchdog, SelfImpactMetrics
 from mac_audit_agent.storage import AuditDatabase
@@ -374,7 +375,12 @@ class BackgroundMonitorService:
     def __init__(self, db_path: Path, poll_interval_seconds: int = 5, executor=None, record_startup: bool = True, mode: str = MONITOR_ROLE_LEGACY) -> None:
         self.db = AuditDatabase(db_path)
         db_path = Path(db_path).expanduser()
-        if db_path.parent not in {Path.home(), default_monitor_db_path("user").parent, default_monitor_db_path("system").parent}:
+        self.mode = (mode or MONITOR_ROLE_LEGACY).strip().lower()
+        resolved_logs = get_log_paths_for_role(self.mode, "system" if db_path == default_monitor_db_path("system") else "user")
+        if self.mode in {MONITOR_ROLE_USER, MONITOR_ROLE_SYSTEM}:
+            self.log_paths = [path for path in [resolved_logs.monitor_log_path, resolved_logs.stdout_path] if path is not None]
+            self.error_log_paths = [resolved_logs.stderr_path]
+        elif db_path.parent not in {Path.home(), default_monitor_db_path("user").parent, default_monitor_db_path("system").parent}:
             local_log_dir = db_path.parent / "logs"
             self.log_paths = [
                 local_log_dir / "monitor.log",
@@ -387,7 +393,6 @@ class BackgroundMonitorService:
         self.poll_interval_seconds = max(3, min(5, poll_interval_seconds))
         self.executor = executor or self._run_command
         self.record_startup = record_startup
-        self.mode = (mode or MONITOR_ROLE_LEGACY).strip().lower()
         self.system_daemon_mode = self.mode == MONITOR_ROLE_SYSTEM
         self.user_notifier_mode = self.mode == MONITOR_ROLE_USER
         self.privacy_monitor = PrivacyMonitor(executor=self.executor)
@@ -1320,6 +1325,18 @@ class BackgroundMonitorService:
         self.db.set_background_monitor_state("notifier_pid", str(os.getpid()))
         self.db.set_background_monitor_state("notifier_loaded", "1")
         self.db.set_background_monitor_state("notifier_pid_alive", "1")
+        notifier_heartbeat = {
+            "pid": os.getpid(),
+            "label": "com.mac-audit-agent.user-notifier",
+            "db_path": str(self.db.path),
+            "settings_version": int(getattr(self.monitor_settings, "settings_version", 0) or 0),
+            "last_event_seen": self.db.get_background_monitor_state("notifier_last_event_seen", ""),
+            "last_alert_displayed": self.db.get_background_monitor_state("notifier_last_alert_displayed", ""),
+            "timestamp": now,
+        }
+        self.db.set_background_monitor_state("notifier_heartbeat", now)
+        self.db.set_background_monitor_state("user_notifier_heartbeat", now)
+        self.db.set_background_monitor_state("notifier_heartbeat_json", json.dumps(notifier_heartbeat, sort_keys=True))
         notified: list[BackgroundMonitorEvent] = []
         seen_count = 0
         alerted_count = 0
@@ -1497,13 +1514,24 @@ class BackgroundMonitorService:
 
     def record_heartbeat(self) -> None:
         timestamp = utc_now_iso()
+        detector_counts = {name: self._detector_observed_count(name) for name in self.enabled_detectors}
+        status = {
+            "daemon_label": "com.mac-audit-agent.monitor",
+            "pid": os.getpid(),
+            "mode": self.mode,
+            "db_path": str(self.db.path),
+            "settings_version": int(getattr(self.monitor_settings, "settings_version", 0) or 0),
+            "timestamp": timestamp,
+            "detector_counts": detector_counts,
+            "last_error": self.db.get_background_monitor_state("last_error", ""),
+        }
         try:
-            self.db.record_monitor_heartbeat(timestamp)
+            self.db.record_monitor_heartbeat(timestamp, status)
         except Exception as exc:
             self.db.set_background_monitor_state("last_error", f"heartbeat write failed: {exc}")
             self._write_log_line(f"heartbeat write failed: {exc}")
             return
-        self._write_log_line(f"heartbeat: timestamp={timestamp}")
+        self._write_log_line(f"heartbeat: timestamp={timestamp} db_path={self.db.path} mode={self.mode}")
 
     def _admin_persistence_monitoring_enabled(self) -> bool:
         try:
@@ -2719,6 +2747,8 @@ class BackgroundMonitorService:
 
     def _active_log_paths(self) -> list[Path]:
         paths = list(getattr(self, "log_paths", [FALLBACK_MONITOR_LOG, STDOUT_MONITOR_LOG]))
+        if getattr(self, "mode", "") in {MONITOR_ROLE_USER, MONITOR_ROLE_SYSTEM}:
+            return paths
         for current, default in [(FALLBACK_MONITOR_LOG, DEFAULT_FALLBACK_MONITOR_LOG), (STDOUT_MONITOR_LOG, DEFAULT_STDOUT_MONITOR_LOG)]:
             if current != default and current not in paths:
                 paths.append(current)
@@ -2726,6 +2756,8 @@ class BackgroundMonitorService:
 
     def _active_error_log_paths(self) -> list[Path]:
         paths = list(getattr(self, "error_log_paths", [STDERR_MONITOR_LOG]))
+        if getattr(self, "mode", "") in {MONITOR_ROLE_USER, MONITOR_ROLE_SYSTEM}:
+            return paths
         if STDERR_MONITOR_LOG != DEFAULT_STDERR_MONITOR_LOG and STDERR_MONITOR_LOG not in paths:
             paths.append(STDERR_MONITOR_LOG)
         return paths

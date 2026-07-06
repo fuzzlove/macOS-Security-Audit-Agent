@@ -131,6 +131,8 @@ def test_assessment_exports_do_not_use_unsupported_compliance_wording(tmp_path: 
     md_path = export_security_assessment_markdown(assessment, tmp_path / "assessment.md")
 
     combined = html_path.read_text(encoding="utf-8") + json_path.read_text(encoding="utf-8") + md_path.read_text(encoding="utf-8")
+    assert "CMMC Readiness Summary" in html_path.read_text(encoding="utf-8")
+    assert "cmmc_readiness" in json_path.read_text(encoding="utf-8")
     assert "demo" not in combined.lower()
     assert "sample finding" not in combined.lower()
     assert "Compliant" not in combined

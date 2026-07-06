@@ -35,3 +35,11 @@ def get_asset_data_uri(name: str) -> str | None:
     mime_type, _ = mimetypes.guess_type(path.name)
     encoded = base64.b64encode(data).decode("ascii")
     return f"data:{mime_type or 'application/octet-stream'};base64,{encoded}"
+
+
+def get_donation_qr_path() -> Path:
+    return get_asset_path("donation_qr.png")
+
+
+def get_donation_qr_metadata_path() -> Path:
+    return get_asset_path("donation_qr.json")

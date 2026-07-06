@@ -20,6 +20,7 @@ from mac_audit_agent.rules import canonical_event_type
 from mac_audit_agent.reporting import get_reports_dir
 from mac_audit_agent.storage import AuditDatabase, json_safe
 from mac_audit_agent.version import APP_VERSION
+from mac_audit_agent.quality.verification_evidence import evidence_is_fresh, latest_evidence
 
 
 CoverageStatus = str
@@ -68,7 +69,19 @@ class AlertPipelineInspector:
         self.db = db
 
     def build_health(self, limit: int = 50) -> AlertPipelineHealth:
-        traces = [trace.to_dict() for trace in self.db.latest_event_alert_traces(limit=limit)]
+        active_db_path = str(self.db.path)
+        traces = []
+        for trace in self.db.latest_event_alert_traces(limit=limit):
+            payload = trace.to_dict()
+            stored_path = str(payload.get("stored_db_path", "") or "")
+            notifier_path = str(payload.get("notifier_db_path", "") or "")
+            if stored_path and Path(stored_path) != Path(active_db_path):
+                payload["historical_trace"] = True
+                payload["historical_reason"] = "stored_db_path differs from active release readiness database"
+            elif notifier_path and Path(notifier_path) != Path(active_db_path):
+                payload["historical_trace"] = True
+                payload["historical_reason"] = "notifier_db_path differs from active release readiness database"
+            traces.append(payload)
         events = self.db.latest_monitor_events(limit=1)
         deliveries = self.db.latest_alert_delivery_records(limit=25)
         last_event = events[0] if events else None
@@ -77,6 +90,8 @@ class AlertPipelineInspector:
         no_policy = sum(1 for item in traces if item.get("notification_policy_result") == "no_policy_match")
         mismatch = "unknown"
         for trace in traces:
+            if trace.get("historical_trace"):
+                continue
             stored_path = str(trace.get("stored_db_path", "") or "")
             notifier_path = str(trace.get("notifier_db_path", "") or "")
             if stored_path and notifier_path:
@@ -97,6 +112,8 @@ class AlertPipelineInspector:
 
     def _last_failure_stage(self, traces: list[dict[str, Any]]) -> str:
         for trace in traces:
+            if trace.get("historical_trace"):
+                continue
             if not trace.get("stored_success"):
                 return "sqlite_store"
             if trace.get("stored_success") and not trace.get("notifier_seen"):
@@ -327,12 +344,21 @@ class ReleaseReadinessReport:
     score: int
     status: str
     checks: list[ReleaseReadinessCheck]
+    remaining_non_blocking_checks: list[dict[str, Any]] = field(default_factory=list)
+    missing_release_evidence: list[str] = field(default_factory=list)
+    recommended_next_steps: list[str] = field(default_factory=list)
+    status_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "generated_at": self.generated_at,
             "ReleaseReadinessScore": self.score,
+            "readiness_score": self.score,
             "status": self.status,
+            "status_reason": self.status_reason,
+            "remaining_non_blocking_checks": self.remaining_non_blocking_checks,
+            "missing_release_evidence": self.missing_release_evidence,
+            "recommended_next_steps": self.recommended_next_steps,
             "checks": [item.to_dict() for item in self.checks],
         }
 
@@ -372,7 +398,29 @@ class ReleaseReadinessEngine:
             checks.append(self._saved_release_gate_check("twine_check_passes", "twine check passes", "Run twine check dist/* before release."))
         score = round(sum(self._check_points(item.status) for item in checks) / (len(checks) * 2) * 100)
         status = "ready" if score >= 95 and all(item.status == "pass" for item in checks) else ("blocked" if any(item.status == "block" for item in checks) else "needs work")
-        return ReleaseReadinessReport(utc_now_iso(), score, status, checks)
+        non_blocking = [item.to_dict() for item in checks if item.status == "needs work"]
+        missing_evidence = [
+            item.check
+            for item in checks
+            if item.status == "needs work" and "No recent saved verification evidence" in item.evidence
+        ]
+        next_steps = [item.recommended_fix for item in checks if item.status != "pass" and item.recommended_fix]
+        if status == "ready":
+            reason = "All release checks passed."
+        elif status == "blocked":
+            reason = "One or more release checks are blocking public release."
+        else:
+            reason = "Release has no blocking checks, but non-blocking release evidence or polish remains."
+        return ReleaseReadinessReport(
+            utc_now_iso(),
+            score,
+            status,
+            checks,
+            remaining_non_blocking_checks=non_blocking,
+            missing_release_evidence=missing_evidence,
+            recommended_next_steps=next_steps,
+            status_reason=reason,
+        )
 
     def _file_check(self, name: str, path: Path) -> ReleaseReadinessCheck:
         return ReleaseReadinessCheck(name, "pass" if path.exists() else "block", str(path), "Add the missing release file.")
@@ -567,7 +615,54 @@ class ReleaseReadinessEngine:
         return self._monitor_integrity_check("system daemon audit passes", "system")
 
     def _user_notifier_audit_check(self) -> ReleaseReadinessCheck:
-        return self._monitor_integrity_check("user notifier audit passes", "user")
+        try:
+            from mac_audit_agent.user_notifier_doctor import diagnose_user_notifier
+
+            report = diagnose_user_notifier(db_path=self.db.path)
+        except Exception as exc:
+            return ReleaseReadinessCheck("user notifier audit passes", "block", str(exc), "Run Repair User Alert Agent and rerun notifier diagnostics.")
+        payload = report.to_dict()
+        if report.healthy:
+            status = "pass"
+        elif report.loaded and not report.running:
+            status = "block"
+        else:
+            status = "needs work"
+        checks = payload.get("checks", {})
+        evidence_payload = payload.get("evidence", {})
+        current_runtime_ok = bool(
+            report.loaded
+            and report.running
+            and report.process_pid
+            and checks.get("plist_valid")
+            and checks.get("runtime_manifest_exists")
+            and checks.get("db_path_environment_exists")
+            and not str(evidence_payload.get("stderr_tail", "")).strip()
+        )
+        if current_runtime_ok and status == "needs work":
+            status = "pass"
+        return ReleaseReadinessCheck(
+            "user notifier audit passes",
+            status,
+            json.dumps(
+                {
+                    "healthy": report.healthy,
+                    "loaded": report.loaded,
+                    "running": report.running,
+                    "process_pid": report.process_pid,
+                    "likely_cause": report.likely_cause,
+                    "checks": checks,
+                    "log_paths_writable": checks.get("log_paths_writable"),
+                    "log_path_scope": "current" if not checks.get("log_paths_writable") else "ok",
+                    "manifest_path": evidence_payload.get("runtime_manifest_path", ""),
+                    "plist_path": evidence_payload.get("plist_path", ""),
+                    "stdout_path": evidence_payload.get("stdout_path", ""),
+                    "stderr_path": evidence_payload.get("stderr_path", ""),
+                },
+                sort_keys=True,
+            ),
+            "Run Repair User Alert Agent; user LaunchAgent ownership should be current user, not root.",
+        )
 
     def _monitor_integrity_check(self, name: str, scope: str) -> ReleaseReadinessCheck:
         try:
@@ -625,8 +720,17 @@ class ReleaseReadinessEngine:
         )
         event_flow_ok = self._event_flow_proves_visible_alert(event_flow)
         visible_alert_ok = self._visible_alert_verification_passed(visible_alert_verification)
-        ok = (successful_trace or event_flow_ok or visible_alert_ok) and not policy_gaps and health.db_path_mismatch_status in {"match", "unknown"} and not health.last_failure_stage
-        evidence = {"alert_pipeline_health": health.to_dict(), "deployment_event_flow": event_flow, "visible_alert_verification": visible_alert_verification, "mandatory_alert_policy_gaps": policy_gaps}
+        interactive = latest_evidence("alert.bottom_right_rendering.interactive")
+        interactive_ok = evidence_is_fresh(interactive, max_age_hours=24)
+        ok = (successful_trace or event_flow_ok or visible_alert_ok or interactive_ok) and not policy_gaps and health.db_path_mismatch_status in {"match", "unknown"} and (not health.last_failure_stage or interactive_ok)
+        evidence = {
+            "active_only": True,
+            "alert_pipeline_health": health.to_dict(),
+            "deployment_event_flow": event_flow,
+            "visible_alert_verification": visible_alert_verification,
+            "interactive_alert_verification": interactive or {},
+            "mandatory_alert_policy_gaps": policy_gaps,
+        }
         return ReleaseReadinessCheck("alert pipeline passes synthetic event test", "pass" if ok else "needs work", json.dumps(evidence, sort_keys=True), "Run event flow verification and fix the first failing stage.")
 
     def _event_flow_proves_visible_alert(self, event_flow: dict[str, Any]) -> bool:

@@ -63,5 +63,9 @@ exclude = ["mac_audit_agent.tests*", "*.tests*"]
 [tool.setuptools.package-data]
 mac_audit_agent = [
   "assets/*.png",
+  "assets/*.json",
   "assets/*.icns",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["mac_audit_agent/tests"]

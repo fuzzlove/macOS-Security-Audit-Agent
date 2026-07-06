@@ -6,24 +6,41 @@ from mac_audit_agent.launch_agent import LaunchAgentManager, default_monitor_db_
 from mac_audit_agent.monitor import is_heartbeat_fresh
 from mac_audit_agent.monitor_settings import load_settings
 from mac_audit_agent.quality.audit_models import AuditContext, FunctionalCheck
+from mac_audit_agent.runtime.db_path_resolver import get_active_monitor_db_path, validate_db_path_alignment
 from mac_audit_agent.storage import AuditDatabase
 from mac_audit_agent.user_notifier_installer import get_user_notifier_status, update_db_notifier_status
 
 
 def run_daemon_audit(context: AuditContext) -> list[FunctionalCheck]:
-    db = AuditDatabase(context.db_path)
-    settings = load_settings(db)
+    active_db_path = get_active_monitor_db_path(context.db_path)
     checks: list[FunctionalCheck] = []
+    db_open = FunctionalCheck("daemon.active_db_open", "Monitor/Daemon", "active monitor database", "Active monitor database is readable and writable for diagnostics.", "blocker", "daemon")
+    try:
+        db = AuditDatabase(active_db_path)
+    except Exception as exc:
+        db_open.failure_stage = "permission_issue"
+        checks.append(db_open.failed(
+            f"Active monitor database could not be opened for diagnostics: {exc}",
+            "Repair active monitor database permissions or run the audit with the same privileges as the active monitor.",
+            {"db_path": str(active_db_path), "exception": type(exc).__name__},
+        ))
+        return checks
+    checks.append(db_open.passed("Active monitor database opened for diagnostics.", {"db_path": str(active_db_path)}))
+    settings = load_settings(db)
     notifier = FunctionalCheck("daemon.notifier_heartbeat", "Monitor/Daemon", "notifier heartbeat", "User notifier heartbeat and status are visible.", "blocker", "daemon")
     try:
-        status = get_user_notifier_status(db_path=context.db_path)
+        status = get_user_notifier_status(db_path=active_db_path)
         update_db_notifier_status(db, status)
         required = settings.local_edr.persistent_local_edr_enabled and settings.notification.bottom_right_alerts and settings.user_notifier.enabled
-        evidence = status.to_dict()
-        db_mismatch = status.db_path and str(Path(status.db_path).expanduser()) != str(Path(context.db_path).expanduser())
+        alignment = validate_db_path_alignment(settings_db_path=context.db_path, notifier_db_path=status.db_path, event_db_path=active_db_path)
+        evidence = {**status.to_dict(), "db_path_alignment": alignment.to_dict()}
+        db_mismatch = bool(status.db_path and not alignment.aligned)
         if required and status.install_status != "loaded":
             notifier.failure_stage = "notifier_not_running"
             checks.append(notifier.failed("Bottom-right alerts are enabled but the user alert agent is not loaded.", "Install and load com.mac-audit-agent.user-notifier in gui/<uid>, then rerun alert delivery test.", evidence))
+        elif required and not status.running:
+            notifier.failure_stage = "notifier_not_running"
+            checks.append(notifier.failed("Bottom-right alerts are enabled but the user alert agent is loaded without a running process.", "Restart or repair User Alert Agent, verify running PID, then rerun alert delivery test.", evidence))
         elif required and db_mismatch:
             notifier.failure_stage = "db_path_mismatch"
             checks.append(notifier.failed("Bottom-right alerts are enabled but the user alert agent is reading a different database.", "Repair User Alert Agent so its MAC_AUDIT_AGENT_DB_PATH matches the active monitor database, then rerun notifier and alert pipeline audits.", evidence))
@@ -61,23 +78,31 @@ def run_daemon_audit(context: AuditContext) -> list[FunctionalCheck]:
     heartbeat = FunctionalCheck("daemon.heartbeat", "Monitor/Daemon", "daemon heartbeat", "Daemon heartbeat freshness is visible.", "critical", "daemon")
     last_heartbeat = db.get_background_monitor_state("last_heartbeat", "")
     if not last_heartbeat:
-        checks.append(heartbeat.warn("No daemon heartbeat recorded.", "Start the monitor or verify daemon startup before UAT.", {"last_heartbeat": last_heartbeat}))
+        checks.append(heartbeat.warn("No daemon heartbeat recorded.", "Start the monitor or verify daemon startup before UAT.", {"last_heartbeat": last_heartbeat, "db_path": str(active_db_path)}))
     elif not is_heartbeat_fresh(last_heartbeat):
         heartbeat.failure_stage = "daemon_not_running"
-        checks.append(heartbeat.failed(f"Stale daemon heartbeat: {last_heartbeat}", "Restart or repair the monitor and confirm heartbeat freshness.", {"last_heartbeat": last_heartbeat}))
+        checks.append(heartbeat.failed(f"Stale daemon heartbeat: {last_heartbeat}", "Restart or repair the monitor and confirm heartbeat freshness.", {"last_heartbeat": last_heartbeat, "db_path": str(active_db_path)}))
     else:
-        checks.append(heartbeat.passed("Daemon heartbeat is fresh.", {"last_heartbeat": last_heartbeat}))
+        checks.append(heartbeat.passed("Daemon heartbeat is fresh.", {"last_heartbeat": last_heartbeat, "db_path": str(active_db_path)}))
 
     event_write = FunctionalCheck("daemon.event_db_writes", "Monitor/Daemon", "event database writes", "Monitor event database write path works.", "blocker", "daemon")
     try:
-        db.set_background_monitor_state("pre_uat_event_write_probe", Path(context.db_path).name)
+        active_name = Path(active_db_path).name
+        db.set_background_monitor_state("pre_uat_event_write_probe", active_name)
         from mac_audit_agent.models import utc_now_iso
         db.set_background_monitor_state("pre_uat_event_write_probe_at", utc_now_iso())
         observed = db.get_background_monitor_state("pre_uat_event_write_probe", "")
-        if observed != Path(context.db_path).name:
-            checks.append(event_write.failed("Background monitor state write/read mismatch.", "Repair SQLite state write path before UAT.", {"observed": observed}))
+        evidence = {
+            "active_db_path": str(active_db_path),
+            "context_db_path": str(context.db_path),
+            "historical_user_db_path": str(context.db_path) if Path(context.db_path) != Path(active_db_path) else "",
+            "active_only": True,
+            "observed": observed,
+        }
+        if observed != active_name:
+            checks.append(event_write.failed("Background monitor state write/read mismatch.", "Repair SQLite state write path before UAT.", evidence))
         else:
-            checks.append(event_write.passed("Database write/read probe succeeded.", {"db_path": str(context.db_path)}))
+            checks.append(event_write.passed("Active monitor database write/read probe succeeded.", evidence))
     except Exception as exc:
         checks.append(event_write.failed(str(exc), "Repair monitor database permissions or schema.", {"exception": type(exc).__name__}))
     return checks

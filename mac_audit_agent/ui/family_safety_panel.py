@@ -111,14 +111,6 @@ class FamilySafetyPanel(QFrame):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
-        title = QLabel("Family & Safety Center")
-        title.setStyleSheet("font-size: 18px; font-weight: 700; color: #F0F6FC;")
-        subtitle = QLabel("Guided, local checks for making this Mac safer for children, families, schools, caregivers, seniors, and users with special needs.")
-        subtitle.setWordWrap(True)
-        subtitle.setStyleSheet("color: #9DB0C9;")
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
-
         privacy = QLabel("Privacy-first: no messages, screenshots, keystrokes, browsing history, microphone data, camera data, or uploads.")
         privacy.setWordWrap(True)
         privacy.setStyleSheet("color: #D6E4FF; font-weight: 600;")

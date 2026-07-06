@@ -4,6 +4,8 @@ MSAA is a local-first macOS audit, monitoring, and investigation platform. It is
 
 This repository is intended to be understandable, auditable, and safe enough for public review, institutional evaluation, and responsible internal deployment.
 
+MSAA is an independent project by Liquidsky Network Security. References to NIST, CISA, DoD, NSA, PCI SSC, MITRE, or other standards bodies are for standards mapping, source attribution, and public guidance alignment only. They do not imply endorsement, sponsorship, certification, or approval.
+
 ## What It Does
 
 - Runs read-only macOS security audits

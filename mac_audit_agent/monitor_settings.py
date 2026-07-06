@@ -5,6 +5,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from mac_audit_agent.settings.settings_reconciliation import reconcile_settings
+from mac_audit_agent.settings.settings_versioning import monitor_mode_display
+
 
 SETTINGS_STATE_KEY = "monitor_settings_json"
 SETTINGS_LAST_SAVED_KEY = "monitor_settings_last_saved"
@@ -796,6 +799,7 @@ def installed_monitor_values(db, *, launch_agent=None, system_launch_agent=None)
 def settings_diagnostics(db, settings: MonitorSettings, *, runtime_values: dict[str, Any] | None = None, installed_values: dict[str, Any] | None = None) -> dict[str, Any]:
     runtime_values = runtime_values or {}
     installed_values = installed_values or {}
+    reconciliation = reconcile_settings(settings, runtime_values=runtime_values, installed_values=installed_values)
     mismatches: list[str] = []
     if settings.alerting.notify_min_severity != runtime_values.get("notify_min_severity", settings.alerting.notify_min_severity):
         mismatches.append("notify_min_severity")
@@ -883,9 +887,24 @@ def settings_diagnostics(db, settings: MonitorSettings, *, runtime_values: dict[
         and settings.user_notifier.enabled
     )
     notifier_status = str(runtime_values.get("user_notifier_install_status") or installed_values.get("user_notifier_install_status") or "unknown")
+    if notifier_status == "loaded_running":
+        notifier_status_display = "loaded"
+    else:
+        notifier_status_display = notifier_status
     notifier_loaded = _bool(runtime_values.get("user_notifier_loaded", installed_values.get("user_notifier_loaded")), False)
-    if notifier_required and (notifier_status not in {"loaded", "installed"} or not notifier_loaded):
+    notifier_running = _bool(runtime_values.get("user_notifier_running", installed_values.get("user_notifier_running")), False)
+    if notifier_required and (notifier_status not in {"loaded", "installed", "loaded_running"} or not notifier_loaded or not notifier_running):
         mismatches.append("user_notifier_not_deliverable")
+    for component in reconciliation.stale_components:
+        legacy_name = {
+            "runtime": "runtime_settings_version",
+            "notifier": "notifier_settings_version",
+            "installed_manifest": "installed_settings_version",
+        }.get(component)
+        if legacy_name and legacy_name not in mismatches:
+            mismatches.append(legacy_name)
+    status = "ok" if reconciliation.status in {"synced", "installed_manifest_stale"} and not any(item not in {"installed_settings_version"} for item in mismatches) else reconciliation.status
+    mode_internal = settings.installation.monitor_mode
     return {
         "current_settings_json": settings.to_dict(),
         "loaded_from": db.get_background_monitor_state(SETTINGS_LOADED_FROM_KEY, ""),
@@ -894,16 +913,78 @@ def settings_diagnostics(db, settings: MonitorSettings, *, runtime_values: dict[
         "last_error": db.get_background_monitor_state(SETTINGS_LAST_ERROR_KEY, ""),
         "current_runtime_values": runtime_values,
         "installed_monitor_values": installed_values,
+        "historical_installed_state": {
+            "user_notifier_install_status": installed_values.get("user_notifier_install_status", ""),
+            "user_notifier_loaded": installed_values.get("user_notifier_loaded", ""),
+            "user_notifier_running": installed_values.get("user_notifier_running", ""),
+            "settings_version_installed": installed_values.get("settings_version_installed", ""),
+            "source": "installed_monitor_values",
+        },
+        "settings_sync_status": {
+            "ui_settings_version": reconciliation.ui_settings_version,
+            "runtime_settings_version": reconciliation.runtime_settings_version,
+            "installed_manifest_settings_version": reconciliation.installed_manifest_settings_version,
+            "notifier_settings_version": reconciliation.notifier_settings_version,
+            "effective_settings_version": reconciliation.effective_settings_version,
+            "last_saved": db.get_background_monitor_state(SETTINGS_LAST_SAVED_KEY, ""),
+            "last_runtime_reload": runtime_values.get("last_settings_reload_time", ""),
+            "last_notifier_reload": runtime_values.get("notifier_last_settings_reload_time", runtime_values.get("last_settings_reload_time", "")),
+            "last_monitor_repair": installed_values.get("last_repaired_at", ""),
+        },
+        "settings_reconciliation": reconciliation.to_dict(),
+        "settings_component_status": [
+            {
+                "component": "UI Settings",
+                "version": reconciliation.ui_settings_version,
+                "status": "current",
+                "source": "current_settings_json.settings_version",
+                "repair_action": "Save settings again if this value is missing.",
+            },
+            {
+                "component": "System Daemon Runtime",
+                "version": reconciliation.runtime_settings_version,
+                "status": "stale" if "runtime" in reconciliation.stale_components else "current",
+                "source": "current_runtime_values.settings_version",
+                "repair_action": "Apply Settings to Runtime / Restart Background Monitor",
+            },
+            {
+                "component": "User Notifier Runtime",
+                "version": reconciliation.notifier_settings_version,
+                "status": "stale" if "notifier" in reconciliation.stale_components else "current",
+                "source": "current_runtime_values.notifier_settings_version",
+                "repair_action": "Restart User Notifier",
+            },
+            {
+                "component": "Installed Monitor Manifest",
+                "version": reconciliation.installed_manifest_settings_version,
+                "status": "stale" if "installed_manifest" in reconciliation.stale_components else "current",
+                "source": "installed_monitor_values.installed_manifest.settings_version",
+                "repair_action": "Repair Background Monitor / Rebuild Installed Manifest",
+            },
+            {
+                "component": "User Alert Agent",
+                "version": "",
+                "status": "running" if notifier_running else ("loaded" if notifier_loaded else notifier_status_display),
+                "source": runtime_values.get("user_notifier_status_source", "runtime_values"),
+                "repair_action": "Repair User Alert Agent" if notifier_required and not notifier_running else "No repair required.",
+            },
+        ],
+        "monitor_mode_internal": mode_internal,
+        "monitor_mode_display": monitor_mode_display(mode_internal),
+        "active_runtime_domain": "system" if mode_internal in {"system", "protected"} else mode_internal,
         "mismatches": mismatches,
+        "detailed_mismatches": [item.to_dict() for item in reconciliation.mismatches],
+        "repair_actions": reconciliation.repair_actions,
         "user_alert_agent": {
             "required": notifier_required,
-            "status": notifier_status,
+            "status": notifier_status_display,
             "loaded": notifier_loaded,
-            "running": _bool(runtime_values.get("user_notifier_running", installed_values.get("user_notifier_running")), False),
+            "running": notifier_running,
             "plist_path": runtime_values.get("user_notifier_plist_path", installed_values.get("user_notifier_plist_path", "")),
             "launchctl_domain": runtime_values.get("user_notifier_launchctl_domain", installed_values.get("user_notifier_launchctl_domain", "")),
             "last_error": runtime_values.get("user_notifier_last_error", installed_values.get("user_notifier_last_error", "")),
-            "deliverable": not notifier_required or (notifier_status in {"loaded", "installed"} and notifier_loaded),
+            "deliverable": not notifier_required or (notifier_status in {"loaded", "installed", "loaded_running"} and notifier_loaded and notifier_running),
+            "source": runtime_values.get("user_notifier_status_source", "runtime_values"),
         },
-        "status": "mismatch" if mismatches else "ok",
+        "status": status,
     }

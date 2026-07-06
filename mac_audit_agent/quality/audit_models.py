@@ -28,6 +28,7 @@ FAILURE_STAGES = {
     "missing_dependency",
     "permission_issue",
     "unsupported_platform",
+    "release_blocked",
     "unknown",
 }
 

@@ -51,14 +51,6 @@ class NetworkIntelligencePanel(QFrame):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
-        title = QLabel("Network Intelligence")
-        title.setStyleSheet("font-size: 20px; font-weight: 800; color: #F0F6FC;")
-        subtitle = QLabel("Network Intelligence powered by Network Sentinel, integrated into MSAA storage, alerts, reports, timeline, and settings.")
-        subtitle.setWordWrap(True)
-        subtitle.setStyleSheet("color: #9DB0C9;")
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
-
         toolbar = QHBoxLayout()
         self.refresh_button = QPushButton("Refresh Network Intelligence")
         self.nmap_button = QPushButton("Nmap Local Scan")
