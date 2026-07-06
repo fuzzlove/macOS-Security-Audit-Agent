@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-APP_VERSION = "0.1.1"
+APP_VERSION = "1.0b"
 RUNTIME_MANIFEST_SCHEMA_VERSION = 1
 DATABASE_SCHEMA_VERSION = 1
 

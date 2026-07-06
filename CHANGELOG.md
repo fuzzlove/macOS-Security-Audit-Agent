@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0b - 2026-07-06
+
+### Added
+
+- Beta release build for MSAA v1.0b with UAT hardening, framework readiness, support-page polish, notifier diagnostics, release evidence, and standards comparison guardrails.
+
 ## 0.1.1 - 2026-06-18
 
 ### Added

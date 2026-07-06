@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: macos-security-audit-agent
-Version: 0.1.1
+Version: 1.0b0
 Summary: Local-first macOS security audit, monitoring, and investigation agent.
 Author: Mac Audit Agent contributors
 License-Expression: MIT

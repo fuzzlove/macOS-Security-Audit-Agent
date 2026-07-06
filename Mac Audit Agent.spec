@@ -42,7 +42,7 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
-    target_arch='universal2',
+    target_arch='arm64',
     codesign_identity=None,
     entitlements_file=None,
     icon=['mac_audit_agent/assets/app_icon.icns'],
@@ -61,8 +61,9 @@ app = BUNDLE(
     name='Mac Audit Agent.app',
     icon='mac_audit_agent/assets/app_icon.icns',
     bundle_identifier='com.fuzzlove.macos-security-audit-agent',
-    version='0.1.1',
+    version='1.0b',
     info_plist={
-        'CFBundleVersion': '0.1.1',
+        'CFBundleShortVersionString': '1.0b',
+        'CFBundleVersion': '1.0b',
     },
 )

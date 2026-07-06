@@ -34,6 +34,7 @@ docs/MACOS_SECURITY_COMPARATIVE_REVIEW.md
 docs/MACOS_SECURITY_DERIVED_IMPLEMENTATION_PLAN.md
 docs/MACOS_SECURITY_IP_SAFETY_REVIEW.md
 docs/MONITOR_SETTINGS_AUDIT.md
+docs/MSAA_VS_MACOS_SECURITY_COMPARE_CONTRAST.md
 docs/NETWORK_INTELLIGENCE_DIAGNOSTICS_SIGNATURE_AUDIT.md
 docs/NETWORK_SENTINEL_FEATURE_MATRIX.md
 docs/NETWORK_SENTINEL_FULL_INVENTORY.md
@@ -66,6 +67,13 @@ docs/UI_AUDIT.md
 docs/UI_BUTTON_INVENTORY.md
 docs/UI_LABEL_HEADER_DEDUPLICATION_AUDIT.md
 docs/USB_BLUETOOTH_NETWORK_SETTINGS_AUDIT.md
+docs/derived_features/SDI-001_macos_hardening_evidence.md
+docs/derived_features/SDI-002_audit_evidence_completeness.md
+docs/derived_features/SDI-003_account_posture_evidence.md
+docs/derived_features/SDI-004_persistence_coverage_evidence.md
+docs/derived_features/SDI-005_network_exposure_evidence.md
+docs/derived_features/SDI-006_manual_evidence_checklist.md
+docs/derived_features/SDI-010_readiness_language_guardrail.md
 icon.iconset/icon_128x128.png
 icon.iconset/icon_128x128@2x.png
 icon.iconset/icon_16x16.png
