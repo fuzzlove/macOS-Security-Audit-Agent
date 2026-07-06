@@ -5,6 +5,9 @@
 ### Added
 
 - Beta release build for MSAA v1.0b with UAT hardening, framework readiness, support-page polish, notifier diagnostics, release evidence, and standards comparison guardrails.
+- PyInstaller macOS arm64 app bundle artifacts refreshed for version 1.0b:
+  - `MSAA-v1.0b-macos-arm64.zip` SHA-256: `1368d9aaf28022c99536aa8881e5fc77a347d5a75679908a626918466df6a989`
+  - `MSAA-v1.0b-macos-arm64.tar.xz` SHA-256: `1e04adf4ede86be994190e829ae1419dd4ee47e7fdbd840d8fc78c4d67b3b54e`
 
 ## 0.1.1 - 2026-06-18
 
