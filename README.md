@@ -6,6 +6,7 @@ All Rights Reserved.
 
 This software is proprietary and confidential.
 Unauthorized copying, modification, redistribution, or reverse engineering is prohibited except as expressly permitted by the applicable license agreement.
+----------
 
 MSAA is a local-first macOS audit, monitoring, and investigation platform. It is designed for analysts who need transparent evidence collection, reviewable alerts, and local-only reports without sending telemetry off the machine.
 
