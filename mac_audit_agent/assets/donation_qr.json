@@ -2,6 +2,10 @@
   "developer": "Liquidsky Network Security",
   "generated_at": "2026-07-05T23:17:49.033713+00:00",
   "generator": "qrcode 8.2, error_correction=Q",
+  "module_count": 37,
+  "source_box_size_pixels": 10,
+  "quiet_zone_modules": 4,
+  "full_page_render_size_pixels": 296,
   "purpose": "Production donation QR code for MSAA support section",
   "target_url": "https://patreon.com/fuzzlove",
   "verified": true

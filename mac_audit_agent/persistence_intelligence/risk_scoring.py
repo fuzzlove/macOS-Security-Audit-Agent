@@ -29,6 +29,27 @@ def score_item(item: PersistenceItem) -> PersistenceItem:
     target = item.executable_path or item.program or item.path
     args = " ".join(item.program_arguments)
     combined = f"{target} {args}"
+    mechanism_weight = {
+        "dylib_insert": (55, "dynamic loader library insertion declaration"),
+        "login_hook": (35, "login hook executes during user session startup"),
+        "logout_hook": (30, "logout hook executes during session teardown"),
+        "event_rule": (35, "event rule can execute commands automatically"),
+        "startup_script": (30, "legacy operating-system startup script present"),
+        "directory_services_plugin": (25, "Directory Services loads this plugin bundle"),
+        "spotlight_importer": (18, "Spotlight worker loads this importer bundle"),
+        "quicklook_plugin": (18, "Quick Look loads this generator bundle"),
+        "dock_tile_plugin": (18, "Dock service loads this application plugin"),
+        "embedded_login_helper": (20, "application contains an embedded login helper"),
+        "ssh_authorized_key": (55, "SSH authorized key can provide durable remote account access"),
+        "ssh_configuration": (20, "SSH configuration can redirect or weaken trusted remote access"),
+        "applescript_persistence": (30, "AppleScript automation can execute commands without an interactive shell"),
+        "application_bundle": (8, "application bundle is part of persistence provenance inventory"),
+        "cron": (20, "cron job executes commands on a schedule or at reboot"),
+        "periodic": (15, "periodic job executes automatically on a system schedule"),
+    }.get(item.mechanism)
+    if mechanism_weight:
+        score += mechanism_weight[0]
+        factors.append(mechanism_weight[1])
     if any(str(target).startswith(marker) or marker in str(target) for marker in TEMP_PATH_MARKERS):
         score += 30
         factors.append("target in temporary/shared writable path")
@@ -41,6 +62,12 @@ def score_item(item: PersistenceItem) -> PersistenceItem:
     if item.world_writable:
         score += 25
         factors.append("plist or target is world-writable")
+    if any("removal-resistance flags" in value for value in item.evidence):
+        score += 35
+        factors.append("non-system persistence is marked immutable or append-only")
+    if any("unreadable or malformed" in value for value in item.evidence):
+        score += 40
+        factors.append("non-system persistence could not be safely parsed")
     if item.writable_by_user and item.owner == "root":
         score += 25
         factors.append("root-owned persistence references user-writable target")
@@ -68,6 +95,15 @@ def score_item(item: PersistenceItem) -> PersistenceItem:
     if REMOTE_URL_RE.search(combined):
         score += 25
         factors.append("command contains remote URL")
+    if SUSPICIOUS_COMMAND_RE.search(combined) and REMOTE_URL_RE.search(combined):
+        score += 25
+        factors.append("network retrieval is combined with an execution-capable command")
+    if item.mechanism == "launch_daemon" and item.signed_status in {"unsigned", "invalid"}:
+        score += 35
+        factors.append("unsigned or invalid LaunchDaemon can execute with system privileges")
+    if item.mechanism == "ssh_authorized_key" and item.baseline_status in {"new", "changed"}:
+        score += 35
+        factors.append("SSH key is new or changed compared with the approved baseline")
     if item.baseline_status == "new":
         score += 18
         factors.append("new compared to baseline")
@@ -84,7 +120,8 @@ def score_item(item: PersistenceItem) -> PersistenceItem:
 
 
 def findings_for_item(item: PersistenceItem) -> list[PersistenceFinding]:
-    if item.risk_level in {"INFO", "LOW"} and item.target_exists and not item.world_writable:
+    target_is_satisfied = item.target_exists or not (item.program or item.executable_path)
+    if item.risk_level in {"INFO", "LOW"} and target_is_satisfied and not item.world_writable:
         return []
     title = f"{item.risk_level}: Review {item.mechanism.replace('_', ' ')} persistence item"
     description = f"{item.label or Path(item.path).name or item.mechanism} scored {item.risk_score}/100 for persistence risk."

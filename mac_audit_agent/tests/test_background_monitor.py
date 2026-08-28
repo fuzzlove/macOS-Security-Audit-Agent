@@ -1,5 +1,6 @@
 import os
 import json
+import inspect
 import plistlib
 import sys
 import subprocess
@@ -9,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from mac_audit_agent.emergency_lockdown import CONFIRMATION_TEXT, LockdownModeCapability, POLICY_ATTEMPT_ACTIVATION, save_policy
 from mac_audit_agent.launch_agent import (
@@ -39,7 +40,7 @@ from mac_audit_agent.monitor import _resolve_monitor_db_path
 from mac_audit_agent.persistence_monitor import PersistenceMonitor, PersistenceSnapshot
 from mac_audit_agent.network_monitor import NetworkMonitor, NetworkMonitorSnapshot
 from mac_audit_agent.native_event_bridge import NativeEventBridge, NativeEventFrame, native_event_frame_to_event, normalize_native_event_type
-from mac_audit_agent.notification_manager import NotificationManager, applescript_escape, send_alert_dialog, send_notification
+from mac_audit_agent.notification_manager import MANDATORY_VISIBLE_ALERT_EVENT_TYPES, NotificationManager, applescript_escape, send_alert_dialog, send_notification
 from mac_audit_agent.privacy_monitor import PrivacyMonitor, PrivacyMonitorSnapshot
 from mac_audit_agent.reporting import export_scan_result_html, export_scan_result_json
 from mac_audit_agent.session_monitor import SessionMonitor, SessionSnapshot, SessionStateObserver
@@ -51,7 +52,7 @@ from mac_audit_agent.system_monitor_readiness import (
     process_deployment_event_flow_request,
 )
 from mac_audit_agent.rules import canonical_event_type, sanitize_signal_text
-from mac_audit_agent.ui.background_monitor_panel import BackgroundMonitorPanel
+from mac_audit_agent.ui.background_monitor_panel import BackgroundMonitorPanel, EVENT_TYPES
 from mac_audit_agent.workflow_layer import InvestigatorWorkflowLayer
 
 
@@ -68,6 +69,17 @@ class FakePopenProcess:
 
     def poll(self):
         return self.returncode
+
+
+def test_system_monitor_filter_includes_every_mandatory_visible_alert_type() -> None:
+    assert MANDATORY_VISIBLE_ALERT_EVENT_TYPES <= set(EVENT_TYPES)
+
+
+def test_main_gui_refresh_never_consumes_the_user_notifier_queue() -> None:
+    assert "process_pending_notifications" not in inspect.getsource(BackgroundMonitorPanel.refresh)
+    repair_source = inspect.getsource(BackgroundMonitorPanel.repair_alerts_notifier)
+    assert "wait_for_visible_alert_trace" in repair_source
+    assert "process_pending_notifications" not in repair_source
 
 
 class FakeLaunchAgent:
@@ -140,7 +152,7 @@ def _monitor_status(**overrides):
 def test_launch_agent_plist_generated_correctly(tmp_path: Path) -> None:
     payload = build_launch_agent_plist(db_path=tmp_path / "audit.sqlite", poll_interval_seconds=30, python_executable="/usr/bin/python3")
     assert payload["Label"] == LAUNCH_AGENT_LABEL
-    assert payload["ProgramArguments"] == ["/usr/bin/python3", str(runtime_monitor_script_path()), "--run"]
+    assert payload["ProgramArguments"] == ["/usr/bin/python3", "-m", "mac_audit_agent.monitor", "--run", "--mode", "user-notifier"]
     assert payload["RunAtLoad"] is True
     assert payload["KeepAlive"] is True
     assert payload["WorkingDirectory"] == str(runtime_root())
@@ -157,7 +169,7 @@ def test_launch_daemon_plist_generated_correctly(tmp_path: Path, monkeypatch) ->
     monkeypatch.setattr("mac_audit_agent.launch_agent.SYSTEM_DB_PATH", tmp_path / "system.sqlite3")
     payload = build_launch_agent_plist(db_path=tmp_path / "system.sqlite3", poll_interval_seconds=30, python_executable="/usr/bin/python3", scope="system")
     assert payload["Label"] == LAUNCH_AGENT_LABEL
-    assert payload["ProgramArguments"] == ["/usr/bin/python3", str(tmp_path / "system-runtime" / "mac_audit_agent" / "monitor.py"), "--run"]
+    assert payload["ProgramArguments"] == ["/usr/bin/python3", "-m", "mac_audit_agent.monitor", "--run", "--mode", "system-daemon"]
     assert "ProcessType" not in payload
     assert payload["WorkingDirectory"] == str(tmp_path / "system-runtime")
     assert payload["EnvironmentVariables"]["MAC_AUDIT_AGENT_LAUNCH_SCOPE"] == "system"
@@ -185,7 +197,8 @@ def test_system_monitor_plist_generated_with_system_mode(tmp_path: Path, monkeyp
     )
     assert payload["ProgramArguments"] == [
         "/usr/bin/python3",
-        str(tmp_path / "system-runtime" / "mac_audit_agent" / "monitor.py"),
+        "-m",
+        "mac_audit_agent.monitor",
         "--run",
         "--mode",
         "system-daemon",
@@ -439,7 +452,16 @@ def test_system_daemon_does_not_call_applescript_directly(tmp_path: Path) -> Non
     assert service.notifications.status().startswith("system daemon")
     event = service.run_self_test()
     assert event.event_type == "monitor_self_test"
-    assert service.db.latest_monitor_events(limit=1)[0].event_type == "monitor_self_test"
+    stored = service.db.latest_monitor_events(limit=1)[0]
+    assert stored.event_type == "monitor_self_test"
+    assert stored.notification_sent is False
+    assert stored.notification_decision == "queued_for_user_notifier"
+    assert stored.notification_reason == "system_daemon_published"
+    trace = service.db.get_event_alert_trace(stored.event_id)
+    assert trace is not None
+    assert trace.notification_policy_checked is False
+    assert trace.overlay_dispatch_result == "queued_for_user_notifier"
+    assert trace.render_verification_status == "queued_not_yet_rendered"
     assert service.db.latest_monitor_heartbeat()
 
 
@@ -464,6 +486,26 @@ def test_user_notifier_processes_pending_events(tmp_path: Path, monkeypatch) -> 
     assert [item.event_type for item in notified] == ["launchdaemon_added"]
 
 
+def test_user_notifier_finalizes_policy_suppression_so_new_alerts_are_not_starved(tmp_path: Path, monkeypatch) -> None:
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite", mode="user-notifier", record_startup=False)
+    event = BackgroundMonitorEvent(
+        event_id="suppressed-1",
+        timestamp="2026-04-25T00:00:00+00:00",
+        event_type="launchctl_list_observed",
+        severity="info",
+        source="test",
+        evidence="Benign policy suppression fixture.",
+        confidence="high",
+        recommendation="none",
+    )
+    service.db.record_monitor_event(event, dedupe_window_seconds=0)
+    monkeypatch.setattr(service.notifications, "should_notify", lambda item, force=False: False)
+    assert service.process_pending_notifications() == []
+    stored = service.db.recent_background_monitor_events(limit=1)[0]
+    assert stored.notification_sent is True
+    assert service.db.pending_background_monitor_events(limit=10) == []
+
+
 def test_user_mode_remains_default() -> None:
     manager = LaunchAgentManager(Path("/tmp/audit.sqlite"))
     assert manager.scope == "user"
@@ -484,7 +526,7 @@ def test_explicit_user_scope_is_not_overridden_by_system_environment(monkeypatch
     assert default_launch_agent_paths("user").plist_path.parent == user_home_dir() / "Library" / "LaunchAgents"
     payload = build_launch_agent_plist(db_path=Path("/tmp/audit.sqlite"), scope="user", mode="user-notifier")
     assert payload["WorkingDirectory"] == str(user_home_dir() / ".mac_audit_agent" / "runtime")
-    assert payload["ProgramArguments"][1] == str(user_home_dir() / ".mac_audit_agent" / "runtime" / "mac_audit_agent" / "monitor.py")
+    assert payload["ProgramArguments"][1:3] == ["-m", "mac_audit_agent.monitor"]
     assert payload["EnvironmentVariables"]["MAC_AUDIT_AGENT_LAUNCH_SCOPE"] == "user"
 
 
@@ -804,6 +846,11 @@ def test_launch_agent_install_validates_with_plutil_and_sets_permissions(tmp_pat
     assert any(command[:2] == [PLUTIL_BIN, "-lint"] for command in calls)
     assert any(call == (manager.paths.plist_path, 0o644) for call in chmod_calls)
     assert any(call[0] == manager.paths.plist_path for call in chown_calls)
+    manifest_path = runtime_base / "install_manifest.json"
+    assert manifest_path.exists()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["scope"] == "user"
+    assert manifest["manifest_digest_sha512"]
 
 
 def test_launch_agent_start_stop_without_root(tmp_path: Path) -> None:
@@ -2161,6 +2208,66 @@ def test_hardware_monitor_emits_only_explicit_new_moisture_markers() -> None:
     events = monitor.evaluate(baseline, current)
     assert [event.event_type for event in events] == ["system_moisture_detected"]
     assert events[0].severity == "critical"
+    metadata = json.loads(events[0].metadata_json)
+    assert metadata["affected_component"] == "USB-C port"
+    assert metadata["physical_damage_status"] == "POSSIBLE_NOT_CONFIRMED"
+    assert metadata["requires_human_confirmation"] is True
+    assert "do not charge" in events[0].recommendation.lower()
+
+
+def test_hardware_monitor_rejects_negated_moisture_messages() -> None:
+    messages = "\n".join(
+        [
+            "No liquid detected in USB-C port",
+            "Moisture not detected",
+            "Liquid warning cleared",
+            "Water present: false",
+            "Moisture status normal",
+        ]
+    )
+
+    def executor(command: list[str]) -> tuple[int, str, str]:
+        if command[0] == "/usr/sbin/ioreg" and "AppleHPMDevice" in command:
+            return 0, messages, ""
+        if command[0] == "/usr/bin/log":
+            return 0, messages, ""
+        return 1, "", "unavailable"
+
+    snapshot = HardwareMonitor(executor=executor).collect_snapshot(include_usb=False, include_bluetooth=False)
+    assert snapshot.moisture_markers == set()
+
+
+def test_hardware_monitor_collects_affirmative_liquid_warning() -> None:
+    def executor(command: list[str]) -> tuple[int, str, str]:
+        if command[0] == "/usr/sbin/ioreg" and "AppleHPMDevice" in command:
+            return 0, "Liquid detected in Thunderbolt port", ""
+        if command[0] == "/usr/bin/log":
+            return 0, "", ""
+        return 1, "", "unavailable"
+
+    snapshot = HardwareMonitor(executor=executor).collect_snapshot(include_usb=False, include_bluetooth=False)
+    assert snapshot.moisture_markers == {"Liquid detected in Thunderbolt port"}
+
+
+def test_moisture_alert_explains_damage_uncertainty_and_safe_response(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "monitor.sqlite3")
+    manager = NotificationManager(db=db)
+    event = BackgroundMonitorEvent(
+        event_id="liquid-warning",
+        timestamp=utc_now_iso(),
+        event_type="system_moisture_detected",
+        severity="critical",
+        source="hardware_moisture_marker",
+        evidence="Liquid detected in USB-C port",
+        confidence="high",
+        metadata_json=json.dumps({"affected_component": "USB-C port"}),
+    )
+    decision = manager.should_show_visible_alert(event, force=True)
+    assert manager._overlay_title_for(event, decision) == "Critical Liquid/Moisture Warning"
+    details = manager._overlay_details_for(event, decision)
+    assert "USB-C port" in details
+    assert "damage is not confirmed" in details
+    assert "stop charging" in details
 
 
 def test_usb_reconnect_observer_enqueues_new_connection() -> None:
@@ -2984,6 +3091,22 @@ def test_background_monitor_panel_shows_duplicate_occurrence_count(tmp_path: Pat
     assert panel.events_table.horizontalHeaderItem(6).text() == "Occurrences"
     assert panel.events_table.item(0, 6).text() == "4 (duplicate burst)"
     panel.close()
+    app.processEvents()
+
+
+def test_background_monitor_refresh_does_not_touch_closed_db_during_shutdown(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    parent = QWidget()
+    parent.shutdown_coordinator = type("Coordinator", (), {"shutting_down": True})()
+    db = AuditDatabase(tmp_path / "shutdown-race.sqlite", tmp_path / "logs")
+    panel = BackgroundMonitorPanel(db, FakeLaunchAgent(installed=False, running=False), parent, audit_mode=True)
+    db.close()
+
+    panel.refresh()
+
+    assert panel._shutdown_in_progress() is True
+    panel.close()
+    parent.close()
     app.processEvents()
 
 
@@ -4107,12 +4230,33 @@ def test_restart_monitor_catches_launchctl_failures(tmp_path: Path, monkeypatch)
     app = QApplication.instance() or QApplication([])
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
     panel = BackgroundMonitorPanel(db, FakeLaunchAgent(installed=True, running=False))
+    panel.system_launch_agent = FakeLaunchAgent(installed=False, running=False)
     messages = []
     monkeypatch.setattr(panel.launch_agent, "stop", lambda: None)
     monkeypatch.setattr(panel.launch_agent, "start", lambda: (_ for _ in ()).throw(RuntimeError("Command failed: /bin/launchctl kickstart -k gui/501/com.mac-audit-agent.monitor\nstderr:\nboom")))
     monkeypatch.setattr("mac_audit_agent.ui.background_monitor_panel.QMessageBox.warning", lambda *args, **kwargs: messages.append(args[2]))
     panel.restart_monitor()
     assert "launchctl" in messages[0]
+    assert app is not None
+
+
+def test_visibility_restart_reconciles_loaded_system_domain_before_control(tmp_path: Path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    db.set_background_monitor_state("monitor_mode", "user")
+    panel = BackgroundMonitorPanel(db, FakeLaunchAgent(installed=True, running=False))
+    panel.system_launch_agent = FakeLaunchAgent(installed=True, running=True)
+    calls = []
+
+    monkeypatch.setattr(panel, "_require_system_service_authorization", lambda operation: calls.append(("authorize", operation)) or False)
+    monkeypatch.setattr(panel.launch_agent, "start", lambda: calls.append(("wrong-domain-start", "gui")))
+    monkeypatch.setattr(panel, "refresh", lambda: None)
+
+    panel.restart_monitor()
+
+    assert db.get_background_monitor_state("monitor_mode", "") == "system"
+    assert db.get_background_monitor_state("current_launchctl_domain", "") == "system"
+    assert calls == [("authorize", "Restarting the System Monitor")]
     assert app is not None
 
 
@@ -4732,6 +4876,35 @@ def test_repair_action_attempts_bootout_bootstrap_kickstart(tmp_path: Path, monk
     assert app is not None
 
 
+def test_repair_reconciles_healthy_system_daemon_instead_of_bootstrapping_gui_domain(tmp_path: Path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    user_manager = LaunchAgentManager(db.path, scope="user")
+    panel = BackgroundMonitorPanel(db, user_manager, audit_mode=True)
+    user_status = _monitor_status(installed=False, loaded=False, running=False, current_launchctl_domain=f"gui/{os.getuid()}")
+    system_status = _monitor_status(
+        installed=True,
+        loaded=True,
+        running=True,
+        plist_path="/Library/LaunchDaemons/com.mac-audit-agent.monitor.plist",
+        current_launchctl_domain="system",
+    )
+    monkeypatch.setattr(panel.launch_agent, "status", lambda: user_status)
+    monkeypatch.setattr(panel.system_launch_agent, "status", lambda: system_status)
+    monkeypatch.setattr(panel, "_ensure_user_notifier_for_alert_settings", lambda *_: "notifier healthy")
+    monkeypatch.setattr(panel, "_active_monitor_db", lambda: db)
+    monkeypatch.setattr(panel, "refresh", lambda: None)
+    monkeypatch.setattr("mac_audit_agent.ui.background_monitor_panel.QMessageBox.information", lambda *args, **kwargs: None)
+    monkeypatch.setattr(panel.launch_agent, "repair", lambda **_: pytest.fail("user-domain repair must not run"))
+
+    panel.repair_monitor()
+
+    assert db.get_background_monitor_state("monitor_mode", "") == "system"
+    assert db.get_background_monitor_state("current_launchctl_domain", "") == "system"
+    assert db.get_background_monitor_state("last_error", "missing") == ""
+    assert app is not None
+
+
 def test_repair_alerts_notifier_recreates_plist_and_verifies_overlay(tmp_path: Path, monkeypatch) -> None:
     app = QApplication.instance() or QApplication([])
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
@@ -4951,7 +5124,9 @@ def test_two_pending_real_events_alert_sequentially(tmp_path: Path, monkeypatch)
             )
         )
 
-    notified = notifier.process_pending_notifications()
+    first_notified = notifier.process_pending_notifications()
+    second_notified = notifier.process_pending_notifications()
+    notified = [*first_notified, *second_notified]
 
     assert [event.event_type for event in notified] == ["lid_opened", "bluetooth_device_connected"]
     assert overlay_calls == ["lid_opened", "bluetooth_device_connected"]
@@ -5112,7 +5287,7 @@ def test_enable_continuous_monitoring_requires_system_install(tmp_path: Path, mo
     assert app is not None
 
 
-def test_enable_continuous_monitoring_starts_system_daemon_and_user_notifier(tmp_path: Path, monkeypatch) -> None:
+def test_enable_continuous_monitoring_starts_system_daemon_and_canonical_user_notifier(tmp_path: Path, monkeypatch) -> None:
     app = QApplication.instance() or QApplication([])
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
     db.set_background_monitor_state("monitor_mode", "system")
@@ -5126,7 +5301,17 @@ def test_enable_continuous_monitoring_starts_system_daemon_and_user_notifier(tmp
         ]
     )
     monkeypatch.setattr(panel.system_launch_agent, "start", lambda: calls.append("system-start"))
-    monkeypatch.setattr(panel.launch_agent, "start", lambda: calls.append("user-notifier-start"))
+    monkeypatch.setattr(panel.launch_agent, "status", lambda: (_ for _ in ()).throw(AssertionError("legacy monitor must not be probed in system mode")))
+    monkeypatch.setattr(panel.launch_agent, "start", lambda: (_ for _ in ()).throw(AssertionError("legacy monitor must not be started in GUI domain")))
+    notifier = type(
+        "CanonicalNotifier",
+        (),
+        {
+            "get_user_notifier_status": lambda self: type("NotifierStatus", (), {"plist_exists": True})(),
+            "load_user_notifier": lambda self: calls.append("canonical-notifier-start"),
+        },
+    )()
+    monkeypatch.setattr(panel, "_user_notifier_installer", lambda *_args: notifier)
     monkeypatch.setattr(panel.db, "get_background_monitor_status", lambda: next(states))
     monkeypatch.setattr("mac_audit_agent.ui.background_monitor_panel.time.sleep", lambda _seconds: None)
     monkeypatch.setattr("mac_audit_agent.ui.background_monitor_panel.QMessageBox.warning", lambda *args, **kwargs: None)
@@ -5134,7 +5319,7 @@ def test_enable_continuous_monitoring_starts_system_daemon_and_user_notifier(tmp
 
     panel.toggle_continuous_monitoring(True)
 
-    assert calls == ["system-start", "user-notifier-start"]
+    assert calls == ["system-start", "canonical-notifier-start"]
     assert app is not None
 
 

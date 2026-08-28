@@ -39,6 +39,11 @@ class _FakeReadiness:
         return _FakeReadinessReport()
 
 
+class _PermissionDeniedReadiness:
+    def audit_deployment(self) -> _FakeReadinessReport:
+        raise PermissionError(1, "Operation not permitted", "/Library/Caches/com.apple.amsengagement.classicdatavault")
+
+
 class _FakeRadar:
     def load_cached_state(self) -> dict[str, object]:
         return {
@@ -103,6 +108,78 @@ def test_operational_health_report_includes_core_components(tmp_path: Path) -> N
     assert report.overall_status in {"healthy", "repair recommended", "degraded", "broken"}
 
 
+def test_operational_health_component_permission_error_becomes_health_check(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    engine = OperationalHealthEngine(
+        db,
+        user_launch_agent=_FakeLaunchAgent(),
+        system_launch_agent=_FakeLaunchAgent(),
+        notification_manager=_FakeNotifier(),
+        system_readiness=_PermissionDeniedReadiness(),
+        cve_radar_engine=_FakeRadar(),
+        reports_dir=tmp_path / "reports",
+        health_log_path=tmp_path / "operational_health.log",
+    )
+
+    report = engine.build_report()
+    monitor = next(check for check in report.checks if check.component == "System Monitor")
+
+    assert monitor.status == "degraded"
+    assert monitor.category == "permission_issue"
+    assert "classicdatavault" in monitor.evidence
+    assert report.overall_status in {"degraded", "broken"}
+
+
+def test_operational_health_uses_application_integrity_root(tmp_path: Path, monkeypatch) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    app_root = tmp_path / "app-resources"
+    seen: list[Path] = []
+
+    class _FakeIntegrityStatus:
+        status = "verified"
+        result_code = "VALID"
+        source_modified_files: list[str] = []
+        missing_files: list[str] = []
+        extra_files: list[str] = []
+        generated_modified_files: list[str] = []
+        recommended_action = ""
+        reason = "ok"
+        git_commit = "commit"
+        build_id = "build"
+        trust_state = "trusted"
+        manifest_path = str(app_root / "mac_audit_agent" / "integrity" / "integrity_manifest.json")
+        authority = {"checked_files": 1, "excluded_files": []}
+
+        def to_dict(self) -> dict[str, object]:
+            return {
+                "status": self.status,
+                "result_code": self.result_code,
+                "trust_state": self.trust_state,
+                "manifest_path": self.manifest_path,
+                "source_modified_files": [],
+                "missing_files": [],
+                "extra_files": [],
+                "authority": self.authority,
+            }
+
+    class _FakeAdapter:
+        def __init__(self, root: Path | None = None) -> None:
+            seen.append(Path(root or ""))
+
+        def get_integrity_status_for_operational_health(self):
+            return _FakeIntegrityStatus()
+
+    monkeypatch.setattr("mac_audit_agent.operational_health.application_integrity_root", lambda: app_root)
+    monkeypatch.setattr("mac_audit_agent.operational_health.IntegrityWrapperAdapter", _FakeAdapter)
+
+    report = _health_engine(db, tmp_path).build_report()
+    source = next(check for check in report.checks if check.component == "Source Integrity")
+
+    assert source.status == "healthy"
+    assert seen
+    assert all(path == app_root for path in seen)
+
+
 def _health_engine(db: AuditDatabase, tmp_path: Path) -> OperationalHealthEngine:
     return OperationalHealthEngine(
         db,
@@ -123,6 +200,21 @@ def test_missing_source_integrity_manifest_is_degraded_not_broken(tmp_path: Path
 
     assert source.status == "degraded"
     assert "No trusted integrity manifest" in source.summary
+
+
+def test_detector_health_reads_active_system_monitor_database(tmp_path: Path, monkeypatch) -> None:
+    settings_db = AuditDatabase(tmp_path / "settings.sqlite", tmp_path / "logs")
+    system_path = tmp_path / "system.sqlite"
+    system_db = AuditDatabase(system_path, tmp_path / "system-logs")
+    system_db.set_background_monitor_state("detector_last_run_timestamp", "2026-07-17T20:00:00+00:00")
+    system_db.set_background_monitor_state("detector_errors", "{}")
+    system_db.close()
+    monkeypatch.setattr("mac_audit_agent.operational_health.get_active_monitor_db_path", lambda _path: system_path)
+
+    detector = _health_engine(settings_db, tmp_path)._detector_health()
+
+    assert detector.status == "healthy"
+    assert detector.evidence == "2026-07-17T20:00:00+00:00"
 
 
 def test_draft_source_integrity_manifest_is_degraded_not_broken(tmp_path: Path) -> None:

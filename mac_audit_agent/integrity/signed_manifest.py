@@ -5,10 +5,10 @@ import json
 import stat
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from mac_audit_agent.compat.datetime_compat import utc_now
 from mac_audit_agent.build_identity import detect_build_identity
 from mac_audit_agent.integrity.hasher import DEFAULT_EXCLUDED_PATTERNS, calculate_sha256, collect_integrity_files
 from mac_audit_agent.integrity.manifest import canonical_source_type
@@ -68,7 +68,7 @@ class SignedManifest:
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return utc_now().isoformat()
 
 
 def manifest_digest(manifest: SignedManifest) -> str:

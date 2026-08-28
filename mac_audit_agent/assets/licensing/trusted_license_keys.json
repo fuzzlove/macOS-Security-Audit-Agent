@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "description": "Production Ed25519 public license verification keys. Private keys must never be stored in this repository or distributed with MSAA.",
+  "keys": [
+    {
+      "algorithm": "Ed25519",
+      "enabled": true,
+      "key_id": "msaa-owner-2026-01",
+      "public_key": "uCKPxvSxfC+nIrdl76oXfxElVjjtMTPkOpIONzr+ZK0="
+    },
+    {
+      "algorithm": "Ed25519",
+      "enabled": true,
+      "key_id": "msaa-stripe-2026-01",
+      "public_key": "jJOfd4sF6htaxOA3tVkXgA7YPqQ0PVquSp5XrAAr2Mc="
+    }
+  ],
+  "revoked_license_ids": []
+}

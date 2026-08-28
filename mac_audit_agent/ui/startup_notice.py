@@ -5,6 +5,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QTextBrowser, QVBoxLayout
 
 
@@ -89,7 +90,9 @@ class StartupNoticeDialog(QDialog):
 def preview_startup_notice(parent=None, state_path: Path | None = None) -> bool:
     if startup_notice_has_been_previewed(state_path):
         return True
-    if StartupNoticeDialog(parent).exec() != QDialog.Accepted:
+    dialog = StartupNoticeDialog(parent)
+    QTimer.singleShot(0, lambda: _present_startup_notice(dialog))
+    if dialog.exec() != QDialog.Accepted:
         return False
     try:
         record_startup_notice_preview(state_path)
@@ -98,3 +101,12 @@ def preview_startup_notice(parent=None, state_path: Path | None = None) -> bool:
         # The reminder will appear again next launch if it cannot be recorded.
         pass
     return True
+
+
+def _present_startup_notice(dialog: QDialog) -> None:
+    dialog.show()
+    dialog.raise_()
+    dialog.activateWindow()
+    handle = dialog.windowHandle()
+    if handle is not None:
+        handle.requestActivate()

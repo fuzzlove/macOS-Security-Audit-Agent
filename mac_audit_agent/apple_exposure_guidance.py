@@ -10,6 +10,31 @@ APPLICABILITY_VALUES = {"confirmed_applicable", "likely_applicable", "review_nee
 CONFIDENCE_VALUES = {"low", "medium", "high", "very_high"}
 
 
+def is_meaningful_value(value: Any, *, treat_unknown_as_empty: bool = False) -> bool:
+    """
+    Return True when a value should be retained during normalization.
+
+    This intentionally avoids set-membership checks against arbitrary payload
+    values because Apple Exposure cards commonly contain nested lists/dicts.
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return True
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return False
+        return not (treat_unknown_as_empty and text.lower() == "unknown")
+    if isinstance(value, dict):
+        return any(is_meaningful_value(item, treat_unknown_as_empty=treat_unknown_as_empty) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(is_meaningful_value(item, treat_unknown_as_empty=treat_unknown_as_empty) for item in value)
+    return True
+
+
 @dataclass
 class AppleExposureUpdateGuide:
     guide_id: str
@@ -134,7 +159,9 @@ def normalize_apple_exposure_item(card_or_finding: Any) -> dict[str, Any]:
     alerts = payload.get("alerts")
     if isinstance(alerts, list) and alerts and isinstance(alerts[0], dict):
         merged = dict(alerts[0])
-        merged.update({key: value for key, value in payload.items() if value not in {None, "", []}})
+        for key, value in payload.items():
+            if is_meaningful_value(value):
+                merged[key] = value
         payload = merged
     cves = payload.get("cve_ids") or payload.get("cves") or payload.get("cve") or payload.get("cve_id") or []
     if isinstance(cves, str):
@@ -225,14 +252,14 @@ def build_apple_exposure_update_guide(
             source_finding_id="",
             source_item_id="",
             title="Apple Security Update Guidance",
-            affected_product="No Apple Exposure item selected",
-            affected_component="No Apple Exposure item selected",
+            affected_product="No Apple Exposure item is selected",
+            affected_component="No Apple Exposure item is selected",
             detected_version="",
             recommended_version="",
             forecast_level="watch",
             applicability="unknown",
             confidence="medium",
-            why_update_is_recommended="Select an Apple Exposure item for item-specific guidance. General Apple security update guidance is shown below.",
+            why_update_is_recommended="No Apple Exposure item is selected. Select an Apple Exposure item for item-specific guidance. General Apple security update guidance is shown below.",
             urgency_explanation="General guidance cannot assign item-specific urgency. Check Software Update and review any Apple Exposure cards after refreshing the assessment.",
             recommended_actions=["Open Software Update and install available macOS or Safari security updates.", "Refresh Apple Exposure Assessment after updating.", "Select an Apple Exposure item for item-specific guidance."],
             step_by_step_update_instructions=["Open System Settings.", "Go to General -> Software Update.", "Install available macOS or Safari security updates.", "Restart if prompted.", "Reopen MSAA.", "Refresh Apple Exposure Assessment.", "Review whether the forecast level changed."],
@@ -282,6 +309,11 @@ def build_apple_exposure_update_guide(
     why = _first(payload, "why_update_is_recommended", "why_shown_to_you", "why_shown", "why_it_matters", "description")
     if not why:
         why = f"Apple security updates may address vulnerabilities affecting {component}. Review the advisory and Software Update before deciding."
+    cves = payload.get("normalized_cves", [])
+    if cves:
+        why = f"{why} Associated CVE(s): {', '.join(cves)}."
+    else:
+        why = f"{why} No CVE was associated with this finding."
     urgency = {
         "critical": "Critical: install the relevant Apple update as soon as operationally safe, especially if exploitation is known or suspected.",
         "urgent": "Urgent: plan the update promptly and preserve evidence first if this Mac is part of an investigation.",
@@ -348,6 +380,13 @@ def build_apple_exposure_update_guide(
             "Confirm detected macOS version/build changed or the update no longer appears.",
         ]
         actions = ["Install available macOS security updates from Software Update.", "Restart if prompted and re-run Apple Exposure Assessment."]
+
+    if cves:
+        actions.insert(0, f"Review Apple/NVD context for: {', '.join(cves)}.")
+        common_verification.append("Verify macOS/app version no longer matches affected version.")
+    else:
+        actions.insert(0, "No CVE was associated with this finding. Verify Apple update status and review vendor or Apple guidance.")
+        common_verification.append("Confirm no CVE-specific action was inferred without source data.")
 
     limitations = _freshness_limitations(freshness_metadata)
     if missing:

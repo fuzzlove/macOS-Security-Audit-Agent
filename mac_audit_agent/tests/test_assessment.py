@@ -68,6 +68,31 @@ def test_assessment_handles_missing_scan_without_fake_findings() -> None:
     assert "No assessment is available yet" in assessment.executive_summary or "No current security assessment" in assessment.executive_summary
 
 
+def test_applicable_apple_exposure_is_the_primary_recommended_action() -> None:
+    apple = {
+        "cards": [
+            {
+                "card_id": "apple-critical",
+                "applicability": "confirmed_applicable",
+                "forecast_level": "critical",
+                "status": "new",
+            }
+        ]
+    }
+
+    assessment = build_security_assessment(
+        _scan(),
+        BackgroundMonitorStatus(status_text="healthy"),
+        [],
+        {},
+        apple_exposure=apple,
+    )
+
+    assert assessment.recommended_actions[0]["title"] == "Apple Exposure Assessment"
+    assert assessment.recommended_actions[0]["primary"] is True
+    assert assessment.recommended_actions[0]["priority"] == "Immediate"
+
+
 def test_assessment_marks_collected_clean_categories_without_placeholder_risks() -> None:
     scan = _scan()
     scan.collected_artifacts.update(

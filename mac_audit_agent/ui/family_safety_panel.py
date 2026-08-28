@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QUrl, Qt, Signal
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
     QGridLayout,
     QHeaderView,
@@ -18,6 +22,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSplitter,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -33,6 +38,28 @@ from mac_audit_agent.family_safety.categories import (
     reset_all_family_view_state,
     reset_category_view_state,
 )
+from mac_audit_agent.family_safety.apply_engine import (
+    CURRENT_PROFILE_KEY,
+    LAST_APPLY_REPORT_KEY,
+    LAST_RUN_KEY,
+    apply_family_safety_recommendation,
+    restore_family_safety_snapshot,
+)
+from mac_audit_agent.family_safety.recommendation_engine import FamilySafetyRecommendationEngine
+from mac_audit_agent.family_safety.system_setup import (
+    build_family_system_setup_plan,
+    execute_family_system_setup_handoff,
+)
+from mac_audit_agent.family_safety.reporting import (
+    export_family_safety_configuration_excel,
+    export_family_safety_configuration_html,
+    export_family_safety_configuration_json,
+    export_family_safety_configuration_markdown,
+    export_family_safety_configuration_word,
+)
+from mac_audit_agent.family_safety.wizard_questions import canonical_family_safety_questions
+from mac_audit_agent.monitor_settings import load_settings
+from mac_audit_agent.ui.responsive_actions import ResponsiveActionRow
 
 
 PROFILE_OPTIONS = [
@@ -43,7 +70,30 @@ PROFILE_OPTIONS = [
     "Shared Family Computer",
     "Special Needs User",
     "School Device",
+    "Security Research Device",
+    "Government Asset",
+    "Doctor's Device",
+    "Nurse's Workstation",
+    "Health Device",
+    "Lawyer's Device / Legal Asset",
 ]
+
+
+DEVICE_ROLE_DEFAULTS: dict[str, dict[str, str]] = {
+    "Young Child": {"primary_user": "Child", "shared_device": "Shared by family", "alert_style": "High visibility", "device_monitoring": "Yes, alert for all new devices", "network_monitoring": "Yes, alert for DNS/gateway/VPN/new listeners", "admin_persistence_monitoring": "Yes, high visibility", "privacy_visibility": "Balanced"},
+    "Teen": {"primary_user": "Teen", "shared_device": "Shared by family", "alert_style": "Balanced alerts", "privacy_visibility": "Balanced"},
+    "Adult": {"primary_user": "Adult / owner", "shared_device": "Private device", "alert_style": "Balanced alerts", "privacy_visibility": "Balanced"},
+    "Senior": {"primary_user": "Elder / at-risk user", "alert_style": "High visibility", "privacy_visibility": "Balanced"},
+    "Shared Family Computer": {"primary_user": "Shared family device", "shared_device": "Shared by family", "alert_style": "Balanced alerts"},
+    "Special Needs User": {"primary_user": "Adult / owner", "alert_style": "Important alerts only", "privacy_visibility": "Privacy-first"},
+    "School Device": {"primary_user": "School/student device", "shared_device": "Shared by school/work", "alert_style": "Balanced alerts"},
+    "Security Research Device": {"primary_user": "Security research device", "alert_style": "Strict / security-focused", "privacy_visibility": "Visibility-first"},
+    "Government Asset": {"primary_user": "Government asset", "shared_device": "Shared by school/work", "alert_style": "Strict / security-focused", "government_hardening": "Yes, NIST/CISA/NSA-style strict recommendations", "privacy_visibility": "Visibility-first"},
+    "Doctor's Device": {"primary_user": "Doctor / clinician device", "alert_style": "High visibility", "privacy_visibility": "Privacy-first"},
+    "Nurse's Workstation": {"primary_user": "Nurse workstation", "shared_device": "Shared by school/work", "alert_style": "High visibility", "privacy_visibility": "Privacy-first"},
+    "Health Device": {"primary_user": "Health device", "alert_style": "High visibility", "privacy_visibility": "Privacy-first"},
+    "Lawyer's Device / Legal Asset": {"primary_user": "Lawyer / legal asset", "alert_style": "High visibility", "privacy_visibility": "Privacy-first"},
+}
 
 
 def _make_table(headers: list[str]) -> QTableWidget:
@@ -69,9 +119,12 @@ def _make_table(headers: list[str]) -> QTableWidget:
 def make_family_button(text: str, tooltip: str, style: str = "secondary", min_width: int | None = None) -> QPushButton:
     button = QPushButton(text)
     button.setToolTip(tooltip)
-    button.setMinimumHeight(36)
-    button.setMinimumWidth(min_width or max(120, len(text) * 8 + 32))
-    button.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
+    button.setAccessibleName(text)
+    button.setCursor(Qt.PointingHandCursor)
+    button.setMinimumHeight(38)
+    text_width = button.fontMetrics().horizontalAdvance(text)
+    button.setMinimumWidth(max(120, min_width or 0, text_width + 32))
+    button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
     if style == "primary":
         button.setProperty("role", "primary")
     return button
@@ -87,16 +140,363 @@ def _scroll_page(widget: QWidget, *, min_width: int = 0) -> QScrollArea:
     return scroll
 
 
+class FamilySafetyWizardDialog(QDialog):
+    def __init__(self, db: Any, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.db = db
+        self.questions = canonical_family_safety_questions()
+        self.answers: dict[str, str] = {question.question_id: question.default_option for question in self.questions}
+        self.recommendation = None
+        self.system_actions = []
+        self.apply_result: dict[str, Any] = {}
+        self.setWindowTitle("Family & Safety Configuration Wizard")
+        self.resize(980, 720)
+        layout = QVBoxLayout(self)
+        title = QLabel("Family & Safety Configuration Wizard")
+        title.setStyleSheet("font-size: 22px; font-weight: 700;")
+        layout.addWidget(title)
+        guardrail = QLabel(
+            "After final confirmation, MSAA applies supported local settings automatically and opens the first Apple-protected setting that needs owner, guardian, or administrator approval. "
+            "It does not upload device information or edit protected Screen Time databases."
+        )
+        guardrail.setWordWrap(True)
+        guardrail.setStyleSheet("color: #D6E4FF; font-weight: 600;")
+        layout.addWidget(guardrail)
+        self.stack = QStackedWidget()
+        self.question_widgets: dict[str, QComboBox] = {}
+        self._question_page = self._build_question_page()
+        self._preview_page = self._build_preview_page()
+        self.stack.addWidget(self._question_page)
+        self.stack.addWidget(self._preview_page)
+        layout.addWidget(self.stack, 1)
+        self.wizard_navigation_actions = ResponsiveActionRow(spacing=10)
+        self.back_button = make_family_button("Back to Questions", "Return to questions and revise answers.", min_width=170)
+        self.back_button.clicked.connect(lambda: self.stack.setCurrentWidget(self._question_page))
+        self.preview_button = make_family_button("Review Recommendation", "Generate and preview recommended changes before applying.", "primary", min_width=190)
+        self.preview_button.clicked.connect(self.generate_preview)
+        self.close_button = make_family_button("Cancel", "Close the wizard without applying settings.", min_width=120)
+        self.close_button.clicked.connect(self.reject)
+        self.wizard_navigation_actions.add_buttons([self.back_button, self.preview_button, self.close_button])
+        layout.addWidget(self.wizard_navigation_actions)
+
+    def _build_question_page(self) -> QWidget:
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        intro = QLabel(
+            "Fast setup: choose how this Mac will be used and MSAA will fill the recommended profile immediately. "
+            "You can then review or fine-tune every setting before the one final apply confirmation."
+        )
+        intro.setWordWrap(True)
+        outer.addWidget(intro)
+        role_frame = QFrame()
+        role_frame.setProperty("themeCard", True)
+        role_layout = QHBoxLayout(role_frame)
+        role_label = QLabel("This Mac is a:")
+        role_label.setStyleSheet("font-weight: 700;")
+        self.device_role_combo = QComboBox()
+        self.device_role_combo.setAccessibleName("Select the Family and Safety device role")
+        self.device_role_combo.addItem("Choose a device role…", "")
+        for option in PROFILE_OPTIONS:
+            self.device_role_combo.addItem(option, option)
+        self.device_role_combo.setMinimumWidth(280)
+        self.device_role_status = QLabel("Selecting a role builds the profile; nothing changes until final confirmation.")
+        self.device_role_status.setWordWrap(True)
+        self.device_role_status.setProperty("textRole", "muted")
+        role_layout.addWidget(role_label)
+        role_layout.addWidget(self.device_role_combo)
+        role_layout.addWidget(self.device_role_status, 1)
+        outer.addWidget(role_frame)
+        form = QWidget()
+        grid = QGridLayout(form)
+        grid.setContentsMargins(4, 4, 4, 4)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(10)
+        grid.setColumnStretch(0, 2)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 2)
+        for row, question in enumerate(self.questions):
+            prompt = QLabel(question.prompt)
+            prompt.setWordWrap(True)
+            prompt.setToolTip(question.help_text)
+            combo = QComboBox()
+            combo.addItems(question.options)
+            combo.setCurrentText(question.default_option)
+            combo.setToolTip(question.help_text + (f"\nPrivacy: {question.privacy_note}" if question.privacy_note else ""))
+            self.question_widgets[question.question_id] = combo
+            help_label = QLabel(question.help_text)
+            help_label.setWordWrap(True)
+            help_label.setStyleSheet("color: #9DB0C9;")
+            grid.addWidget(prompt, row, 0)
+            grid.addWidget(combo, row, 1)
+            grid.addWidget(help_label, row, 2)
+        scroll = _scroll_page(form, min_width=560)
+        outer.addWidget(scroll, 1)
+        self.device_role_combo.currentIndexChanged.connect(self._device_role_selected)
+        return page
+
+    def _device_role_selected(self, _index: int = -1) -> None:
+        role = str(self.device_role_combo.currentData() or "")
+        if not role:
+            return
+        defaults = {
+            "preserve_evidence": "Yes",
+            "bottom_right_alerts": "Yes",
+            "device_monitoring": "Yes, alert only for unknown/high-risk devices",
+            "network_monitoring": "Yes, alert only for suspicious changes",
+            "admin_persistence_monitoring": "Yes, important alerts only",
+            "government_hardening": "No, family-only recommendations",
+            "auto_apply": "Apply after confirmation",
+            **DEVICE_ROLE_DEFAULTS.get(role, {}),
+        }
+        for question_id, value in defaults.items():
+            combo = self.question_widgets.get(question_id)
+            if combo is not None and combo.findText(value) >= 0:
+                combo.setCurrentText(value)
+        self.device_role_status.setText(f"{role} defaults loaded. Review the generated profile and confirm once to apply supported changes.")
+        self.generate_preview()
+
+    def _build_preview_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        review_title = QLabel("Review Recommended Family & Safety Configuration")
+        review_title.setStyleSheet("font-size: 18px; font-weight: 700;")
+        layout.addWidget(review_title)
+        self.profile_summary = QTextEdit()
+        self.profile_summary.setReadOnly(True)
+        self.profile_summary.setMinimumHeight(170)
+        self.profile_summary.setLineWrapMode(QTextEdit.WidgetWidth)
+        layout.addWidget(self.profile_summary)
+        self.changes_table = QTableWidget(0, 8)
+        self.changes_table.setHorizontalHeaderLabels(["Category", "Setting", "Current", "Recommended", "Expected Effect", "Alert Noise", "Requires Restart", "Apply?"])
+        self.changes_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.changes_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.changes_table.verticalHeader().setVisible(False)
+        self.changes_table.setWordWrap(True)
+        layout.addWidget(self.changes_table, 1)
+        system_title = QLabel("macOS Setup Actions")
+        system_title.setStyleSheet("font-size: 15px; font-weight: 700;")
+        system_help = QLabel(
+            "AUTOMATIC applies inside MSAA after confirmation. USER APPROVAL REQUIRED opens the relevant Apple setting because MSAA cannot bypass owner/guardian approval. MDM REQUIRED identifies organization-managed policy."
+        )
+        system_help.setWordWrap(True)
+        system_help.setProperty("textRole", "muted")
+        self.system_actions_table = QTableWidget(0, 5)
+        self.system_actions_table.setHorizontalHeaderLabels(["macOS Control", "Desired State", "Automation", "Why", "Verification"])
+        self.system_actions_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.system_actions_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.system_actions_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.system_actions_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.system_actions_table.verticalHeader().setVisible(False)
+        self.system_actions_table.setWordWrap(True)
+        self.system_actions_table.setMinimumHeight(180)
+        layout.addWidget(system_title)
+        layout.addWidget(system_help)
+        layout.addWidget(self.system_actions_table)
+        self.preview_actions = ResponsiveActionRow(spacing=10)
+        self.select_all_button = make_family_button("Select all", "Select every proposed setting change for apply.", min_width=120)
+        self.select_all_button.clicked.connect(lambda: self._set_all_checks(True))
+        self.deselect_all_button = make_family_button("Deselect all", "Deselect every proposed setting change.", min_width=120)
+        self.deselect_all_button.clicked.connect(lambda: self._set_all_checks(False))
+        self.apply_selected_button = make_family_button("Apply selected changes", "Apply only checked changes after explicit confirmation.", "primary", min_width=190)
+        self.apply_selected_button.clicked.connect(self.apply_selected_changes)
+        self.save_draft_button = make_family_button("Save as draft", "Save the recommendation locally without applying changes.", min_width=140)
+        self.save_draft_button.clicked.connect(self.save_draft)
+        self.export_report_button = make_family_button("Export recommendation report", "Export a local report without applying settings.", min_width=230)
+        self.export_report_button.clicked.connect(self.export_report)
+        self.preview_actions.add_buttons(
+            [
+                self.select_all_button,
+                self.deselect_all_button,
+                self.apply_selected_button,
+                self.save_draft_button,
+                self.export_report_button,
+            ]
+        )
+        layout.addWidget(self.preview_actions)
+        self.preview_notes = QTextEdit()
+        self.preview_notes.setReadOnly(True)
+        self.preview_notes.setMinimumHeight(160)
+        self.preview_notes.setLineWrapMode(QTextEdit.WidgetWidth)
+        layout.addWidget(self.preview_notes)
+        return page
+
+    def generate_preview(self) -> None:
+        self.answers = {question_id: widget.currentText() for question_id, widget in self.question_widgets.items()}
+        settings = load_settings(self.db)
+        engine = FamilySafetyRecommendationEngine()
+        self.recommendation = engine.recommend(
+            self.answers,
+            settings,
+            current_monitor_mode=settings.installation.monitor_mode,
+            current_user_account_type="local account",
+            available_permissions=[],
+            existing_family_settings={},
+            existing_alert_configuration=settings.alerting.__dict__.copy(),
+        )
+        self.system_actions = build_family_system_setup_plan(self.recommendation.selected_profile.profile_id)
+        self._render_preview()
+        self.stack.setCurrentWidget(self._preview_page)
+
+    def _render_preview(self) -> None:
+        if self.recommendation is None:
+            return
+        rec = self.recommendation
+        profile = rec.selected_profile
+        self.profile_summary.setPlainText(
+            "\n\n".join(
+                [
+                    f"Recommended Profile: {profile.display_name}",
+                    profile.description,
+                    "Why This Profile Was Selected:\n- " + "\n- ".join(rec.reasoning),
+                    "Expected Alerts:\n- " + "\n- ".join(profile.expected_behavior),
+                    "Privacy Notes:\n- " + "\n- ".join(rec.privacy_notes),
+                    "Manual Review Items:\n- " + "\n- ".join(rec.manual_review_items),
+                    "Revert Plan:\n- " + "\n- ".join(rec.revert_plan),
+                ]
+            )
+        )
+        self.changes_table.setRowCount(0)
+        for row, change in enumerate(rec.proposed_changes):
+            self.changes_table.insertRow(row)
+            values = [
+                change.category,
+                change.setting_path,
+                str(change.current_value),
+                str(change.proposed_value),
+                change.expected_effect,
+                change.alert_noise_impact,
+                "yes" if change.requires_restart else "no",
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                self.changes_table.setItem(row, column, item)
+            box = QCheckBox()
+            box.setChecked(True)
+            box.setToolTip("Apply this individual change if you confirm.")
+            self.changes_table.setCellWidget(row, 7, box)
+        self.changes_table.resizeRowsToContents()
+        self.system_actions_table.setRowCount(0)
+        for row, action in enumerate(self.system_actions):
+            self.system_actions_table.insertRow(row)
+            values = [action.title, action.desired_state, action.automation.replace("_", " "), action.reason, action.verification]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setToolTip(str(value))
+                self.system_actions_table.setItem(row, column, item)
+        self.system_actions_table.resizeRowsToContents()
+        self.preview_notes.setPlainText(
+            "\n".join(
+                [
+                    "Warnings:",
+                    *[f"- {item}" for item in rec.warnings],
+                    "",
+                    "Standards Alignment:",
+                    *[f"- {item}" for item in rec.standards_alignment],
+                    "",
+                    "Unchanged Settings:",
+                    *[f"- {item.setting_path}: already {item.current_value}" for item in rec.unchanged_settings[:12]],
+                ]
+            )
+        )
+
+    def _set_all_checks(self, checked: bool) -> None:
+        for row in range(self.changes_table.rowCount()):
+            widget = self.changes_table.cellWidget(row, 7)
+            if isinstance(widget, QCheckBox):
+                widget.setChecked(checked)
+
+    def _selected_change_ids(self) -> list[str]:
+        if self.recommendation is None:
+            return []
+        ids: list[str] = []
+        for row, change in enumerate(self.recommendation.proposed_changes):
+            widget = self.changes_table.cellWidget(row, 7)
+            if isinstance(widget, QCheckBox) and widget.isChecked():
+                ids.append(change.change_id)
+        return ids
+
+    def apply_selected_changes(self) -> None:
+        if self.recommendation is None:
+            return
+        selected = self._selected_change_ids()
+        if not selected:
+            QMessageBox.information(self, "No Changes Selected", "Select at least one proposed change to apply.")
+            return
+        result = QMessageBox.question(
+            self,
+            "Apply Selected Family Safety Settings",
+            "Apply the selected MSAA settings now and continue to the first required Apple setting? A pre-change snapshot will be created first. "
+            "Apple-protected controls still require owner, guardian, administrator, or MDM approval; MSAA will not bypass that approval.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if result != QMessageBox.Yes:
+            return
+        self.apply_result = apply_family_safety_recommendation(self.recommendation, selected, self.db)
+        system_results = execute_family_system_setup_handoff(
+            self.system_actions,
+            opener=lambda url: QDesktopServices.openUrl(QUrl(url)),
+            max_opened=1,
+        )
+        self.apply_result["system_setup_actions"] = system_results
+        regenerated_reports = {}
+        for format_name, exporter in {
+            "json": export_family_safety_configuration_json,
+            "markdown": export_family_safety_configuration_markdown,
+            "html": export_family_safety_configuration_html,
+            "docx": export_family_safety_configuration_word,
+            "xlsx": export_family_safety_configuration_excel,
+        }.items():
+            try:
+                regenerated_reports[format_name] = str(exporter(self.recommendation, apply_result=self.apply_result))
+            except Exception as exc:
+                self.apply_result.setdefault("report_export_errors", {})[format_name] = f"{type(exc).__name__}: {exc}"
+        self.apply_result["generated_reports"] = regenerated_reports
+        self.db.set_background_monitor_state(LAST_APPLY_REPORT_KEY, __import__("json").dumps(self.apply_result, sort_keys=True, default=str))
+        opened = sum(item.get("status") == "OPENED_FOR_USER_APPROVAL" for item in system_results)
+        mdm = sum(item.get("status") == "MDM_REQUIRED" for item in system_results)
+        QMessageBox.information(
+            self,
+            "Family Safety Setup Applied",
+            f"Applied {len(self.apply_result.get('applied_changes', []))} supported changes. Settings version: {self.apply_result.get('settings_version_after')}.\n\n"
+            f"Apple settings opened for approval: {opened}\nMDM-dependent actions: {mdm}\n\n"
+            "No Apple-protected control is reported as changed until a later audit verifies it.",
+        )
+        self.accept()
+
+    def save_draft(self) -> None:
+        if self.recommendation is None:
+            return
+        self.db.set_background_monitor_state("family_safety_draft_recommendation_json", __import__("json").dumps(self.recommendation.to_dict(), sort_keys=True, default=str))
+        QMessageBox.information(self, "Draft Saved", "Family & Safety recommendation draft saved locally. No settings were applied.")
+
+    def export_report(self) -> None:
+        if self.recommendation is None:
+            return
+        paths = {
+            "json": export_family_safety_configuration_json(self.recommendation),
+            "markdown": export_family_safety_configuration_markdown(self.recommendation),
+            "html": export_family_safety_configuration_html(self.recommendation),
+            "docx": export_family_safety_configuration_word(self.recommendation),
+            "xlsx": export_family_safety_configuration_excel(self.recommendation),
+        }
+        QMessageBox.information(self, "Recommendation Report Exported", "Saved local reports:\n" + "\n".join(str(path) for path in paths.values()))
+
+
 class FamilySafetyPanel(QFrame):
     audit_requested = Signal(str)
     export_html_requested = Signal()
+    export_word_requested = Signal()
+    export_excel_requested = Signal()
     export_json_requested = Signal()
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, parent: QWidget | None = None, db: Any | None = None) -> None:
         super().__init__(parent)
+        self.db = db
         self.setObjectName("familySafetyPanel")
         self.setFrameShape(QFrame.StyledPanel)
-        self.setMinimumSize(820, 620)
+        self.setMinimumSize(640, 560)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._report: dict[str, Any] = {}
         self._categories = {category.category_id: category for category in canonical_family_safety_categories()}
@@ -116,23 +516,94 @@ class FamilySafetyPanel(QFrame):
         privacy.setStyleSheet("color: #D6E4FF; font-weight: 600;")
         layout.addWidget(privacy)
 
-        controls = QHBoxLayout()
-        controls.addWidget(QLabel("Who uses this Mac?"))
+        setup_frame = QFrame()
+        setup_frame.setProperty("themeCard", True)
+        setup_layout = QGridLayout(setup_frame)
+        setup_layout.setContentsMargins(12, 12, 12, 12)
+        setup_layout.setSpacing(8)
+        setup_title = QLabel("Guided Family Safety Setup")
+        setup_title.setStyleSheet("font-size: 18px; font-weight: 700;")
+        setup_desc = QLabel("Answer a few questions and MSAA will recommend a safety configuration. You can preview, apply, export, or manually adjust every setting.")
+        setup_desc.setWordWrap(True)
+        consent = QLabel("MSAA applies local settings only. The wizard does not send answers, reports, or device information to external services.")
+        consent.setWordWrap(True)
+        consent.setStyleSheet("color: #D6E4FF; font-weight: 600;")
+        self.guided_setup_button = make_family_button("Start Guided Setup", "Start a guided setup wizard that recommends and applies Family & Safety Center settings based on user needs.", "primary", min_width=170)
+        self.guided_setup_button.setObjectName("startGuidedFamilySafetySetupButton")
+        self.guided_setup_button.clicked.connect(self.open_configuration_wizard)
+        self.configure_family_settings_button = make_family_button("Configure Family & Safety Settings", "Start a guided setup wizard that recommends and applies Family & Safety Center settings based on user needs.", "primary", min_width=240)
+        self.configure_family_settings_button.setObjectName("configureFamilySafetySettingsButton")
+        self.configure_family_settings_button.clicked.connect(self.open_configuration_wizard)
+        self.view_current_profile_button = make_family_button("View Current Profile", "Show the current Family & Safety Center profile and last wizard status.", min_width=170)
+        self.view_current_profile_button.clicked.connect(self.show_current_profile)
+        self.export_current_family_report_button = make_family_button("Export Current Family Safety Report", "Export the most recent Family & Safety configuration report for manual review.", min_width=260)
+        self.export_current_family_report_button.clicked.connect(self.export_current_configuration_report)
+        self.restore_previous_settings_button = make_family_button("Restore Previous Settings", "Preview and restore the previous wizard-applied Family & Safety settings where supported.", min_width=220)
+        self.restore_previous_settings_button.clicked.connect(self.restore_previous_settings)
+        setup_layout.addWidget(setup_title, 0, 0, 1, 4)
+        setup_layout.addWidget(setup_desc, 1, 0, 1, 4)
+        setup_layout.addWidget(consent, 2, 0, 1, 4)
+        self.setup_actions = ResponsiveActionRow(spacing=10)
+        self.setup_actions.add_buttons(
+            [
+                self.guided_setup_button,
+                self.configure_family_settings_button,
+                self.view_current_profile_button,
+                self.export_current_family_report_button,
+                self.restore_previous_settings_button,
+            ]
+        )
+        setup_layout.addWidget(self.setup_actions, 3, 0, 1, 4)
+        layout.addWidget(setup_frame)
+
+        self.wizard_status_frame = QFrame()
+        self.wizard_status_frame.setProperty("themeCard", True)
+        status_layout = QGridLayout(self.wizard_status_frame)
+        status_layout.setContentsMargins(12, 12, 12, 12)
+        self.current_profile_label = QLabel("Current Profile: not configured")
+        self.last_wizard_run_label = QLabel("Last Wizard Run: not yet")
+        self.last_applied_changes_label = QLabel("Last Applied Changes: none")
+        self.settings_sync_status_label = QLabel("Settings Sync Status: unknown")
+        self.manual_review_needed_label = QLabel("Manual Review Needed: run the wizard or audit to see checklist items")
+        for row, label in enumerate([self.current_profile_label, self.last_wizard_run_label, self.last_applied_changes_label, self.settings_sync_status_label, self.manual_review_needed_label]):
+            label.setWordWrap(True)
+            status_layout.addWidget(label, row, 0)
+        layout.addWidget(self.wizard_status_frame)
+
+        audit_frame = QFrame()
+        audit_frame.setProperty("themeCard", True)
+        audit_layout = QGridLayout(audit_frame)
+        audit_layout.setContentsMargins(12, 12, 12, 12)
+        audit_layout.setHorizontalSpacing(10)
+        audit_layout.setVerticalSpacing(10)
+        audit_title = QLabel("Safety Audit & Reports")
+        audit_title.setStyleSheet("font-size: 17px; font-weight: 700;")
+        audit_layout.addWidget(audit_title, 0, 0, 1, 3)
+        profile_label = QLabel("Who uses this Mac?")
+        audit_layout.addWidget(profile_label, 1, 0)
         self.profile_combo = QComboBox()
         self.profile_combo.addItems(PROFILE_OPTIONS)
-        self.profile_combo.setMinimumHeight(34)
-        controls.addWidget(self.profile_combo)
+        self.profile_combo.setMinimumHeight(38)
+        self.profile_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        audit_layout.addWidget(self.profile_combo, 1, 1)
         self.audit_button = make_family_button("Run Safety Audit", "Run a local Family & Safety audit for the selected user profile.", "primary")
         self.audit_button.clicked.connect(lambda: self.audit_requested.emit(self.profile_combo.currentText()))
-        controls.addWidget(self.audit_button)
+        audit_layout.addWidget(self.audit_button, 1, 2)
         self.export_html_button = make_family_button("Export HTML", "Export a local Family & Safety HTML report.", min_width=124)
         self.export_html_button.clicked.connect(self.export_html_requested.emit)
-        controls.addWidget(self.export_html_button)
+        self.export_word_button = make_family_button("Export Word", "Export a macro-free Family & Safety Word report.", min_width=124)
+        self.export_word_button.clicked.connect(self.export_word_requested.emit)
+        self.export_excel_button = make_family_button("Export Excel", "Export a formula-free Family & Safety Excel workbook.", min_width=124)
+        self.export_excel_button.clicked.connect(self.export_excel_requested.emit)
         self.export_json_button = make_family_button("Export JSON", "Export a local Family & Safety JSON report.", min_width=124)
         self.export_json_button.clicked.connect(self.export_json_requested.emit)
-        controls.addWidget(self.export_json_button)
-        controls.addStretch(1)
-        layout.addLayout(controls)
+        self.report_actions = ResponsiveActionRow(spacing=10)
+        self.report_actions.add_buttons(
+            [self.export_html_button, self.export_word_button, self.export_excel_button, self.export_json_button]
+        )
+        audit_layout.addWidget(self.report_actions, 2, 0, 1, 3)
+        audit_layout.setColumnStretch(1, 1)
+        layout.addWidget(audit_frame)
 
         score_frame = QFrame()
         score_frame.setProperty("themeCard", True)
@@ -155,7 +626,7 @@ class FamilySafetyPanel(QFrame):
 
         self.tabs = QTabWidget()
         self.category_list = QListWidget()
-        self.category_list.setMinimumWidth(220)
+        self.category_list.setMinimumWidth(180)
         self.category_list.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         for category_id in self._category_order:
             self.category_list.addItem(self._categories[category_id].title)
@@ -221,6 +692,7 @@ class FamilySafetyPanel(QFrame):
         self._add_text_tab(self.education_view, "Guidance")
         layout.addWidget(self.tabs, 1)
         self._render_active_category()
+        self.refresh_wizard_status()
 
     def _add_category_tab(self) -> None:
         page = QWidget()
@@ -233,21 +705,19 @@ class FamilySafetyPanel(QFrame):
         splitter.addWidget(self.category_list)
         detail = QFrame()
         detail.setProperty("themeCard", True)
-        detail.setMinimumWidth(520)
+        detail.setMinimumWidth(420)
         detail.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         detail_layout = QVBoxLayout(detail)
         detail_layout.setContentsMargins(14, 14, 14, 14)
         detail_layout.setSpacing(8)
-        nav = QHBoxLayout()
-        nav.addWidget(self.previous_category_button)
-        nav.addWidget(self.next_category_button)
-        nav.addWidget(self.overview_category_button)
-        nav.addStretch(1)
-        reset_row = QHBoxLayout()
-        reset_row.addWidget(self.reset_view_button)
-        reset_row.addWidget(self.reset_pending_button)
-        reset_row.addWidget(self.reset_defaults_button)
-        reset_row.addStretch(1)
+        self.category_navigation_actions = ResponsiveActionRow(spacing=10)
+        self.category_navigation_actions.add_buttons(
+            [self.previous_category_button, self.next_category_button, self.overview_category_button]
+        )
+        self.category_reset_actions = ResponsiveActionRow(spacing=10)
+        self.category_reset_actions.add_buttons(
+            [self.reset_view_button, self.reset_pending_button, self.reset_defaults_button]
+        )
         detail_layout.addWidget(self.category_title_label)
         detail_layout.addWidget(self.category_context_label)
         detail_layout.addWidget(self.category_status_label)
@@ -262,13 +732,13 @@ class FamilySafetyPanel(QFrame):
         detail_layout.addWidget(self.category_selected_device_label)
         detail_layout.addWidget(self.category_pending_label)
         detail_layout.addWidget(self.category_changes_view, 1)
-        detail_layout.addLayout(reset_row)
-        detail_layout.addLayout(nav)
-        self.category_detail_scroll = _scroll_page(detail, min_width=520)
+        detail_layout.addWidget(self.category_reset_actions)
+        detail_layout.addWidget(self.category_navigation_actions)
+        self.category_detail_scroll = _scroll_page(detail, min_width=420)
         splitter.addWidget(self.category_detail_scroll)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([260, 760])
+        splitter.setSizes([220, 760])
         self.category_splitter = splitter
         page_layout.addWidget(splitter, 1)
         self.tabs.addTab(page, "Category Guide")
@@ -590,3 +1060,105 @@ class FamilySafetyPanel(QFrame):
         lines.append("\nPrivacy Requirements:")
         lines.extend(f"- {item}" for item in notice)
         return "\n".join(lines)
+
+    def open_configuration_wizard(self) -> None:
+        if self.db is None:
+            QMessageBox.information(self, "Wizard Requires Settings", "Open the full application to configure Family & Safety settings. This standalone panel can still show audits and reports.")
+            return
+        dialog = FamilySafetyWizardDialog(self.db, self)
+        if dialog.exec() == QDialog.Accepted:
+            self.refresh_wizard_status()
+
+    def refresh_wizard_status(self) -> None:
+        if self.db is None:
+            self.current_profile_label.setText("Current Profile: not configured")
+            self.last_wizard_run_label.setText("Last Wizard Run: not yet")
+            self.last_applied_changes_label.setText("Last Applied Changes: none")
+            self.settings_sync_status_label.setText("Settings Sync Status: unavailable in standalone panel")
+            self.manual_review_needed_label.setText("Manual Review Needed: run the wizard or audit to see checklist items")
+            return
+        profile = self.db.get_background_monitor_state(CURRENT_PROFILE_KEY, "not configured")
+        last_run = self.db.get_background_monitor_state(LAST_RUN_KEY, "not yet")
+        raw = self.db.get_background_monitor_state(LAST_APPLY_REPORT_KEY, "")
+        applied_count = 0
+        sync_status = "unknown"
+        system_action_status = "no macOS handoff recorded"
+        if raw:
+            try:
+                import json
+
+                payload = json.loads(raw)
+                applied_count = len(payload.get("applied_changes", []))
+                sync_status = str(payload.get("settings_sync", {}).get("status", "unknown"))
+                system_actions = payload.get("system_setup_actions", [])
+                if isinstance(system_actions, list) and system_actions:
+                    opened = sum(item.get("status") == "OPENED_FOR_USER_APPROVAL" for item in system_actions if isinstance(item, dict))
+                    mdm = sum(item.get("status") == "MDM_REQUIRED" for item in system_actions if isinstance(item, dict))
+                    queued = sum(item.get("status") == "QUEUED_FOR_USER_REVIEW" for item in system_actions if isinstance(item, dict))
+                    system_action_status = f"{opened} opened for approval, {queued} queued, {mdm} MDM-dependent"
+            except Exception:
+                sync_status = "status unavailable"
+        self.current_profile_label.setText(f"Current Profile: {profile}")
+        self.last_wizard_run_label.setText(f"Last Wizard Run: {last_run}")
+        self.last_applied_changes_label.setText(f"Last Applied Changes: {applied_count}")
+        self.settings_sync_status_label.setText(f"Settings Sync Status: {sync_status}")
+        self.manual_review_needed_label.setText(f"Protected macOS / MDM Actions: {system_action_status}. Re-run the Safety Audit to verify effective state.")
+
+    def show_current_profile(self) -> None:
+        self.refresh_wizard_status()
+        QMessageBox.information(
+            self,
+            "Current Family Safety Profile",
+            "\n".join(
+                [
+                    self.current_profile_label.text(),
+                    self.last_wizard_run_label.text(),
+                    self.last_applied_changes_label.text(),
+                    self.settings_sync_status_label.text(),
+                    self.manual_review_needed_label.text(),
+                ]
+            ),
+        )
+
+    def export_current_configuration_report(self) -> None:
+        if self.db is None:
+            QMessageBox.information(self, "Export Unavailable", "Open the full application to export the current Family & Safety configuration report.")
+            return
+        raw = self.db.get_background_monitor_state("family_safety_draft_recommendation_json", "") or self.db.get_background_monitor_state("family_safety_last_recommendation_json", "")
+        if not raw:
+            QMessageBox.information(self, "No Recommendation Available", "Run the guided setup wizard first to create an exportable recommendation report.")
+            return
+        from pathlib import Path
+        import json
+
+        recommendation = json.loads(raw)
+        paths = [
+            export_family_safety_configuration_html(recommendation),
+            export_family_safety_configuration_word(recommendation),
+            export_family_safety_configuration_excel(recommendation),
+            export_family_safety_configuration_json(recommendation),
+        ]
+        QMessageBox.information(
+            self,
+            "Family Safety Configuration Report Exported",
+            "Saved local HTML, Word, Excel, and JSON reports:\n" + "\n".join(str(Path(path)) for path in paths),
+        )
+
+    def restore_previous_settings(self) -> None:
+        if self.db is None:
+            QMessageBox.information(self, "Restore Unavailable", "Open the full application to restore wizard-applied settings.")
+            return
+        preview = restore_family_safety_snapshot(self.db, preview_only=True)
+        if preview.get("status") == "no_snapshot":
+            QMessageBox.information(self, "No Snapshot Available", "No previous wizard snapshot is available to restore.")
+            return
+        changes = preview.get("restore_changes", [])
+        text = "Restore only these wizard-changed MSAA setting paths?\n\n" + "\n".join(
+            f"- {item.get('setting_path')}: {item.get('current_value')} -> {item.get('restore_value')}" for item in changes
+        )
+        result = QMessageBox.question(self, "Restore Previous Family Safety Settings", text, QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if result != QMessageBox.Yes:
+            return
+        restored = restore_family_safety_snapshot(self.db)
+        QMessageBox.information(self, "Family Safety Settings Restored", f"Restore status: {restored.get('status')}\nSettings version: {restored.get('settings_version_after')}")
+        self.refresh_wizard_status()

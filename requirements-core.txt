@@ -1,0 +1,2 @@
+# MSAA core CLI/doctor is intentionally stdlib-oriented.
+-e .

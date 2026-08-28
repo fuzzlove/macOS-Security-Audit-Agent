@@ -1,0 +1,58 @@
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-07-10",
+  "disclaimer": "Product planning only; not an official assessment result.",
+  "items": [
+    {
+      "feature_gap_id": "CFG-P0-001",
+      "title": "Complete verified contractual catalogs and objectives",
+      "description": "Replace the 11-item illustrative mapping with reviewed Level 1, Level 2, Level 3, and assessment-objective content packs.",
+      "affected_frameworks": ["CMMC L1", "CMMC L2", "CMMC L3"],
+      "affected_requirements": ["all"], "affected_objectives": ["all"],
+      "current_capability": "Illustrative local technical mappings",
+      "missing_capability": "Complete official catalogs, identifiers, objectives, counts, sources, and activation review",
+      "evidence_impact": "Applicable objectives can be omitted", "assessment_impact": "Blocks valid complete assessment", "contractual_impact": "High",
+      "recommended_solution": "Signed, versioned offline content packs generated from verified primary documents with human review",
+      "alternative_solutions": ["Approved licensed structured catalog import"], "manual_fallback": "Use official guides outside MSAA and mark MSAA report incomplete",
+      "priority": "P0_BLOCKS_VALID_ASSESSMENT", "implementation_effort": "XL", "dependencies": ["official content review", "legal publication-terms review"],
+      "security_risks": ["incorrect activation"], "privacy_risks": [], "acceptance_tests": ["exact active-pack counts", "no missing/orphan objectives", "hash and rollback"],
+      "proposed_release": "future major", "status": "PLANNED", "owner": "Standards content owner"
+    },
+    {
+      "feature_gap_id": "CFG-P0-002", "title": "Applicability, scope, asset, and CUI boundary workflow", "description": "Implement contract-driven scoping and official asset categorization.",
+      "affected_frameworks": ["32 CFR 170", "CMMC"], "affected_requirements": ["scope dependent"], "affected_objectives": ["scope dependent"],
+      "current_capability": "Free-text scope name", "missing_capability": "Contract, enclave, asset, flow, provider, supplier, and unresolved-question models",
+      "evidence_impact": "Evidence scope cannot be proven", "assessment_impact": "SCP001 blocks final readiness", "contractual_impact": "High",
+      "recommended_solution": "Guided and expert scoping workspaces using active guide definitions", "alternative_solutions": ["Structured JSON import"], "manual_fallback": "Attach assessor-reviewed scope workbook",
+      "priority": "P0_BLOCKS_VALID_ASSESSMENT", "implementation_effort": "XL", "dependencies": ["verified scoping guide pack"], "security_risks": ["CUI boundary disclosure"], "privacy_risks": ["personnel/location data"],
+      "acceptance_tests": ["unresolved scope blocks result", "scope change stales affected evidence"], "proposed_release": "future major", "status": "PLANNED", "owner": "Assessment architecture"
+    },
+    {
+      "feature_gap_id": "CFG-P0-003", "title": "Official scoring and POA&M rules", "description": "Install exact sourced weights, partial cases, exclusions, threshold, and closeout rules.",
+      "affected_frameworks": ["CMMC L1", "CMMC L2", "CMMC L3"], "affected_requirements": ["all scored"], "affected_objectives": ["all"],
+      "current_capability": "Generic percentage disabled", "missing_capability": "Verified golden-vector scoring pack and POA&M eligibility",
+      "evidence_impact": "No reproducible official-current score", "assessment_impact": "Score remains invalid", "contractual_impact": "High",
+      "recommended_solution": "Versioned rule engine with primary citations and independent recalculation", "alternative_solutions": ["Read-only import from approved assessment system"], "manual_fallback": "Calculate from official methodology outside MSAA",
+      "priority": "P0_BLOCKS_VALID_ASSESSMENT", "implementation_effort": "L", "dependencies": ["complete catalog", "methodology review"], "security_risks": ["unauthorized partial credit"], "privacy_risks": [],
+      "acceptance_tests": ["official golden vectors", "88 threshold", "invalid POA&M rejected", "180-day expiry"], "proposed_release": "future major", "status": "PLANNED", "owner": "Scoring owner"
+    },
+    {
+      "feature_gap_id": "CFG-P1-001", "title": "Professional SSP and shared-responsibility builder", "description": "Structured who/what/where/when/how implementation records with provider inheritance.",
+      "affected_frameworks": ["NIST SP 800-171", "CMMC"], "affected_requirements": ["all"], "affected_objectives": ["examine implementation"],
+      "current_capability": "No complete SSP workflow", "missing_capability": "Versioning, ownership, inheritance, diagrams, approval and evidence linkage",
+      "evidence_impact": "Manual document evidence missing", "assessment_impact": "Major readiness gap", "contractual_impact": "High",
+      "recommended_solution": "Structured SSP entities and reviewed suggested-text workflow", "alternative_solutions": ["Import existing SSP references"], "manual_fallback": "Maintain SSP externally and register hashed sections",
+      "priority": "P1_MAJOR_COVERAGE_GAP", "implementation_effort": "XL", "dependencies": ["scope model"], "security_risks": ["sensitive architecture data"], "privacy_risks": ["role data"],
+      "acceptance_tests": ["no boilerplate auto-implemented", "every statement has owner/scope/evidence"], "proposed_release": "future major", "status": "PLANNED", "owner": "SSP owner"
+    },
+    {
+      "feature_gap_id": "CFG-P3-001", "title": "Rev. 2 to Rev. 3 transition content", "description": "Complete change classification, ODPs, evidence reuse, and migration backlog.",
+      "affected_frameworks": ["SP 800-171 Rev. 3", "SP 800-172 Rev. 3"], "affected_requirements": ["future profile"], "affected_objectives": ["future profile"],
+      "current_capability": "Profile isolation only", "missing_capability": "Complete reviewed transition catalogs and mapping",
+      "evidence_impact": "Future reuse unknown", "assessment_impact": "No current score impact", "contractual_impact": "Future",
+      "recommended_solution": "Reviewed mapping content pack", "alternative_solutions": ["NIST-provided transition artifacts where available"], "manual_fallback": "External transition workbook",
+      "priority": "P3_FUTURE_READINESS", "implementation_effort": "XL", "dependencies": ["Rev. 3 catalogs"], "security_risks": ["false equivalence"], "privacy_risks": [],
+      "acceptance_tests": ["future profile cannot alter current score", "all ODPs accounted"], "proposed_release": "future", "status": "RESEARCH", "owner": "Research workspace owner"
+    }
+  ]
+}

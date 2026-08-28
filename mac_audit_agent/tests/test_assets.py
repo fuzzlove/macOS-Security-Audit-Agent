@@ -10,7 +10,8 @@ from PySide6.QtCore import Qt
 
 from mac_audit_agent.assets import get_asset_path, get_donation_qr_metadata_path, get_donation_qr_path
 from mac_audit_agent.branding.support_links import SUPPORT_LINKS
-from mac_audit_agent.ui.main_window import MainWindow, STARTUP_STRATEGY_QUOTES, choose_startup_strategy_quote, create_fallback_qr_pixmap, format_startup_strategy_quote
+from mac_audit_agent.ui.main_window import MainWindow, STARTUP_STRATEGY_QUOTES, choose_startup_strategy_quote, create_fallback_qr_pixmap, format_startup_strategy_quote, load_support_image_pixmap
+from mac_audit_agent.dashboard.security_quotes import format_security_quote, load_security_quotes
 
 
 def test_asset_path_resolves_logo() -> None:
@@ -37,6 +38,20 @@ def test_missing_logo_does_not_crash_ui(tmp_path: Path, monkeypatch) -> None:
     dashboard_pixmap = window.dashboard_logo_label.pixmap()
     assert header_pixmap is None or header_pixmap.isNull()
     assert dashboard_pixmap is None or dashboard_pixmap.isNull()
+    window.close()
+    app.processEvents()
+
+
+def test_legacy_dashboard_images_never_become_startup_windows(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(tmp_path / "audit.sqlite")
+
+    for image_label in (window.header_logo_label, window.dashboard_logo_label):
+        assert image_label.parentWidget() is not None
+        assert not image_label.isWindow()
+        assert not image_label.isVisible()
+        assert image_label not in QApplication.topLevelWidgets()
+
     window.close()
     app.processEvents()
 
@@ -76,10 +91,10 @@ def test_startup_strategy_quote_picker_excludes_previous_quote() -> None:
     assert choose_startup_strategy_quote(previous, rng=FakeRandom()) != previous
 
 
-def test_main_window_shows_new_strategy_quote_each_open(tmp_path: Path) -> None:
+def test_main_window_honors_default_daily_quote_rotation(tmp_path: Path) -> None:
     app = QApplication.instance() or QApplication([])
     db_path = tmp_path / "audit.sqlite"
-    formatted_quotes = {format_startup_strategy_quote(entry) for entry in STARTUP_STRATEGY_QUOTES}
+    formatted_quotes = {format_security_quote(entry) for entry in load_security_quotes()}
     first_window = MainWindow(db_path)
     first_quote = first_window.startup_quote
     assert first_window.startup_quote_label.text() == first_quote
@@ -90,7 +105,7 @@ def test_main_window_shows_new_strategy_quote_each_open(tmp_path: Path) -> None:
     second_quote = second_window.startup_quote
     assert second_window.startup_quote_label.text() == second_quote
     assert second_quote in formatted_quotes
-    assert second_quote != first_quote
+    assert second_quote == first_quote
     second_window.close()
     app.processEvents()
 
@@ -144,6 +159,7 @@ def test_support_rail_uses_image_and_patreon_link(tmp_path: Path, monkeypatch) -
     assert window.support_ad_frame.cursor().shape() == Qt.PointingHandCursor
     pixmap = window.support_ad_image_label.pixmap()
     assert pixmap is not None and not pixmap.isNull()
+    assert (pixmap.width(), pixmap.height()) == (296, 296)
     assert window.support_ad_image_label.minimumWidth() >= 180
     assert window.support_ad_image_label.minimumHeight() >= 180
     assert window.support_ad_image_label.maximumWidth() >= window.support_ad_image_label.minimumWidth()
@@ -197,6 +213,9 @@ def test_support_page_separates_nsa_acknowledgement_from_author_and_donations(tm
     assert "Author / Developer" in text
     assert "Liquidsky Network Security" in text
     assert "MSAA is developed and maintained independently." in text
+    assert "MSAA helps defenders assess macOS security posture" in text
+    assert "Support helps fund continued development and maintenance." in text
+    assert "Support is optional and does not affect access or functionality." in text
     assert "Community Acknowledgements" in text
     assert "Thank you to the NSA" in text
     assert "does not imply endorsement, affiliation, certification, or approval" in text
@@ -231,11 +250,42 @@ def test_donation_qr_asset_and_metadata_are_production_values() -> None:
     assert metadata["target_url"] == SUPPORT_LINKS["patreon"]
     assert metadata["developer"] == "Liquidsky Network Security"
     assert metadata["verified"] is True
+    assert metadata["module_count"] == 37
+    assert metadata["source_box_size_pixels"] == 10
+    assert metadata["full_page_render_size_pixels"] % metadata["module_count"] == 0
     assert "qrcode" in metadata.get("generator", "")
     combined = qr_path.name + metadata_path.read_text(encoding="utf-8")
     assert "example.com" not in combined
     assert "localhost" not in combined
     assert "placeholder" not in combined.lower()
+
+
+def test_donation_qr_source_and_display_preserve_integer_module_grid() -> None:
+    app = QApplication.instance() or QApplication([])
+    source = load_support_image_pixmap()
+    assert not source.isNull()
+    assert (source.width(), source.height()) == (370, 370)
+
+    # Every source module is a uniform 10x10 block. This catches accidental
+    # filtering, corruption, or replacement with artwork that only resembles a QR.
+    image = source.toImage()
+    module_size = 10
+    for module_y in range(37):
+        for module_x in range(37):
+            expected = image.pixelColor(module_x * module_size, module_y * module_size)
+            for offset in range(module_size):
+                assert image.pixelColor(module_x * module_size + offset, module_y * module_size) == expected
+                assert image.pixelColor(module_x * module_size, module_y * module_size + offset) == expected
+
+    # Four white quiet-zone modules must surround the encoded symbol.
+    white = image.pixelColor(0, 0)
+    assert white.red() > 240 and white.green() > 240 and white.blue() > 240
+    for coordinate in range(370):
+        assert image.pixelColor(coordinate, 0) == white
+        assert image.pixelColor(0, coordinate) == white
+        assert image.pixelColor(coordinate, 369) == white
+        assert image.pixelColor(369, coordinate) == white
+    app.processEvents()
 
 
 def test_usage_readme_path_uses_pyinstaller_bundle(tmp_path: Path, monkeypatch) -> None:

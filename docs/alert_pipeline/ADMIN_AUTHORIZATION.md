@@ -1,0 +1,5 @@
+# Administrator authorization requirements
+
+Read-only status, history, health, suppression listing, redacted export, and integrity verification do not require elevation when database permissions permit. Creating/revoking suppression, changing retention, deleting/rotating logs, changing integrity keys, enabling broad maintenance, or executing containment requires the installed privileged workflow, operator identity, reason, ticket, and applicable approval policy. The CLI rejects suppression mutation when not effective root; deployments must add their authorization policy at the privileged service boundary rather than treating root as sufficient business approval.
+
+Never collect or store an administrator password in MSAA. System deployment should authorize only the privileged component to establish ownership and 0750 directory/0640 file modes, provision the machine audit key, and mutate policy. The GUI is read-only for suppression/configuration changes and directs operators to the privileged workflow.

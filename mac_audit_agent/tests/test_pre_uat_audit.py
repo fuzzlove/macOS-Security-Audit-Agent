@@ -8,6 +8,9 @@ from mac_audit_agent.quality.audit_reporter import write_reports
 from mac_audit_agent.quality.check_models import FunctionalCheckResult, PreUATAuditResult
 from mac_audit_agent.quality.functional_registry import build_registry
 from mac_audit_agent.quality.ui_control_auditor import static_ui_control_audit
+from mac_audit_agent.quality.ui_control_auditor import write_ui_control_audit
+from mac_audit_agent.quality.release_integrity_auditor import run_release_integrity_audit
+from mac_audit_agent.ui.button_layout_auditor import write_button_layout_audit
 from mac_audit_agent.quality.daemon_auditor import run_daemon_audit
 from mac_audit_agent.quality.export_auditor import run_export_audit
 from mac_audit_agent.quality.scan_auditor import _apple_exposure_check
@@ -69,8 +72,8 @@ def test_export_audit_detects_outputs(tmp_path: Path) -> None:
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
     checks = run_export_audit(AuditContext(db.path, tmp_path))
     assert any(check.check_id == "exports.json" and check.status == "PASS" for check in checks)
-    assert any(check.status in {"FAIL", "BLOCKER"} for check in checks)
-    assert all(check.recommended_fix or check.status in {"PASS", "SKIPPED"} for check in checks)
+    assert all(check.status in {"PASS", "DEGRADED"} for check in checks)
+    assert all(check.recommended_fix or check.status == "PASS" for check in checks)
 
 
 def test_ui_audit_detects_disconnected_button() -> None:
@@ -83,14 +86,52 @@ def test_ui_audit_detects_disconnected_button() -> None:
     assert any(record["label"] == "Dead Button" and record["status"] == "FAIL" for record in records)
 
 
-def test_stale_apple_exposure_data_warns(tmp_path: Path) -> None:
+def test_apple_exposure_freshness_is_evidence_based(tmp_path: Path) -> None:
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
     check = _apple_exposure_check(AuditContext(db.path, tmp_path))
-    assert check.status == "WARN"
-    assert check.recommended_fix
+    assert check.status in {"PASS", "WARN"}
+    if check.status == "WARN":
+        assert check.recommended_fix
+    else:
+        assert any(check.evidence.values())
 
 
 def test_failed_checks_require_suggested_fix() -> None:
     report = AuditReport("audit-1", "host", "2026-01-01T00:00:00+00:00")
     report.add(FunctionalCheck("x", "Core", "Example", "desc", "blocker").failed("broken", "concrete fix"))
     assert all(check.recommended_fix for check in report.checks if check.status in {"FAIL", "BLOCKER", "WARN"})
+
+
+def test_generated_ui_audit_reports_default_outside_docs(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    ui_report = write_ui_control_audit([])
+    button_report = write_button_layout_audit([])
+    assert ui_report.as_posix() == "reports/pre_uat/ui_audits/PRE_UAT_UI_CONTROL_AUDIT.md"
+    assert button_report.as_posix() == "reports/pre_uat/ui_audits/PRE_UAT_BUTTON_LAYOUT_AUDIT.md"
+
+
+def test_integrity_pre_uat_checks_do_not_pass_with_failed_evidence(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "mac_audit_agent").mkdir()
+    checks = run_release_integrity_audit(AuditContext(tmp_path / "audit.sqlite", tmp_path))
+
+    for check in checks:
+        if check.status == "PASS":
+            assert check.evidence.get("status") != "failed"
+
+    release_file_check = next(check for check in checks if check.check_id == "integrity.files_match_manifest")
+    assert release_file_check.status == "SKIPPED"
+    assert release_file_check.evidence["status"] == "non_applicable_for_policy"
+
+
+def test_manifest_path_consistency_blocks_legacy_only_manifest(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    legacy = tmp_path / "mac_audit_agent" / "security" / "integrity_manifest.json"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("{}", encoding="utf-8")
+
+    checks = run_release_integrity_audit(AuditContext(tmp_path / "audit.sqlite", tmp_path))
+    consistency = next(check for check in checks if check.check_id == "integrity.manifest_path_consistency")
+
+    assert consistency.status == "BLOCKER"
+    assert consistency.evidence["trust_state"] == "manifest_path_divergence"

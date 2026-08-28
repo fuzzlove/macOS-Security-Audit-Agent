@@ -322,6 +322,12 @@ class FamilySafetyAuditor:
             "Shared Family Computer": ["Use separate accounts for each person.", "Disable Guest access unless intentionally needed.", "Review downloads, web safety, and app inventory regularly."],
             "Special Needs User": ["Review accessibility supports with the user.", "Use simplified access where helpful.", "Reduce unexpected prompts, app clutter, and confusing permissions."],
             "School Device": ["Use managed accounts where appropriate.", "Review web filtering, app inventory, guest access, remote access, and classroom restrictions."],
+            "Security Research Device": ["Complete the Security Research Device wizard and preserve authorization scope.", "Review FileVault, Secure Boot, SIP, software provenance, research network/DNS/VPN scope, evidence handling, backups, and disclosure contacts."],
+            "Government Asset": ["Confirm the asset owner, authorization boundary, data classification, MDM enrollment, and currently approved macOS baseline.", "Review identity, audit retention, removable media, network scope, incident reporting, backup, and recovery with the system security officer."],
+            "Doctor's Device": ["Protect availability and patient privacy without collecting patient content in MSAA.", "Review encryption, screen lock, approved clinical apps, session access, network segmentation, backups, downtime procedures, and incident contacts."],
+            "Nurse's Workstation": ["Review shared-session controls, rapid lock, approved clinical applications, removable media, and emergency-access procedures.", "Coordinate changes with clinical operations so security changes do not disrupt patient care."],
+            "Health Device": ["Confirm device purpose, vendor support, safety impact, network segmentation, update validation, inventory, and recovery procedures.", "Do not change a regulated or patient-care device without clinical owner and vendor approval."],
+            "Lawyer's Device / Legal Asset": ["Review encryption, identity separation, secure communications, client/matter access, remote access, backups, retention, legal hold, and secure deletion.", "Do not place privileged or client-confidential content in MSAA notes or ordinary exports."],
         }
         return {"profile": [profile], "recommendations": base.get(profile, base["Shared Family Computer"])}
 
@@ -475,7 +481,7 @@ def export_family_safety_html(report: FamilySafetyReport, output_path: Path | No
   <meta charset="utf-8">
   <title>Family Safety Report</title>
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 32px; color: #172033; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 32px; color: #172033; }}
     h1, h2 {{ color: #0f172a; }}
     .score {{ font-size: 32px; font-weight: 700; margin: 12px 0; }}
     .notice {{ background: #eef6ff; border: 1px solid #bfdbfe; padding: 12px; border-radius: 8px; }}
@@ -532,8 +538,16 @@ def export_family_safety_html(report: FamilySafetyReport, output_path: Path | No
 def export_family_safety_word(report: FamilySafetyReport, output_path: Path | None = None) -> Path:
     try:
         from docx import Document
-    except ImportError as exc:
-        raise RuntimeError("Word export requires python-docx. Install project dependencies including python-docx to create .docx reports.") from exc
+    except Exception:
+        from mac_audit_agent.professional_report import structured_payload_report
+
+        output_path = output_path or default_family_safety_report_path(suffix="docx")
+        return structured_payload_report(
+            output_path,
+            title="Family Safety Report",
+            payload=report.to_dict(),
+            qualification="Static macro-free Word report; findings and recommendations require authorized human review.",
+        )
     output_path = output_path or default_family_safety_report_path(suffix="docx")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = report.to_dict()
@@ -582,8 +596,16 @@ def export_family_safety_excel(report: FamilySafetyReport, output_path: Path | N
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Alignment, Font, PatternFill
-    except ImportError as exc:
-        raise RuntimeError("Excel export requires openpyxl. Install project dependencies including openpyxl to create .xlsx reports.") from exc
+    except Exception:
+        from mac_audit_agent.professional_report import structured_payload_report
+
+        output_path = output_path or default_family_safety_report_path(suffix="xlsx")
+        return structured_payload_report(
+            output_path,
+            title="Family Safety Report",
+            payload=report.to_dict(),
+            qualification="Static formula-free Excel workbook; findings and recommendations require authorized human review.",
+        )
     output_path = output_path or default_family_safety_report_path(suffix="xlsx")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = report.to_dict()
@@ -641,3 +663,22 @@ def export_family_safety_excel(report: FamilySafetyReport, output_path: Path | N
         temp_path.unlink(missing_ok=True)
         raise
     return output_path
+
+
+from mac_audit_agent.family_safety.apply_engine import (  # noqa: E402
+    FamilySafetyConfigSnapshot,
+    apply_family_safety_recommendation,
+    latest_family_safety_snapshot,
+    restore_family_safety_snapshot,
+)
+from mac_audit_agent.family_safety.config_change import FamilySafetyConfigChange  # noqa: E402
+from mac_audit_agent.family_safety.profiles import FamilySafetyProfile, canonical_family_safety_profiles  # noqa: E402
+from mac_audit_agent.family_safety.recommendation_engine import FamilySafetyRecommendation, FamilySafetyRecommendationEngine  # noqa: E402
+from mac_audit_agent.family_safety.reporting import (  # noqa: E402
+    export_family_safety_configuration_excel,
+    export_family_safety_configuration_html,
+    export_family_safety_configuration_json,
+    export_family_safety_configuration_markdown,
+    export_family_safety_configuration_word,
+)
+from mac_audit_agent.family_safety.wizard_questions import FamilySafetyQuestion, canonical_family_safety_questions  # noqa: E402

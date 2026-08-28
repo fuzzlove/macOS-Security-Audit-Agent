@@ -7,7 +7,7 @@ from typing import Any
 from mac_audit_agent.integrity.diff_report import IntegrityDiffReport, IntegrityState, report_from_verification
 from mac_audit_agent.integrity.hasher import DEFAULT_EXCLUDED_PATTERNS, calculate_sha256
 from mac_audit_agent.integrity.manifest import create_integrity_manifest
-from mac_audit_agent.integrity.verifier import verify_current_install_integrity, verify_integrity_manifest
+from mac_audit_agent.integrity.wrapper_adapter import IntegrityWrapperAdapter, WrapperIntegrityStatus
 from mac_audit_agent.models import BackgroundMonitorEvent, utc_now_iso
 from mac_audit_agent.rules import rule_for_event
 
@@ -31,10 +31,7 @@ class IntegrityEngine:
 
     def compare_with_trusted_manifest(self):
         self._log("integrity_check_started", {"root": str(self.root), "manifest_path": str(self.manifest_path or "")})
-        if self.manifest_path:
-            result = verify_integrity_manifest(self.manifest_path, root=self.root, bypass_cache=True)
-        else:
-            result = verify_current_install_integrity(self.root, bypass_cache=True)
+        result = self._verification_payload_from_authority()
         report = report_from_verification(result)
         if report.state != IntegrityState.VERIFIED:
             self._log("mismatch_detected", report.to_dict())
@@ -47,8 +44,12 @@ class IntegrityEngine:
     def generate_diff_report(self) -> IntegrityDiffReport:
         result = self.compare_with_trusted_manifest()
         report = report_from_verification(result)
-        self._store_last_report(report, result.to_dict() if hasattr(result, "to_dict") else {})
+        self._store_last_report(report, result.to_dict() if hasattr(result, "to_dict") else dict(result))
         return report
+
+    def _verification_payload_from_authority(self) -> dict[str, Any]:
+        status = IntegrityWrapperAdapter(self.root).get_current_integrity_status(consumer="integrity_engine")
+        return _wrapper_status_to_verification_payload(status)
 
     def diagnostics(self, report: IntegrityDiffReport | None = None) -> dict[str, Any]:
         report = report or self.generate_diff_report()
@@ -119,3 +120,51 @@ class IntegrityEngine:
                 handle.write(json.dumps(entry, sort_keys=True) + "\n")
         except Exception:
             pass
+
+
+def _wrapper_status_to_verification_payload(status: WrapperIntegrityStatus) -> dict[str, Any]:
+    file_results: list[dict[str, Any]] = []
+    for rel_path in status.source_modified_files:
+        file_results.append({"relative_path": rel_path, "verification_status": "mismatch"})
+    for rel_path in status.missing_files:
+        file_results.append({"relative_path": rel_path, "verification_status": "missing"})
+    for rel_path in status.extra_files:
+        file_results.append({"relative_path": rel_path, "verification_status": "extra"})
+
+    verified = status.status == "verified" and status.result_code == "VALID"
+    errors = [] if verified else [status.reason or status.failure_code or status.result_code]
+    recommendations = []
+    if status.recommended_action:
+        recommendations.append(status.recommended_action)
+    elif not verified:
+        recommendations.append("Reinstall from an official release or rebuild from trusted source.")
+
+    return {
+        "overall_status": "verified" if verified else "failed",
+        "health_impact": "healthy" if verified else "broken",
+        "trust_state": status.trust_state,
+        "result_code": status.result_code,
+        "failure_code": status.failure_code,
+        "signature_valid": status.signature_valid,
+        "signature_path": status.signature_path,
+        "manifest_path": status.manifest_path,
+        "manifest_hash": status.manifest_sha256,
+        "manifest_build_id": status.build_id,
+        "current_build_id": status.build_id,
+        "manifest_git_commit": status.git_commit,
+        "current_git_commit": status.git_commit,
+        "release_id": status.release_id,
+        "signing_key_fingerprint": status.signing_key_fingerprint,
+        "matched_count": int(status.authority.get("checked_files", 0) or 0),
+        "mismatched_count": len(status.source_modified_files),
+        "missing_count": len(status.missing_files),
+        "extra_count": len(status.extra_files),
+        "file_results": file_results,
+        "errors": errors,
+        "warnings": [] if verified else [status.reason] if status.reason else [],
+        "recommended_actions": recommendations,
+        "exact_mismatch_reason": status.reason,
+        "verified_at": utc_now_iso(),
+        "checked_at": utc_now_iso(),
+        "wrapper": status.to_dict(),
+    }

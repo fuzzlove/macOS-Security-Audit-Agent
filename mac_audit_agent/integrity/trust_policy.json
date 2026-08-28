@@ -1,0 +1,24 @@
+{
+  "allowed_developer_ids": [
+    "liquidsky"
+  ],
+  "created_at": "2026-07-08T00:00:00Z",
+  "enrolled_yubikeys": [],
+  "pkcs11_provider": "ykcs11",
+  "policy_version": "1",
+  "project_name": "macOS Security Audit Agent",
+  "require_build_id_binding": true,
+  "require_codex_provenance_for_manifest_update": false,
+  "require_distinct_devices": true,
+  "require_git_commit_binding": true,
+  "require_manifest_hash_binding": true,
+  "require_pin": true,
+  "require_touch": true,
+  "required_signature_quorum": {
+    "mode": "all_required",
+    "required_count": 2
+  },
+  "signing_algorithm": "piv_ecdsa_p256_sha256",
+  "source_exclusion_policy_id": "msaa-source-exclusions-v1",
+  "updated_at": "2026-07-08T00:00:00Z"
+}

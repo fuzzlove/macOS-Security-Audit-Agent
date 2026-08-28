@@ -4,10 +4,10 @@ import hashlib
 import json
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from mac_audit_agent.compat.datetime_compat import utc_now
 from mac_audit_agent.integrity.strict_verifier import IntegrityDiffReport
 
 
@@ -45,7 +45,7 @@ class AuthorizedChangeRegistry:
         serialized = json.dumps(report.to_dict(), sort_keys=True, separators=(",", ":"))
         record = AuthorizedChangeRecord(
             authorization_id=f"integrity-auth-{uuid.uuid4().hex}",
-            timestamp=datetime.now(timezone.utc).isoformat(),
+            timestamp=utc_now().isoformat(),
             user_confirmation=user_confirmation,
             reason=reason,
             file_paths=[change.file_path for change in changes],

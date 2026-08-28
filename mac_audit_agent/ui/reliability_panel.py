@@ -17,6 +17,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from mac_audit_agent.ui.button_factory import create_button, create_export_button, create_toolbar_button
+from mac_audit_agent.ui.responsive_actions import ResponsiveActionRow
+
 
 def _table(headers: list[str]) -> QTableWidget:
     widget = QTableWidget(0, len(headers))
@@ -64,8 +67,8 @@ class ReliabilityPanel(QFrame):
 
         header = QHBoxLayout()
         title = QLabel("Reliability & Release Readiness")
-        title.setStyleSheet("font-size: 18px; font-weight: 700; color: #F0F6FC;")
-        self.refresh_button = QPushButton("Refresh")
+        title.setProperty("textRole", "cardTitle")
+        self.refresh_button = create_toolbar_button("Refresh")
         self.refresh_button.clicked.connect(self.refresh_requested.emit)
         header.addWidget(title, 1)
         header.addWidget(self.refresh_button)
@@ -73,7 +76,7 @@ class ReliabilityPanel(QFrame):
 
         self.summary_label = QLabel("No reliability report loaded yet.")
         self.summary_label.setWordWrap(True)
-        self.summary_label.setStyleSheet("color: #D6E4FF; font-weight: 700;")
+        self.summary_label.setStyleSheet("font-weight: 700;")
         layout.addWidget(self.summary_label)
 
         self.tabs = QTabWidget()
@@ -107,20 +110,19 @@ class ReliabilityPanel(QFrame):
         self.incident_text.setReadOnly(True)
         incident_page = QWidget()
         incident_layout = QVBoxLayout(incident_page)
-        incident_buttons = QHBoxLayout()
-        self.enable_incident_button = QPushButton("Enable Incident Mode")
-        self.disable_incident_button = QPushButton("Disable Incident Mode")
+        incident_buttons = ResponsiveActionRow()
+        self.enable_incident_button = create_button("Enable Incident Mode")
+        self.disable_incident_button = create_button("Disable Incident Mode")
         self.enable_incident_button.clicked.connect(self.incident_mode_enable_requested.emit)
         self.disable_incident_button.clicked.connect(self.incident_mode_disable_requested.emit)
-        incident_buttons.addWidget(self.enable_incident_button)
-        incident_buttons.addWidget(self.disable_incident_button)
-        incident_layout.addLayout(incident_buttons)
-        incident_action_buttons = QHBoxLayout()
-        self.incident_snapshot_button = QPushButton("Create Evidence Snapshot")
-        self.incident_timeline_button = QPushButton("Open Timeline")
-        self.incident_export_button = QPushButton("Export Case Package")
-        self.incident_note_button = QPushButton("Add Investigation Note")
-        self.incident_priority_button = QPushButton("Review High Priority Events")
+        incident_buttons.add_buttons([self.enable_incident_button, self.disable_incident_button])
+        incident_layout.addWidget(incident_buttons)
+        incident_action_buttons = ResponsiveActionRow()
+        self.incident_snapshot_button = create_toolbar_button("Create Evidence Snapshot")
+        self.incident_timeline_button = create_toolbar_button("Open Timeline")
+        self.incident_export_button = create_export_button("Export Case Package")
+        self.incident_note_button = create_toolbar_button("Add Investigation Note")
+        self.incident_priority_button = create_toolbar_button("Review High Priority Events")
         self.incident_snapshot_button.clicked.connect(self.incident_create_snapshot_requested.emit)
         self.incident_timeline_button.clicked.connect(self.incident_open_timeline_requested.emit)
         self.incident_export_button.clicked.connect(self.incident_export_case_package_requested.emit)
@@ -133,8 +135,8 @@ class ReliabilityPanel(QFrame):
             self.incident_note_button,
             self.incident_priority_button,
         ]:
-            incident_action_buttons.addWidget(button)
-        incident_layout.addLayout(incident_action_buttons)
+            incident_action_buttons.add_button(button)
+        incident_layout.addWidget(incident_action_buttons)
         incident_layout.addWidget(self.incident_text, 1)
 
         self.tabs.addTab(self.alert_table, "Alert Pipeline Health")

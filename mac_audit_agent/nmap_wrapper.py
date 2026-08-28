@@ -300,3 +300,40 @@ def run_nmap_scan(
         exit_code=completed.returncode,
         sudo_required=profile.requires_sudo,
     )
+
+
+def run_nmap_vulnerability_scripts(target: str, *, port: int | None = None,
+                                   timeout_seconds: int = 300,
+                                   nmap_path: str | None = None) -> dict[str, Any]:
+    """Run Nmap's locally installed, category=vuln NSE scripts and parse script output."""
+    resolved = nmap_path or find_nmap_binary()
+    if resolved is None:
+        return {"available": False, "findings": [], "errors": [NMAP_INSTALL_MESSAGE], "command": ""}
+    safe_target = validate_target(target, advanced_authorized=True)
+    command = [resolved, "-sV", "-Pn", "-n", "--script", "vuln"]
+    if port is not None:
+        command.extend(["-p", str(int(port))])
+    else:
+        command.extend(["--top-ports", "1000"])
+    command.extend([safe_target, "-oX", "-"])
+    try:
+        completed = subprocess.run(command, shell=False, timeout=timeout_seconds,
+                                   capture_output=True, text=True)
+    except subprocess.TimeoutExpired:
+        return {"available": True, "findings": [], "errors": [f"Nmap vulnerability scan timed out after {timeout_seconds} seconds."], "command": redact_command(command)}
+    findings: list[dict[str, Any]] = []
+    errors = [] if completed.returncode == 0 else [completed.stderr.strip() or f"Nmap exited with {completed.returncode}."]
+    try:
+        root = ElementTree.fromstring(completed.stdout)
+        for host in root.findall("host"):
+            for port_node in host.findall("./ports/port"):
+                port_id = port_node.attrib.get("portid", "")
+                for script in port_node.findall("script"):
+                    findings.append({"script_id": script.attrib.get("id", "nmap-vuln"),
+                                     "port": port_id, "output": script.attrib.get("output", "")[:4096]})
+            for script in host.findall("./hostscript/script"):
+                findings.append({"script_id": script.attrib.get("id", "nmap-vuln"),
+                                 "port": "host", "output": script.attrib.get("output", "")[:4096]})
+    except ElementTree.ParseError as exc:
+        if completed.stdout.strip(): errors.append(f"Unable to parse Nmap vulnerability XML: {exc}")
+    return {"available": True, "findings": findings, "errors": errors, "command": redact_command(command)}

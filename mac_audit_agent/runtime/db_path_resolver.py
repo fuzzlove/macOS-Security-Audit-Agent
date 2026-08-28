@@ -4,8 +4,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from mac_audit_agent.launch_agent import default_monitor_db_path
-from mac_audit_agent.monitor_settings import load_settings
 from mac_audit_agent.runtime.path_alignment import classify_runtime_paths
+from mac_audit_agent.runtime.topology import resolve_runtime_topology
 from mac_audit_agent.storage import AuditDatabase
 
 
@@ -29,31 +29,7 @@ class DbPathAlignment:
 
 
 def get_active_monitor_mode(settings_db_path: Path | None = None) -> str:
-    db_path = Path(settings_db_path or default_monitor_db_path("user")).expanduser()
-    system_db_path = default_monitor_db_path("system").expanduser()
-    try:
-        db = AuditDatabase(db_path)
-        explicit_mode = db.get_background_monitor_state("monitor_mode", db.get_background_monitor_state("monitor_install_mode", "")).strip().lower()
-        settings = load_settings(db)
-        mode = str(settings.installation.monitor_mode or "user").strip().lower()
-    except Exception:
-        explicit_mode = ""
-        mode = ""
-    if explicit_mode in {"system", "protected"}:
-        return "system"
-    if explicit_mode == "user":
-        return "user"
-    if mode in {"system", "protected"}:
-        return "system"
-    if system_db_path.exists():
-        try:
-            system_db = AuditDatabase(system_db_path)
-            system_mode = system_db.get_background_monitor_state("monitor_mode", system_db.get_background_monitor_state("monitor_install_mode", "")).strip().lower()
-            if system_mode in {"system", "protected"} or system_db.latest_monitor_heartbeat():
-                return "system"
-        except Exception:
-            return "system"
-    return "system" if mode in {"system", "protected"} else "user"
+    return resolve_runtime_topology(settings_db_path).selected_monitor_mode
 
 
 def get_system_daemon_db_path() -> Path:
@@ -65,23 +41,11 @@ def get_user_monitor_db_path() -> Path:
 
 
 def get_active_monitor_db_path(settings_db_path: Path | None = None) -> Path:
-    mode = get_active_monitor_mode(settings_db_path)
-    if mode == "system":
-        return get_system_daemon_db_path()
-    if settings_db_path is not None:
-        settings_path = Path(settings_db_path).expanduser()
-        try:
-            configured = AuditDatabase(settings_path).get_background_monitor_state("db_path", "").strip()
-            if configured:
-                return Path(configured).expanduser()
-        except Exception:
-            return settings_path
-        return settings_path
-    return get_user_monitor_db_path()
+    return Path(resolve_runtime_topology(settings_db_path).canonical_event_database)
 
 
 def get_user_notifier_db_path(settings_db_path: Path | None = None) -> Path:
-    return get_active_monitor_db_path(settings_db_path)
+    return Path(resolve_runtime_topology(settings_db_path).notifier_event_database)
 
 
 def validate_db_path_alignment(
@@ -92,12 +56,13 @@ def validate_db_path_alignment(
     alert_trace_db_path: Path | None = None,
 ) -> DbPathAlignment:
     settings_path = Path(settings_db_path or default_monitor_db_path("user")).expanduser()
-    active = get_active_monitor_db_path(settings_path)
+    topology = resolve_runtime_topology(settings_path, notifier_event_database=Path(notifier_db_path).expanduser() if notifier_db_path else None)
+    active = Path(topology.canonical_event_database)
     notifier = Path(notifier_db_path).expanduser() if notifier_db_path else active
-    event = Path(event_db_path or alert_trace_db_path or active).expanduser()
-    alert_trace = Path(alert_trace_db_path or event_db_path or active).expanduser()
+    event = Path(event_db_path or active).expanduser()
+    alert_trace = Path(alert_trace_db_path or topology.alert_trace_database).expanduser()
     system = get_system_daemon_db_path()
-    mode = get_active_monitor_mode(settings_path)
+    mode = topology.selected_monitor_mode
     alignment = classify_runtime_paths(
         active_monitor_mode=mode,
         active_monitor_db_path=active,

@@ -69,11 +69,11 @@ class InvestigationPriorityPanel(QFrame):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
 
-        self.title_label = QLabel("Investigation Priorities")
-        self.title_label.setStyleSheet("font-size: 18px; font-weight: 700; color: #F0F6FC;")
+        self.title_label = QLabel("Investigation Priority")
+        self.title_label.setProperty("textRole", "cardTitle")
         self.subtitle_label = QLabel("Ranked by persistence, admin changes, network changes, unknown devices, trust decay, and suppression history.")
         self.subtitle_label.setWordWrap(True)
-        self.subtitle_label.setStyleSheet("color: #9DB0C9;")
+        self.subtitle_label.setProperty("textRole", "muted")
         layout.addWidget(self.title_label)
         layout.addWidget(self.subtitle_label)
 
@@ -83,7 +83,7 @@ class InvestigationPriorityPanel(QFrame):
         self.summary_label = QLabel("No findings to prioritize.")
         for label in [self.generated_label, self.scan_label, self.summary_label]:
             label.setWordWrap(True)
-            label.setStyleSheet("color: #D6E4FF;")
+            label.setProperty("textRole", "muted")
             summary_row.addWidget(label)
         layout.addLayout(summary_row)
 

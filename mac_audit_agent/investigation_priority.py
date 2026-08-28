@@ -213,7 +213,7 @@ class InvestigationPriorityEngine:
         if scan is None:
             scan = self.db.get_scan_result(scan_id) if scan_id else self.db.latest_scan_result()
         if scan is None:
-            return build_investigation_priority_report_from_scan(None)
+            return self._merge_rce_events(self._merge_behavioral_incidents(build_investigation_priority_report_from_scan(None)))
         review_statuses: dict[tuple[str, str], ReviewChecklistItem] = {}
         suppression_rules: list[FindingSuppressionRule] = []
         context_window: WorkflowContextWindow | None = None
@@ -239,12 +239,110 @@ class InvestigationPriorityEngine:
         except Exception as exc:
             LOGGER.exception("Failed to build context window for investigation priorities: %s", exc)
             context_window = None
-        return build_investigation_priority_report_from_scan(
+        report = build_investigation_priority_report_from_scan(
             scan,
             review_statuses=review_statuses,
             suppression_rules=suppression_rules,
             context_window=context_window,
         )
+        return self._merge_rce_events(self._merge_behavioral_incidents(report))
+
+    def _merge_rce_events(self, report: InvestigationPriorityReport) -> InvestigationPriorityReport:
+        try:
+            from mac_audit_agent.rce_monitor.repository import RCERepository
+
+            repository = RCERepository(Path(self.db.path))
+            rows = [repository.event_detail(str(item["event_id"])) for item in repository.list_events(limit=500)]
+            repository.conn.close()
+        except Exception as exc:
+            LOGGER.debug("RCE investigation priorities are unavailable: %s", exc, exc_info=True)
+            return report
+        candidates: list[InvestigationPriorityItem] = []
+        for row in rows:
+            if not row or row.get("event_type") != "SUSPECTED_REMOTE_CODE_EXECUTION":
+                continue
+            disposition = str(row.get("disposition", "")).upper()
+            if disposition in {"FALSE_POSITIVE", "BENIGN_SOFTWARE_BEHAVIOR", "FUZZING_TEST_ACTIVITY", "DEBUGGER_ACTIVITY"}:
+                continue
+            score = max(0, min(100, int(row.get("confidence_score", 0) or 0)))
+            process = row.get("process", {}) or row.get("target_process", {}) or {}
+            reason_codes = [str(item.get("code", "")) for item in row.get("reason_evidence", [])]
+            candidates.append(InvestigationPriorityItem(
+                finding_id=str(row.get("event_id", "")),
+                title=f"Suspected RCE: {process.get('name') or Path(str(process.get('executable', ''))).name or 'unknown process'}",
+                rank_score=score,
+                why_ranked_here=str(row.get("why_flagged", "Exploitation-like behavior requires analyst validation.")),
+                evidence="Reason codes: " + ", ".join(reason_codes),
+                confidence=str(row.get("confidence", "low")).lower().replace("critical", "high").replace("info", "low"),
+                recommended_next_action="Open Host IDS → Suspected RCE and validate the timeline, process tree, memory indicators, file/network evidence, and sensor gaps.",
+                estimated_investigation_effort="20–45 minutes",
+                severity=str(row.get("severity", "medium")).lower(),
+                first_seen=str(row.get("first_observed_at", row.get("observed_at", ""))),
+                review_state=str(row.get("review_state", "open")).lower(),
+                trust_score_impact=-25 if score >= 80 else -15,
+                persistence_involvement=any("PERSISTENCE" in item for item in reason_codes),
+                network_involvement="RCE-R009_UNEXPECTED_NETWORK" in reason_codes,
+                admin_involvement=bool(row.get("token_or_privilege_context")),
+                priority_factors=reason_codes,
+                source_trace=str(row.get("event_id", "")),
+            ))
+        if not candidates:
+            return report
+        combined = [*report.full_queue, *candidates]
+        combined.sort(key=lambda item: (-item.rank_score, -SEVERITY_RANK.get(item.severity, 0), -CONFIDENCE_RANK.get(item.confidence, 0), _parse_timestamp(item.first_seen), item.title.lower()))
+        report.full_queue, report.top_10, report.top_3 = combined, combined[:10], combined[:3]
+        report.summary = f"{report.summary} Included {len(candidates)} suspected RCE investigation{'s' if len(candidates) != 1 else ''}."
+        return report
+
+    def _merge_behavioral_incidents(self, report: InvestigationPriorityReport) -> InvestigationPriorityReport:
+        try:
+            from mac_audit_agent.telemetry.storage import TelemetryRepository
+
+            rows = TelemetryRepository(self.db).list_incidents(limit=500)
+        except Exception as exc:
+            LOGGER.debug("Behavioral incident priorities are unavailable: %s", exc, exc_info=True)
+            return report
+        behavioral: list[InvestigationPriorityItem] = []
+        for row in rows:
+            status = str(row.get("status", "NEW")).upper()
+            if status in {"BENIGN", "FALSE_POSITIVE", "CLOSED"}:
+                continue
+            codes = [str(item) for item in row.get("reason_codes", [])]
+            score = max(0, min(100, int(row.get("anomaly_score", 0) or 0)))
+            confidence_value = float(row.get("detection_confidence", 0.0) or 0.0)
+            confidence = "high" if confidence_value >= 0.75 else "medium" if confidence_value >= 0.45 else "low"
+            evidence_refs = [str(item) for item in row.get("evidence_refs", [])]
+            reason_summary = ", ".join(code.replace("_", " ").title() for code in codes[:6]) or "Correlated behavioral deviation"
+            behavioral.append(
+                InvestigationPriorityItem(
+                    finding_id=str(row.get("incident_id", "")),
+                    title=f"Behavioral incident: {str(row.get('primary_entity') or 'multiple related entities')}",
+                    rank_score=score,
+                    why_ranked_here=f"{reason_summary}. Anomaly score {score}/100; behavior remains an investigation signal rather than proof of intent.",
+                    evidence="Canonical evidence references: " + (", ".join(evidence_refs[:20]) if evidence_refs else "none preserved"),
+                    confidence=confidence,
+                    recommended_next_action="Open Behavioral Telemetry, review the explanation and timeline, then validate the related process, persistence, privilege, and network evidence.",
+                    estimated_investigation_effort="15–30 minutes" if score >= 80 else "10–20 minutes",
+                    severity=str(row.get("security_severity", "info")).lower(),
+                    first_seen=str(row.get("first_seen", "")),
+                    review_state=status.lower(),
+                    trust_score_impact=-20 if score >= 80 else -10 if score >= 60 else 0,
+                    persistence_involvement=any("PERSISTENCE" in code for code in codes),
+                    network_involvement=any(token in code for code in codes for token in ("NETWORK", "DESTINATION", "DNS")),
+                    admin_involvement=any(token in code for code in codes for token in ("PRIVILEGE", "ADMINISTRATOR", "AUTHENTICATION")),
+                    priority_factors=codes,
+                    source_trace=str(row.get("incident_id", "")),
+                )
+            )
+        if not behavioral:
+            return report
+        combined = [*report.full_queue, *behavioral]
+        combined.sort(key=lambda item: (-item.rank_score, -SEVERITY_RANK.get(item.severity, 0), -CONFIDENCE_RANK.get(item.confidence, 0), _parse_timestamp(item.first_seen), item.title.lower()))
+        report.full_queue = combined
+        report.top_10 = combined[:10]
+        report.top_3 = combined[:3]
+        report.summary = f"{report.summary} Included {len(behavioral)} correlated Behavioral Telemetry incident candidate{'s' if len(behavioral) != 1 else ''}."
+        return report
 
 
 def _priority_item_from_finding(

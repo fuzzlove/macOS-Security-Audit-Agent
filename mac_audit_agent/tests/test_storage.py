@@ -5,6 +5,8 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from mac_audit_agent.models import BackgroundMonitorEvent, Finding, InvestigationNote, ScanSummary
 from mac_audit_agent.storage import AuditDatabase, json_safe, normalize_finding_for_db, normalize_finding_payload
 
@@ -565,6 +567,10 @@ def test_storage_migration_preserves_existing_tables(tmp_path: Path) -> None:
 
 def test_system_monitor_db_permissions_are_admin_group_writable(tmp_path: Path, monkeypatch) -> None:
     system_db = tmp_path / "Library" / "Application Support" / "MacAuditAgent" / "mac_audit_agent.sqlite3"
+    system_db.parent.mkdir(parents=True)
+    integrity_key = system_db.with_name(system_db.name + ".audit-integrity.key")
+    integrity_key.write_bytes(b"k" * 32)
+    integrity_key.chmod(0o600)
     chown_calls = []
     monkeypatch.setattr("mac_audit_agent.storage.SYSTEM_MONITOR_DB_PATH", system_db)
     monkeypatch.setattr("mac_audit_agent.storage.grp.getgrnam", lambda _name: type("Group", (), {"gr_gid": 80})())
@@ -575,3 +581,14 @@ def test_system_monitor_db_permissions_are_admin_group_writable(tmp_path: Path, 
     assert (system_db, 0, 80) in chown_calls
     assert system_db.stat().st_mode & 0o777 == 0o660
     assert system_db.parent.stat().st_mode & 0o777 == 0o775
+    assert integrity_key.stat().st_mode & 0o777 == 0o640
+    assert (integrity_key, 0, 80) in chown_calls
+
+
+def test_dynamic_sql_identifiers_reject_injection(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    with pytest.raises(ValueError):
+        db._insert_snapshot_rows("port_snapshots; DROP TABLE scans", "scan", [])
+    with pytest.raises(ValueError):
+        db.update_event_alert_trace("trace", **{"status = 'bad' --": "x"})
+    assert db.conn.execute("SELECT name FROM sqlite_master WHERE name='scans'").fetchone() is not None

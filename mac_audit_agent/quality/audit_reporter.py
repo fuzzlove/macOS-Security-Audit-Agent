@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import html
 import json
-import socket
 from pathlib import Path
 
 from mac_audit_agent.models import utc_now_iso
@@ -20,8 +19,7 @@ def default_output_dir() -> Path:
 
 def report_basename(hostname: str, timestamp: str | None = None) -> str:
     stamp = (timestamp or utc_now_iso()).replace(":", "").replace("-", "").replace("+", "Z")[:15]
-    safe_host = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in hostname or socket.gethostname())
-    return f"Pre_UAT_Audit_{safe_host}_{stamp}"
+    return f"Pre_UAT_Audit_redacted-host_{stamp}"
 
 
 def write_reports(report: AuditReport, output_dir: Path | None = None) -> dict[str, str]:
@@ -58,6 +56,9 @@ def markdown_report(report: AuditReport) -> str:
         ("Blockers", {"BLOCKER"}),
         ("Critical Failures", {"FAIL"}),
         ("Warnings", {"WARN"}),
+        ("Degraded", {"DEGRADED"}),
+        ("Not Verified", {"NOT_VERIFIED"}),
+        ("Harness Errors", {"HARNESS_ERROR"}),
         ("Passed Checks", {"PASS"}),
         ("Skipped Checks", {"SKIPPED"}),
     ]:
@@ -87,7 +88,8 @@ th, td {{ border: 1px solid #c9d2dc; padding: 8px; text-align: left; vertical-al
 th {{ background: #263746; color: white; }}
 .PASS {{ color: #1b7f3a; font-weight: 700; }}
 .WARN {{ color: #9a6700; font-weight: 700; }}
-.FAIL, .BLOCKER {{ color: #b42318; font-weight: 700; }}
+.FAIL, .BLOCKER, .HARNESS_ERROR {{ color: #b42318; font-weight: 700; }}
+.DEGRADED, .NOT_VERIFIED {{ color: #9a6700; font-weight: 700; }}
 .SKIPPED {{ color: #667085; font-weight: 700; }}
 </style></head><body>
 <h1>MSAA Pre-UAT Audit</h1>

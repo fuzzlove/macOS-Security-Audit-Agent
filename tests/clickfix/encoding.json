@@ -1,0 +1,209 @@
+[
+  {
+    "fixture_id": "CF-ENC-001",
+    "name": "Harmless Base64 content decoded into zsh",
+    "category": "encoding",
+    "description": "Harmless Base64 content decoded into zsh supplied only as inert scanner data.",
+    "command_text": "printf '%s' 'cHJpbnRmICdNU0FBX0NMSUNLRklYX1RFU1Rcbic=' | base64 -D | zsh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "decoded_content_to_interpreter",
+      "static_decoded_content"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-ENC-002",
+    "name": "Base64 decoded into Bash",
+    "category": "encoding",
+    "description": "Base64 decoded into Bash supplied only as inert scanner data.",
+    "command_text": "echo 'cHJpbnRmICdNU0FBX0NMSUNLRklYX1RFU1Rcbic=' | base64 --decode | bash",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "decoded_content_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-ENC-003",
+    "name": "OpenSSL Base64 decoding into shell",
+    "category": "encoding",
+    "description": "OpenSSL Base64 decoding into shell supplied only as inert scanner data.",
+    "command_text": "printf '%s' 'cHJpbnRmICdNU0FBX0NMSUNLRklYX1RFU1Rcbic=' | openssl base64 -d | sh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "decoded_content_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-ENC-004",
+    "name": "Hexadecimal reconstruction into zsh",
+    "category": "encoding",
+    "description": "Hexadecimal reconstruction into zsh supplied only as inert scanner data.",
+    "command_text": "printf '7072696e746620274d5341415f434c49434b4649585f544553545c6e27' | xxd -r -p | zsh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "decoded_content_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-ENC-005",
+    "name": "Decoder output captured and evaluated",
+    "category": "encoding",
+    "description": "Decoder output captured and evaluated supplied only as inert scanner data.",
+    "command_text": "x=\"$(printf '%s' 'cHJpbnRmICdNU0FBX0NMSUNLRklYX1RFU1Rcbic=' | base64 -D)\" ; eval \"$x\"",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "static_decoded_content",
+      "dynamic_execution"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-ENC-006",
+    "name": "Nested encoding",
+    "category": "encoding",
+    "description": "Nested encoding supplied only as inert scanner data.",
+    "command_text": "printf '%s' 'Y0hKcGJuUm1JQ2ROVTBGQlgwTk1TVU5MUmtsWVgxUkZVMVJjYmljPQ==' | base64 -D | base64 -D | zsh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "decoded_content_to_interpreter",
+      "multiple_decode_layers"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-ENC-007",
+    "name": "Base64 plus Gzip plus eval",
+    "category": "encoding",
+    "description": "Base64 plus Gzip plus eval supplied only as inert scanner data.",
+    "command_text": "eval \"$(printf '%s' 'H4sIAAAAAAAC/ysoyswrSVNQ9w12dIx39vF09nbzjIgPcQ0OiclTBwDmyIEAHQAAAA==' | base64 -D | gzip -d)\"",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "static_decoded_content",
+      "dynamic_execution"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  }
+]

@@ -9,14 +9,17 @@ import stat
 import subprocess
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from mac_audit_agent.compat.datetime_compat import utc_now
 from mac_audit_agent.build_identity import detect_build_identity
+from mac_audit_agent.integrity.approved_changes import classify_files_against_record, latest_pending_approved_change
+from mac_audit_agent.integrity.exclusions import is_runtime_mutable_path
 from mac_audit_agent.integrity.hasher import calculate_sha256, is_excluded, iter_integrity_files
 from mac_audit_agent.integrity.manifest import canonical_source_type
 from mac_audit_agent.integrity.manifest import IntegrityFileEntry, IntegrityManifest, load_integrity_manifest
+from mac_audit_agent.integrity.trust_states import IntegrityTrustState, signature_context_message, trust_basis_for_state
 
 
 @dataclass
@@ -28,6 +31,14 @@ class IntegrityVerificationResult:
     overall_status: str
     health_impact: str = "degraded"
     trust_state: str = "unknown"
+    trust_basis: str = ""
+    baseline_mode: str = ""
+    signature_status: str = ""
+    signature_message: str = ""
+    approved_change_id: str = ""
+    approved_change_status: str = ""
+    modified_file_classification: list[dict[str, str]] = field(default_factory=list)
+    excluded_runtime_files: list[str] = field(default_factory=list)
     manifest_app_version: str = ""
     current_app_version: str = ""
     manifest_build_id: str = ""
@@ -68,7 +79,7 @@ class IntegrityVerificationResult:
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return utc_now().isoformat()
 
 
 def _mode(path: Path) -> str:
@@ -147,6 +158,51 @@ def _add_mismatch(result: IntegrityVerificationResult, field: str, manifest_valu
 
 def _compatible_source_type(manifest_type: str, active_type: str) -> bool:
     return canonical_source_type(manifest_type) == canonical_source_type(active_type)
+
+
+def _classify_modified_files(result: IntegrityVerificationResult, root: Path, manifest: IntegrityManifest) -> None:
+    changed = [
+        str(item.get("relative_path", ""))
+        for item in result.file_results
+        if isinstance(item, dict) and item.get("verification_status") in {"mismatch", "missing", "extra"}
+    ]
+    changed = [item for item in changed if item]
+    excluded = [item for item in changed if is_runtime_mutable_path(item, manifest.excluded_patterns)]
+    if excluded:
+        result.excluded_runtime_files = excluded
+        result.modified_file_classification.extend(
+            {"file": item, "classification": "excluded", "approved_change_id": "", "reason": "runtime mutable path"}
+            for item in excluded
+        )
+    security_changes = [item for item in changed if item not in excluded]
+    if not security_changes:
+        if changed:
+            result.trust_state = IntegrityTrustState.RUNTIME_MUTABLE_CHANGE_ONLY.value
+            result.trust_basis = trust_basis_for_state(result.trust_state)
+        return
+    record = latest_pending_approved_change(root)
+    classification = classify_files_against_record(security_changes, record)
+    approved = [path for path, state in classification.items() if state == "approved"]
+    unapproved = [path for path, state in classification.items() if state != "approved"]
+    for path, state in classification.items():
+        result.modified_file_classification.append(
+            {
+                "file": path,
+                "classification": state,
+                "approved_change_id": record.change_id if record and state == "approved" else "",
+                "reason": "matches approved change record" if state == "approved" else "no approved change record covers this file",
+            }
+        )
+    if approved and not unapproved:
+        result.trust_state = IntegrityTrustState.MODIFIED_PENDING_REVIEW.value
+        result.trust_basis = trust_basis_for_state(result.trust_state)
+        result.approved_change_id = record.change_id if record else ""
+        result.approved_change_status = record.approval_status if record else ""
+        result.warnings.append("Modified files match an approved change record, but they are not trusted until reviewed, verified, and rebaselined.")
+    elif unapproved:
+        result.trust_state = IntegrityTrustState.MODIFIED_UNAPPROVED.value
+        result.trust_basis = trust_basis_for_state(result.trust_state)
+        result.warnings.append("One or more modified files are not covered by an approved change record.")
 
 
 @dataclass(frozen=True)
@@ -250,6 +306,8 @@ def verify_integrity_manifest(
             source_type="unknown",
             overall_status="unknown",
             health_impact="degraded",
+            trust_state=IntegrityTrustState.MISSING_MANIFEST.value,
+            trust_basis=trust_basis_for_state(IntegrityTrustState.MISSING_MANIFEST.value),
             cached_result=False,
             cache_valid=False,
             cache_invalidated_reason="bypassed" if bypass_cache else "manifest_missing",
@@ -289,6 +347,11 @@ def verify_integrity_manifest(
         overall_status="unknown",
         health_impact="degraded",
         trust_state=manifest.trust_state,
+        trust_basis=trust_basis_for_state(manifest.trust_state, source_type=manifest.source_type, signature_status=manifest.signature_status),
+        baseline_mode=manifest.baseline_mode,
+        signature_status=manifest.signature_status,
+        signature_message=signature_context_message(manifest.source_type, manifest.signature_status)[0],
+        approved_change_id=manifest.approved_change_id or "",
         manifest_app_version=manifest.app_version,
         current_app_version=identity.app_version,
         manifest_build_id=manifest.build_id,
@@ -307,7 +370,13 @@ def verify_integrity_manifest(
         verification_result_id=result_id,
         verified_at=checked_at,
     )
-    if manifest.trust_state != "trusted":
+    trusted_manifest_states = {
+        "trusted",
+        IntegrityTrustState.TRUSTED_DEVELOPMENT_BASELINE.value,
+        IntegrityTrustState.TRUSTED_CODEX_APPROVED_CHANGE.value,
+        IntegrityTrustState.TRUSTED_SIGNED_RELEASE.value,
+    }
+    if manifest.trust_state not in trusted_manifest_states:
         status = manifest.trust_state if manifest.trust_state in {"draft", "expired", "revoked", "unknown"} else "unknown"
         result.overall_status = "stale" if status == "expired" else status
         result.health_impact = _health_impact(result.overall_status)
@@ -453,8 +522,12 @@ def verify_integrity_manifest(
         elif not allow_extra_files:
             result.extra_count += 1
             result.file_results.append({"relative_path": rel, "absolute_path": str(path), "verification_status": "extra", "executable": False})
+    _classify_modified_files(result, base, manifest)
     if result.mismatched_count or result.missing_count:
-        result.recommended_actions.append("Preserve evidence and reinstall MSAA from a trusted source if the change was not approved.")
+        if result.trust_state == IntegrityTrustState.MODIFIED_PENDING_REVIEW.value:
+            result.recommended_actions.append("Review the approved change, run verification, then explicitly update the trusted development baseline if appropriate.")
+        else:
+            result.recommended_actions.append("Preserve evidence and reinstall MSAA from a trusted source if the change was not approved.")
     if result.extra_count:
         result.recommended_actions.append("Review unexpected executable files before trusting this installation.")
     if metadata_mismatch and not (result.mismatched_count or result.missing_count):
@@ -462,6 +535,25 @@ def verify_integrity_manifest(
     if not result.recommended_actions:
         result.recommended_actions.append("No integrity drift detected against the trusted manifest.")
     result.overall_status = _status(result, metadata_mismatch=metadata_mismatch)
+    if result.overall_status in {"verified", "verified_with_warnings"}:
+        if manifest.approved_change_id:
+            result.trust_state = IntegrityTrustState.TRUSTED_CODEX_APPROVED_CHANGE.value
+        elif manifest.source_type == "source_tree":
+            result.trust_state = IntegrityTrustState.TRUSTED_DEVELOPMENT_BASELINE.value
+        elif manifest.signature_status == "signed":
+            result.trust_state = IntegrityTrustState.TRUSTED_SIGNED_RELEASE.value
+        else:
+            msg, sev = signature_context_message(manifest.source_type, manifest.signature_status)
+            result.signature_message = msg
+            if sev == "high" and manifest.source_type in {"pyinstaller_app", "pip_package"}:
+                result.trust_state = IntegrityTrustState.UNSIGNED_RELEASE_ARTIFACT.value
+            else:
+                result.trust_state = manifest.trust_state
+    elif result.overall_status == "stale":
+        result.trust_state = IntegrityTrustState.STALE_MANIFEST.value
+    elif result.overall_status == "failed":
+        result.trust_state = IntegrityTrustState.VERIFICATION_ERROR.value
+    result.trust_basis = trust_basis_for_state(result.trust_state, source_type=manifest.source_type, signature_status=manifest.signature_status)
     result.health_impact = _health_impact(result.overall_status)
     if result.mismatch_details:
         result.exact_mismatch_reason = result.mismatch_details[0]["message"]

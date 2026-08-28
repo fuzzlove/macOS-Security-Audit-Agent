@@ -41,7 +41,7 @@ def test_settings_reconciliation_labels_manifest_only_stale_as_safe_for_manual_t
     )
 
     assert result.status == "installed_manifest_stale"
-    assert result.safe_to_manual_test is True
+    assert not hasattr(result, "safe_to_manual_test")
     assert result.requires_reinstall is True
 
 
@@ -70,7 +70,8 @@ def test_settings_diagnostics_keeps_stale_installed_notifier_state_historical(tm
     )
 
     assert diagnostics["user_alert_agent"]["running"] is True
-    assert diagnostics["user_alert_agent"]["deliverable"] is True
+    assert diagnostics["user_alert_agent"]["deliverable"] is False
+    assert diagnostics["user_alert_agent"]["deliverability_predicates"]["current_diagnostic_event_received"] is False
     assert diagnostics["user_alert_agent"]["status"] == "loaded"
     assert diagnostics["historical_installed_state"]["user_notifier_running"] == "0"
     assert diagnostics["settings_reconciliation"]["status"] == "synced"

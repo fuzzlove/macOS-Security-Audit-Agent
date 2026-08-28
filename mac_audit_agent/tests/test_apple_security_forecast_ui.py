@@ -75,7 +75,9 @@ def test_forecast_tab_exists_and_dashboard_is_compact(tmp_path: Path) -> None:
     assert window.dashboard_forecast_cards_label.text().startswith("Cards:")
     assert window.open_forecast_button.text() == "Open Apple Exposure Assessment"
     assert window.open_forecast_button.objectName() == "openAppleExposureAssessmentButton"
-    assert window.open_forecast_button.isVisible()
+    # The parent window is intentionally never shown in this headless test;
+    # verify the control itself was not explicitly hidden.
+    assert window.open_forecast_button.isHidden() is False
     assert window.open_forecast_button.isEnabled()
     assert window.open_forecast_button.toolTip() == "Open the Apple Exposure Assessment view to review Mac-relevant Apple security update exposure."
     window.close()
@@ -89,6 +91,30 @@ def test_forecast_button_opens_apple_exposure_assessment(tmp_path: Path) -> None
     window.open_forecast_button.click()
     assert window.sidebar.currentRow() == apple_row
     assert window.pages.currentIndex() == apple_row
+    window.close()
+    app.processEvents()
+
+
+def test_applicable_apple_exposure_becomes_dashboard_priority(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(tmp_path / "audit.sqlite")
+    window._apply_cve_radar_payload(
+        {
+            "state_text": "Update Today",
+            "display_cards": [
+                {
+                    "card_id": "macos-update",
+                    "applicability": "confirmed_applicable",
+                    "forecast_level": "critical",
+                    "status": "new",
+                }
+            ],
+        }
+    )
+
+    assert not window.dashboard_forecast_priority_label.isHidden()
+    assert window.dashboard_forecast_frame.property("priorityAssessment") is True
+    assert window.open_forecast_button.text() == "Priority: Review Apple Exposure"
     window.close()
     app.processEvents()
 

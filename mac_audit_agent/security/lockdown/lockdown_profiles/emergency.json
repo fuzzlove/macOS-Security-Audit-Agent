@@ -1,0 +1,106 @@
+{
+  "feature_id": "MSAA_LOCKDOWN_PROFILE_V1",
+  "product_name": "MSAA Emergency Protection Mode",
+  "name": "Emergency Response",
+  "purpose": "Rapid attack-surface reduction with increased monitoring.",
+  "network_mode": "restricted",
+  "controls": [
+    {
+      "id": "remote_login",
+      "description": "Disable SSH Remote Login.",
+      "warning": "Remote Login will be disabled and existing remote administration may be interrupted.",
+      "apply": [
+        "/usr/sbin/systemsetup",
+        "-setremotelogin",
+        "off"
+      ],
+      "rollback": [
+        "/usr/sbin/systemsetup",
+        "-setremotelogin",
+        "on"
+      ],
+      "state_probe": "remote_login"
+    },
+    {
+      "id": "application_firewall",
+      "description": "Ensure the macOS Application Firewall is enabled.",
+      "warning": "The macOS Application Firewall will be enabled.",
+      "apply": [
+        "/usr/libexec/ApplicationFirewall/socketfilterfw",
+        "--setglobalstate",
+        "on"
+      ],
+      "rollback": [
+        "/usr/libexec/ApplicationFirewall/socketfilterfw",
+        "--setglobalstate",
+        "off"
+      ],
+      "state_probe": "application_firewall"
+    }
+  ],
+  "monitoring": [
+    "unsigned_application_execution",
+    "suspicious_parent_child",
+    "privilege_escalation",
+    "shell_execution",
+    "unexpected_root_process",
+    "launch_agents",
+    "launch_daemons",
+    "login_items",
+    "system_extensions",
+    "usb",
+    "bluetooth",
+    "browser_extensions",
+    "suspicious_downloads",
+    "file_modification",
+    "network_connections"
+  ],
+  "score_adjustments": {
+    "attack_surface_reduction": 15,
+    "additional_monitoring": 8
+  },
+  "compliance": {
+    "NIST CSF 2.0": [
+      "GV.PO-01",
+      "PR.PS-01",
+      "DE.CM-01",
+      "RS.MA-01"
+    ],
+    "NIST SP 800-53 Rev. 5": [
+      "AC-3",
+      "AC-6",
+      "AU-2",
+      "CM-6",
+      "IR-4",
+      "SI-4"
+    ],
+    "NIST SP 800-61": [
+      "Preparation",
+      "Detection and Analysis",
+      "Containment",
+      "Eradication and Recovery"
+    ],
+    "CIS Apple macOS Benchmark": [
+      "Application Firewall",
+      "Remote Login",
+      "Gatekeeper"
+    ],
+    "MITRE ATT&CK for macOS": [
+      "T1204",
+      "T1543.001",
+      "T1059",
+      "T1068",
+      "T1098"
+    ],
+    "CISA CPG": [
+      "1.A",
+      "2.T",
+      "2.U"
+    ],
+    "Zero Trust": [
+      "least privilege",
+      "continuous verification",
+      "deny by default"
+    ]
+  }
+}

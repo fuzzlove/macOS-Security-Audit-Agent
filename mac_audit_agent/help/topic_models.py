@@ -40,6 +40,9 @@ class HelpTopic:
     category: str = "Getting Started"
     audience: str = "Users, analysts, administrators, and incident responders."
     last_updated: str = "2026-07-05"
+    resource: str = ""
+    resource_content: str = ""
+    diagnostic_codes: list[str] = field(default_factory=list)
 
     @property
     def summary(self) -> str:
@@ -56,7 +59,7 @@ class HelpTopic:
             self.user_friendly_explanation,
             "Why does it matter?",
             "\n".join(f"- {item}" for item in self.when_this_matters),
-            "What should I do?",
+            "What the user should do:",
             "\n".join(f"- {item}" for item in self.what_you_should_do),
             "Technical view",
             self.advanced_details,

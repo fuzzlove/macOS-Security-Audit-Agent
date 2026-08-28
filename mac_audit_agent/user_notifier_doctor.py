@@ -1,21 +1,25 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import plistlib
 import pwd
 import stat
 import subprocess
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 from mac_audit_agent.launch_agent import LAUNCHCTL_BIN, MAC_AUDIT_AGENT_ENV_DB_PATH, PLUTIL_BIN
+from mac_audit_agent.runtime.db_path_resolver import get_active_monitor_db_path
 from mac_audit_agent.user_notifier_installer import (
     MAC_AUDIT_AGENT_SETTINGS_PATH,
     USER_NOTIFIER_LABEL,
     UserNotifierInstaller,
 )
+from mac_audit_agent.runtime.force_mode import ForceArgumentError, ForceMode, log_force_action, parse_force_argument
 
 
 @dataclass
@@ -68,7 +72,13 @@ def diagnose_user_notifier(*, db_path: Path | None = None, home: Path | None = N
     checks["launchctl_domain_gui_uid"] = status.launchctl_domain == f"gui/{installer.uid}"
     checks["program_arguments_correct"] = args == [installer.python_executable, "-m", "mac_audit_agent.user_notifier", "--run"] or args == ["/usr/bin/python3", "-m", "mac_audit_agent.user_notifier", "--run"]
     checks["working_directory_exists"] = Path(str(plist_payload.get("WorkingDirectory", ""))).expanduser().exists()
-    checks["pythonpath_contains_runtime"] = str(installer.runtime_dir) in str(env.get("PYTHONPATH", ""))
+    # Source-mode launch agents intentionally avoid PYTHONPATH and import the
+    # staged package from their canonical runtime working directory.  Accept
+    # either model, but still require the independent import test below.
+    checks["pythonpath_contains_runtime"] = (
+        str(installer.runtime_dir) in str(env.get("PYTHONPATH", ""))
+        or (status.working_directory == str(installer.runtime_dir) and "-m" in (status.program_arguments or []))
+    )
     checks["runtime_package_exists"] = (installer.runtime_package_dir / "user_notifier.py").exists()
     checks["runtime_writable_by_user"] = _owned_writable_dir(installer.runtime_dir, installer.uid)
     checks["app_support_writable_by_user"] = _owned_writable_dir(installer.app_support_dir, installer.uid)
@@ -180,6 +190,8 @@ def _import_test(python_executable: str, runtime_dir: Path) -> bool:
 
 def _classify_likely_cause(checks: dict[str, bool], evidence: dict[str, Any]) -> str:
     stderr = str(evidence.get("stderr_tail", "")).lower()
+    if evidence.get("source_database_readable") and evidence.get("source_database_integrity") == "ok" and checks.get("process_pid_running"):
+        return ""
     if not checks.get("runtime_writable_by_user") or not checks.get("app_support_writable_by_user") or not checks.get("log_paths_writable"):
         return "permission issue"
     if not checks.get("runtime_package_exists") or "modulenotfounderror" in stderr:
@@ -200,7 +212,28 @@ def _classify_likely_cause(checks: dict[str, bool], evidence: dict[str, Any]) ->
 
 
 def main() -> int:
-    report = diagnose_user_notifier()
+    raw_argv = sys.argv[1:]
+    try:
+        cleaned, force_mode = parse_force_argument(raw_argv, command="repair-notifier", supported_scopes={"repair", "diagnostics"}, default_scope="repair" if "--repair" in raw_argv else "diagnostics", require_command=False)
+    except ForceArgumentError as exc:
+        print(str(exc), file=sys.stderr)
+        log_force_action("repair-notifier", ForceMode(enabled=False, scope="unsupported"), result="rejected", error=str(exc))
+        return 2
+    parser = argparse.ArgumentParser(description="Diagnose, repair, or verify the MSAA User Alert Agent LaunchAgent.")
+    parser.add_argument("--repair", action="store_true", help="Rewrite, bootstrap, kickstart, and verify the user alert agent.")
+    parser.add_argument("--verify", action="store_true", help="Verify the user alert agent without modifying it.")
+    parser.add_argument("--db-path", type=Path, default=None, help="Active MSAA database path the notifier should use.")
+    parser.add_argument("--force", "-f", action="store_true", help="Retry safe notifier repair from scratch. Does not delete logs or bypass validation.")
+    args = parser.parse_args(cleaned)
+    if args.force:
+        force_mode.enabled = True
+    db_path = args.db_path or get_active_monitor_db_path()
+    if force_mode.enabled:
+        log_force_action("repair-notifier" if args.repair else "verify-notifier", force_mode, action_taken="retry_notifier_repair" if args.repair else "rerun_notifier_diagnostics", result="started")
+        print("Force enabled: cached data will be bypassed and the operation will run fresh.", file=sys.stderr)
+    report = repair_user_alert_agent(db_path=db_path) if args.repair else diagnose_user_notifier(db_path=db_path)
+    if force_mode.enabled:
+        log_force_action("repair-notifier" if args.repair else "verify-notifier", force_mode, action_taken="retry_notifier_repair" if args.repair else "rerun_notifier_diagnostics", result="healthy" if report.healthy else "unhealthy")
     print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
     return 0 if report.healthy else 1
 

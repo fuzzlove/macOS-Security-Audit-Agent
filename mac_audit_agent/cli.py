@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import shutil
 import subprocess
@@ -9,7 +10,6 @@ import tempfile
 from pathlib import Path
 from uuid import uuid4
 
-from mac_audit_agent.app import main as gui_main
 from mac_audit_agent.collectors import CollectorSuite
 from mac_audit_agent.config import AuditConfig
 from mac_audit_agent.cve_radar import CveRadarEngine
@@ -17,7 +17,10 @@ from mac_audit_agent.launch_agent import LaunchAgentManager, default_monitor_db_
 from mac_audit_agent.models import BackgroundMonitorEvent, EventAlertTrace, ScanResult, ScanSummary, utc_now_iso
 from mac_audit_agent.notification_manager import MANDATORY_VISIBLE_ALERT_EVENT_TYPES, NotificationManager
 from mac_audit_agent.operational_health import OperationalHealthEngine
-from mac_audit_agent.persistence_intelligence.baseline import PersistenceBaselineManager
+from mac_audit_agent.persistence_intelligence.baseline import (
+    INSECURE_BASELINE_DISCLAIMER, RISK_ACCEPTANCE_PHRASE,
+    PersistenceBaselineManager, insecure_baseline_reasons,
+)
 from mac_audit_agent.persistence_intelligence.chain_view import build_chain_view
 from mac_audit_agent.persistence_intelligence.diagnostics import build_diagnostics
 from mac_audit_agent.persistence_intelligence.report_adapter import export_persistence_report_html, export_persistence_report_json, export_persistence_report_markdown
@@ -26,6 +29,7 @@ from mac_audit_agent.persistence_intelligence.timeline import build_timeline, ex
 from mac_audit_agent.reliability import ReleaseReadinessEngine
 from mac_audit_agent.reporting import export_scan_result_html, export_scan_result_json
 from mac_audit_agent.rules import canonical_event_type
+from mac_audit_agent.runtime.force_mode import ForceArgumentError, ForceMode, log_force_action, parse_force_argument
 from mac_audit_agent.runner import RunnerConfig, SafeCommandRunner
 from mac_audit_agent.storage import AuditDatabase
 from mac_audit_agent.system_monitor_readiness import SystemMonitorReadiness
@@ -66,6 +70,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clean-install-wheel", type=Path, default=None, help="Wheel path to install. Defaults to the newest dist/*.whl.")
     parser.add_argument("--db", type=Path, default=_default_db_path(), help="SQLite database path. Defaults to ~/.mac_audit_agent.sqlite3.")
     parser.add_argument("--no-gui", action="store_true", help="Do not launch the GUI when no action flags are provided.")
+    parser.add_argument("--force", "-f", action="store_true", help="Safely bypass cache/retry supported operations. Does not bypass integrity or safety checks.")
     return parser
 
 
@@ -81,12 +86,30 @@ def _build_persistence_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", type=Path, default=_default_db_path())
     parser.add_argument("--include-downloads", action="store_true")
     parser.add_argument("--interval", type=int, default=30)
+    parser.add_argument("--force", "-f", action="store_true", help="Rerun supported persistence operations from fresh local data.")
     return parser
 
 
 def _run_persistence_cli(argv: list[str]) -> int:
+    try:
+        command = argv[0] if argv else ""
+        cleaned, force_mode = parse_force_argument(
+            argv,
+            command=f"persistence {command}",
+            supported_scopes={"rescan", "refresh", "diagnostics"},
+            default_scope="rescan" if command in {"scan", "coverage", "chains", "posture", "timeline", "doctor", "export"} else "refresh",
+        )
+    except ForceArgumentError as exc:
+        print(str(exc), file=sys.stderr)
+        log_force_action("persistence", ForceMode(enabled=False, scope="unsupported"), result="rejected", error=str(exc))
+        return 2
     parser = _build_persistence_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(cleaned)
+    if getattr(args, "force", False):
+        force_mode.enabled = True
+    if force_mode.enabled:
+        log_force_action(f"persistence {args.command}", force_mode, action_taken="rerun_persistence_workflow", result="started")
+        print("Force enabled: cached data will be bypassed and the operation will run fresh.", file=sys.stderr)
     context = ScanContext(include_downloads=bool(args.include_downloads))
     modules = [] if args.all else list(args.module or [])
     engine = PersistenceIntelligenceEngine(context)
@@ -114,8 +137,26 @@ def _run_persistence_cli(argv: list[str]) -> int:
     elif args.command == "doctor":
         print(json.dumps(build_diagnostics(report), indent=2, sort_keys=True))
     elif args.command == "baseline":
+        if force_mode.enabled and args.baseline_action == "delete":
+            message = "Force was refused because this action could alter security state or evidence."
+            log_force_action("persistence baseline delete", force_mode, result="rejected", error=message)
+            print(message, file=sys.stderr)
+            return 2
         if args.baseline_action == "create" and args.name:
-            print(f"Baseline created: {baseline_manager.create_baseline(args.name, report.items)}")
+            reasons = insecure_baseline_reasons(report)
+            acknowledgement = ""
+            if reasons:
+                print(INSECURE_BASELINE_DISCLAIMER, file=sys.stderr)
+                print("Blocking evidence:\n- " + "\n- ".join(reasons), file=sys.stderr)
+                print("MSAA recommends that you stop and contact local IT or an authorized security team.", file=sys.stderr)
+                if not sys.stdin.isatty():
+                    print("INSECURE_BASELINE_REFUSED: interactive exact acknowledgement is required; no baseline was created.", file=sys.stderr)
+                    return 2
+                acknowledgement = input(f"Type {RISK_ACCEPTANCE_PHRASE} exactly and press Enter to accept full responsibility: ").strip()
+                if acknowledgement != RISK_ACCEPTANCE_PHRASE:
+                    print("INSECURE_BASELINE_REFUSED: acknowledgement did not match; no baseline was created.", file=sys.stderr)
+                    return 2
+            print(f"Baseline created: {baseline_manager.create_baseline(args.name, report.items, risk_reasons=reasons, acknowledgement=acknowledgement, acknowledged_by=getpass.getuser())}")
         elif args.baseline_action == "compare" and args.name:
             print(json.dumps(baseline_manager.compare_baseline(args.name, report.items), indent=2, sort_keys=True))
         elif args.baseline_action == "delete" and args.name:
@@ -190,7 +231,7 @@ def _persist_scan(db: AuditDatabase, summary: ScanSummary, scan_result: ScanResu
     )
 
 
-def _run_scan(db: AuditDatabase, *, aggressive: bool) -> tuple[ScanSummary, ScanResult]:
+def _run_scan(db: AuditDatabase, *, aggressive: bool, force_mode: ForceMode | None = None) -> tuple[ScanSummary, ScanResult]:
     scan_mode = "aggressive" if aggressive else "safe"
     localhost_protocol = "both" if aggressive else "tcp"
     config = AuditConfig(logs_dir=db.logs_dir, dry_run=False, disable_aggressive_scan=False)
@@ -198,7 +239,7 @@ def _run_scan(db: AuditDatabase, *, aggressive: bool) -> tuple[ScanSummary, Scan
     collectors = CollectorSuite(runner, config)
     started_at = utc_now_iso()
     scan_result = collectors.run_scan(
-        previous_result=db.latest_scan_result(),
+        previous_result=None if force_mode and force_mode.enabled else db.latest_scan_result(),
         scan_mode=scan_mode,
         localhost_scan_protocol=localhost_protocol,
     )
@@ -454,22 +495,91 @@ def _verify_clean_install(db: AuditDatabase, *, python_executable: Path, wheel_p
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in {"license", "licensing"}:
+        from mac_audit_agent.licensing.cli import main as licensing_main
+
+        return licensing_main(argv[1:])
+    if argv and argv[0] == "clickfix":
+        from mac_audit_agent.clickfix.cli import main as clickfix_main
+
+        return clickfix_main(argv[1:])
     if argv and argv[0] == "persistence":
         return _run_persistence_cli(argv[1:])
+    if argv and argv[0] == "anti-ransomware":
+        from mac_audit_agent.anti_ransomware.cli import main as anti_ransomware_main
+
+        return anti_ransomware_main(argv[1:])
+    if argv and argv[0] == "lockdown":
+        from mac_audit_agent.security.lockdown.lockdown_cli import main as lockdown_main
+
+        return lockdown_main(argv[1:])
+    if argv and argv[0] == "anti-typosquatting":
+        from mac_audit_agent.anti_typosquatting.cli import main as anti_typosquatting_main
+
+        return anti_typosquatting_main(argv[1:])
+    if argv and argv[0] == "alerts":
+        from mac_audit_agent.alerts.cli import main as alerts_main
+
+        return alerts_main(argv[1:])
+    if argv and argv[0] == "sensors":
+        from mac_audit_agent.health.cli import main as sensors_main
+
+        return sensors_main(argv[1:])
+    if argv and argv[0] == "telemetry":
+        from mac_audit_agent.telemetry.cli import main as telemetry_main
+
+        return telemetry_main(argv[1:])
+    if argv and argv[0] in {"definitions", "threat-definitions"}:
+        from mac_audit_agent.threat_definitions.cli import main as definitions_main
+
+        return definitions_main(argv[1:])
+    if argv and argv[0] == "rce-monitor":
+        from mac_audit_agent.rce_monitor.cli import main as rce_monitor_main
+
+        return rce_monitor_main(argv[1:])
+    if argv and argv[0] == "process-injection":
+        from mac_audit_agent.rce_monitor.process_injection_cli import main as process_injection_main
+
+        return process_injection_main(argv[1:])
+    try:
+        cleaned_argv, force_mode = parse_force_argument(
+            argv,
+            command="macos-security-audit-agent",
+            supported_scopes={"rescan", "refresh", "diagnostics"},
+            default_scope="rescan" if any(item in argv for item in ["--safe-scan", "--aggressive-scan"]) else "diagnostics",
+            require_command=False,
+        )
+    except ForceArgumentError as exc:
+        print(str(exc), file=sys.stderr)
+        log_force_action("macos-security-audit-agent", ForceMode(enabled=False, scope="unsupported"), result="rejected", error=str(exc))
+        return 2
+    if force_mode.enabled and not cleaned_argv:
+        message = "Specify what to force. Examples: scan --force, refresh --force, repair-notifier --force."
+        log_force_action("force", force_mode, result="rejected", error=message)
+        print(message, file=sys.stderr)
+        return 2
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(cleaned_argv)
+    if getattr(args, "force", False):
+        force_mode.enabled = True
+    if force_mode.enabled:
+        log_force_action("macos-security-audit-agent", force_mode, action_taken="force_cli_operation", result="started")
+        print("Force enabled: cached data will be bypassed and the operation will run fresh.", file=sys.stderr)
     action_requested = any([args.safe_scan, args.aggressive_scan, args.report, args.json_report, args.system_health, args.release_readiness, args.release_readiness_expensive, args.verify_event_flow, args.verify_visible_alert, args.verify_clean_install])
     if not action_requested:
         if args.no_gui:
             parser.print_help()
             return 0
+        from mac_audit_agent.app import main as gui_main
+
         return gui_main()
 
     db = AuditDatabase(args.db, _logs_dir_for_db(args.db))
     scan_result: ScanResult | None = None
     exit_code = 0
     if args.safe_scan or args.aggressive_scan:
-        summary, scan_result = _run_scan(db, aggressive=bool(args.aggressive_scan))
+        summary, scan_result = _run_scan(db, aggressive=bool(args.aggressive_scan), force_mode=force_mode)
         print(
             json.dumps(
                 {

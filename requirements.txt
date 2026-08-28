@@ -1,23 +1,6 @@
-# UI
-PySide6>=6.6
-openpyxl>=3.1
-python-docx>=1.1
+# Recommended end-user installation: desktop UI plus all graceful-enhancement
+# features.  Platform/Python markers in pyproject.toml automatically skip
+# components that cannot run on the selected interpreter.
+-e .[compat,desktop,crypto,exports,network]
 
-# Networking / discovery
-psutil>=5.9
-netifaces>=0.11
-
-# Packet capture (optional / dev mode only)
-scapy>=2.5
-
-# Data handling
-pydantic>=2.0
-
-# Logging / utilities
-rich>=13.0
-
-# Testing
-pytest>=7.4
-
-# Packaging
-pyinstaller>=6.0
+# For a minimal CLI/doctor-only host, use requirements-core.txt instead.

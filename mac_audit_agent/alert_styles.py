@@ -143,6 +143,32 @@ def get_alert_style(severity: str | None) -> AlertSeverityStyle:
     return ALERT_SEVERITY_STYLES[canonical_alert_severity(severity)]
 
 
+def cvss_alert_severity(score: Any) -> str:
+    """Map CVSS v3.x/v4.0 base-score bands to the alert palette."""
+    try:
+        numeric = float(score)
+    except (TypeError, ValueError):
+        return "info"
+    if not 0 <= numeric <= 10:
+        return "info"
+    if numeric == 0:
+        return "info"
+    if numeric <= 3.9:
+        return "low"
+    if numeric <= 6.9:
+        return "medium"
+    if numeric <= 8.9:
+        return "high"
+    return "critical"
+
+
+def resolve_alert_severity(severity: str | None, *, cvss_score: Any = None) -> str:
+    """Prefer an explicit CVSS score when alert evidence supplies one."""
+    if cvss_score not in {None, ""}:
+        return cvss_alert_severity(cvss_score)
+    return canonical_alert_severity(severity)
+
+
 def validate_alert_styles() -> list[str]:
     failures: list[str] = []
     required = {"critical", "high", "medium", "low", "info", "success"}

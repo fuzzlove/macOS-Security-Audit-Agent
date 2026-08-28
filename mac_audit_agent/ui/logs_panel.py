@@ -18,6 +18,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from mac_audit_agent.ui.button_factory import create_toolbar_button
+from mac_audit_agent.ui.responsive_actions import ResponsiveActionRow
+
 
 def _make_table(headers: list[str]) -> QTableWidget:
     table = QTableWidget(0, len(headers))
@@ -51,31 +54,28 @@ class LogsPanel(QFrame):
         layout.setSpacing(8)
 
         title = QLabel("Logs")
-        title.setStyleSheet("font-size: 18px; font-weight: 700; color: #F0F6FC;")
+        title.setProperty("textRole", "cardTitle")
         subtitle = QLabel("Local event history, notification decisions, and scan output.")
         subtitle.setWordWrap(True)
-        subtitle.setStyleSheet("color: #9DB0C9;")
+        subtitle.setProperty("textRole", "muted")
         layout.addWidget(title)
         layout.addWidget(subtitle)
 
-        toolbar = QHBoxLayout()
+        toolbar = ResponsiveActionRow()
         self.category_combo = QComboBox()
         self.category_combo.addItem("All Log Categories", "all")
         self.category_combo.addItem("Monitor Events", "monitor_events")
         self.category_combo.addItem("Scan Command Logs", "scan_command_logs")
         self.category_combo.addItem("Remediation Actions", "remediation_actions")
         self.category_combo.addItem("Application File Logs", "app_file_logs")
-        self.refresh_button = QPushButton("Refresh")
-        self.clear_category_button = QPushButton("Clear Category")
-        self.open_reports_button = QPushButton("Open Reports Folder")
+        self.refresh_button = create_toolbar_button("Refresh")
+        self.clear_category_button = create_toolbar_button("Clear Category")
+        self.open_reports_button = create_toolbar_button("Open Reports Folder")
         self.category_combo.setToolTip("Choose which local log category to show and clear.")
-        toolbar.addWidget(self.category_combo)
+        toolbar.add_button(self.category_combo)
         for button in [self.refresh_button, self.clear_category_button, self.open_reports_button]:
-            button.setMinimumHeight(36)
-            button.setToolTip(button.text())
-            button.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
-            toolbar.addWidget(button)
-        layout.addLayout(toolbar)
+            toolbar.add_button(button)
+        layout.addWidget(toolbar)
 
         self.summary_label = QLabel("No logs loaded yet.")
         self.summary_label.setWordWrap(True)

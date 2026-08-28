@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from mac_audit_agent.apple_exposure_priority import apple_exposure_priority
 from mac_audit_agent.frameworks import framework_summary_for_findings
 from mac_audit_agent.frameworks.cmmc import build_cmmc_readiness
 from mac_audit_agent.frameworks.poam import poam_from_cmmc_readiness
@@ -54,6 +55,8 @@ class SecurityAssessment:
     data_freshness: dict[str, Any] = field(default_factory=dict)
     limitations: list[str] = field(default_factory=list)
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    assessment_profile: str = "General Security Assessment"
+    assessment_depth: str = "Standard"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -116,6 +119,25 @@ def _persistence_finding_dicts(payload: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
     return findings
+
+
+def _profile_scoped_findings(findings: list[dict[str, Any]], profile: str) -> list[dict[str, Any]]:
+    normalized = str(profile or "General Security Assessment").casefold()
+    if normalized in {"general security assessment", "apple security assessment", "cis profile"}:
+        return findings
+    terms_by_profile = {
+        "zero trust assessment": ("identity", "account", "admin", "authentication", "encryption", "filevault", "signature", "software", "persistence", "network", "firewall", "sensor", "patch", "update"),
+        "network assessment": ("network", "dns", "firewall", "connection", "listener", "remote", "vpn", "proxy", "port", "gateway"),
+        "developer security assessment": ("code", "script", "dependency", "package", "supply chain", "secret", "credential", "permission", "signature", "developer", "temporary file"),
+        "incident readiness assessment": ("monitor", "sensor", "alert", "evidence", "logging", "recovery", "backup", "timeline", "containment", "integrity", "retention"),
+    }
+    terms = terms_by_profile.get(normalized)
+    if not terms:
+        return findings
+    return [
+        finding for finding in findings
+        if any(term in " ".join(str(finding.get(key, "")) for key in ("category", "title", "description", "event_type", "source")).casefold() for term in terms)
+    ]
 
 
 def _category_for_event(event_type: str) -> str:
@@ -209,8 +231,24 @@ def _severity_groups(risks: list[dict[str, Any]]) -> dict[str, list[dict[str, An
     return groups
 
 
-def _actions_from_risks(risks: list[dict[str, Any]], limitations: list[str]) -> list[dict[str, Any]]:
+def _actions_from_risks(
+    risks: list[dict[str, Any]],
+    limitations: list[str],
+    apple: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     actions: list[dict[str, Any]] = []
+    apple_priority = apple_exposure_priority(apple)
+    if apple_priority["takes_priority"]:
+        actions.append(
+            {
+                "priority": "Immediate" if apple_priority["level"] in {"critical", "urgent"} else "Priority",
+                "title": "Apple Exposure Assessment",
+                "action": apple_priority["recommended_action"],
+                "source_id": "apple-exposure",
+                "primary": True,
+                "reason": apple_priority["reason"],
+            }
+        )
     for item in risks[:10]:
         severity = str(item.get("severity", "info")).lower()
         priority = "Immediate" if severity in {"critical", "high"} else ("Short-term" if severity == "medium" else "Informational")
@@ -370,19 +408,22 @@ def build_security_assessment(
     physical_devices: dict[str, Any] | None = None,
     persistence_intelligence: dict[str, Any] | None = None,
     assessment_id: str | None = None,
+    assessment_profile: str = "General Security Assessment",
+    assessment_depth: str = "Standard",
 ) -> SecurityAssessment:
     now = datetime.now(timezone.utc)
     created_at = utc_now_iso()
     findings = _finding_dicts(scan_result)
     all_event_items = [_event_dict(event) for event in (events or [])]
-    event_risks = [
-        item
-        for item in all_event_items
-        if SEVERITY_ORDER.get(str(item.get("severity", "info")).lower(), 0) >= SEVERITY_ORDER["medium"]
+    depth = str(assessment_depth or "Standard").casefold()
+    event_threshold = SEVERITY_ORDER["info"] if depth == "deep" else SEVERITY_ORDER["medium"]
+    event_risks = [] if depth == "quick" else [
+        item for item in all_event_items
+        if SEVERITY_ORDER.get(str(item.get("severity", "info")).lower(), 0) >= event_threshold
     ]
     persistence_payload = dict(persistence_intelligence or {})
-    persistence_findings = _persistence_finding_dicts(persistence_payload)
-    risks = [*findings, *event_risks, *persistence_findings]
+    persistence_findings = [] if depth == "quick" else _persistence_finding_dicts(persistence_payload)
+    risks = _profile_scoped_findings([*findings, *event_risks, *persistence_findings], assessment_profile)
     risks.sort(key=lambda item: SEVERITY_ORDER.get(str(item.get("severity", "info")).lower(), 0), reverse=True)
     groups = _severity_groups(risks)
     monitor = _to_dict(monitor_state)
@@ -423,7 +464,7 @@ def build_security_assessment(
     score = None if scan_result is None and not risks else _score(risks, monitor, apple, baseline)
     severities = [str(item.get("severity", "info")).lower() for item in risks]
     risk_level = _risk_level(score, severities)
-    framework_summary = framework_summary_for_findings([*findings, *persistence_findings]) if [*findings, *persistence_findings] else {}
+    framework_summary = framework_summary_for_findings(risks) if risks else {}
     completed_checks: set[str] = set()
     if apple:
         completed_checks.add("scan.apple_exposure")
@@ -460,7 +501,7 @@ def build_security_assessment(
         high_findings=groups["high"],
         medium_findings=groups["medium"],
         info_findings=groups["info"],
-        recommended_actions=_actions_from_risks(risks, limitations),
+        recommended_actions=_actions_from_risks(risks, limitations, apple),
         framework_summary=framework_summary,
         mitre_summary={
             "mapped_to": framework_summary.get("mitre_attack_macos", {}),
@@ -486,7 +527,12 @@ def build_security_assessment(
             "missing_subsystems": list(limitations),
             "settings_loaded": bool(settings is not None),
             "persistence_intelligence_loaded": bool(persistence_payload),
+            "profile_scope": assessment_profile,
+            "assessment_depth": assessment_depth,
+            "qualification": "Control and framework mappings support defensive review; they do not constitute certification.",
         },
+        assessment_profile=assessment_profile,
+        assessment_depth=assessment_depth,
     )
     return assessment
 
@@ -628,7 +674,7 @@ def export_security_assessment_html(assessment: SecurityAssessment, output_path:
     )
     html_text = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>MSAA Security Assessment</title>
-<style>body{{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;margin:32px;line-height:1.45}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:8px;text-align:left}}.risk{{font-size:22px;font-weight:700}}</style></head>
+<style>body{{font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:32px;line-height:1.45}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:8px;text-align:left}}.risk{{font-size:22px;font-weight:700}}</style></head>
 <body>
 <h1>MSAA Security Assessment</h1>
 <p>Created: {html.escape(assessment.created_at)}<br>Host: {html.escape(assessment.hostname)}<br>Status: {html.escape(assessment.assessment_status)}</p>

@@ -351,6 +351,27 @@ def open_lockdown_settings_fallback(runner: Callable[..., Any] | None = None) ->
     return final
 
 
+def open_lockdown_mode_switch(runner: Callable[..., Any] | None = None) -> dict[str, Any]:
+    """Open Apple's Lockdown Mode control without claiming to change its state.
+
+    Apple does not expose a supported public API for silently enabling Lockdown
+    Mode.  This shortcut opens the most specific System Settings deep link and
+    falls back to Privacy & Security when macOS does not accept that link.
+    """
+
+    result = open_lockdown_settings_fallback(runner)
+    result.update(
+        {
+            "operation": "open_lockdown_mode_switch",
+            "automatic_activation_attempted": False,
+            "user_action_required": True,
+            "requires_restart": True,
+            "instruction": 'Flip the Lockdown Mode switch, then confirm "Turn On & Restart" in System Settings.',
+        }
+    )
+    return result
+
+
 def _failure_reason(code: str, detail: str = "") -> str:
     return f"{code}: {detail}" if detail else code
 

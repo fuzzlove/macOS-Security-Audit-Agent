@@ -7,6 +7,7 @@ from typing import Any
 from mac_audit_agent.assessment import SecurityAssessment
 from mac_audit_agent.exporters.export_models import ExportAssessmentData, ExportOptions, build_export_assessment_data
 from mac_audit_agent.ui.severity_styles import display_severity_label, get_severity_style
+from mac_audit_agent.runtime.optional_dependencies import OptionalDependencyError, missing_office_dependency
 
 
 DISCLAIMER = (
@@ -21,7 +22,7 @@ def _require_docx():
         from docx.enum.text import WD_ALIGN_PARAGRAPH
         from docx.shared import Pt, RGBColor
     except ImportError as exc:
-        raise RuntimeError("Word export requires python-docx. Install project dependencies including python-docx to create .docx reports.") from exc
+        raise missing_office_dependency("docx") from exc
     return Document, WD_ALIGN_PARAGRAPH, Pt, RGBColor
 
 
@@ -94,8 +95,15 @@ def _add_detailed_findings(doc, findings: list[dict[str, Any]]) -> None:
         ("Evidence", "evidence_summary"),
         ("Impact", "impact"),
         ("Suggested Fix", "suggested_fix"),
+        ("Immediate Action", "immediate_action"),
+        ("Recommended Fix Detail", "recommended_fix_detail"),
+        ("Examine Further", "examine_further"),
+        ("Evidence To Collect", "evidence_to_collect"),
+        ("False Positive Review", "false_positive_review"),
         ("Validation Steps", "validation_step"),
         ("False Positive Notes", "false_positive_notes"),
+        ("Standards / Source Mappings", "source_mappings_text"),
+        ("Apple Evidence Checklist", "apple_evidence_checklist"),
         ("NIST CSF", "nist_csf"),
         ("NIST 800-53", "nist_800_53"),
         ("MITRE ATT&CK", "mitre_attack"),
@@ -337,7 +345,10 @@ def export_assessment_word(assessment: SecurityAssessment, output_path: Path | N
     else:
         path = output_path
     path.parent.mkdir(parents=True, exist_ok=True)
-    doc = _build_document(data)
+    try:
+        doc = _build_document(data)
+    except OptionalDependencyError:
+        return _export_dependency_free_word(data, path)
     with NamedTemporaryFile(prefix=path.stem, suffix=".tmp.docx", dir=path.parent, delete=False) as handle:
         temp_path = Path(handle.name)
     try:
@@ -347,3 +358,36 @@ def export_assessment_word(assessment: SecurityAssessment, output_path: Path | N
         temp_path.unlink(missing_ok=True)
         raise
     return path
+
+
+def _export_dependency_free_word(data: ExportAssessmentData, path: Path) -> Path:
+    """Keep Word export available when a native python-docx dependency is unusable."""
+
+    from mac_audit_agent.professional_report import ReportSection, ReportTable, write_professional_report
+
+    def table(title: str, rows: list[dict[str, Any]]) -> ReportTable:
+        headers = tuple(dict.fromkeys(str(key) for row in rows for key in row)) or ("Status",)
+        values = tuple(tuple(row.get(header, "") for header in headers) for row in rows)
+        return ReportTable(title, headers, values)
+
+    summary_rows = tuple((str(key).replace("_", " ").title(), value) for key, value in data.summary.items())
+    metadata_rows = tuple((str(key).replace("_", " ").title(), value) for key, value in data.metadata.items())
+    tables = [
+        ReportTable("Assessment Metadata", ("Field", "Value"), metadata_rows),
+        ReportTable("Executive Summary", ("Field", "Value"), summary_rows),
+        table("Detailed Findings", data.findings),
+        table("Remediation Plan", data.remediation_items),
+        table("Apple Exposure", data.apple_exposure),
+        ReportTable("CMMC / NIST Readiness", ("Field", "Value"), tuple((str(key).replace("_", " ").title(), value) for key, value in data.cmmc_summary.items())),
+        table("Evidence Matrix", data.cmmc_evidence_matrix),
+        table("POA&M", data.cmmc_poam),
+        table("Framework Mappings", data.framework_mappings),
+        table("Application Integrity", data.application_integrity),
+    ]
+    return write_professional_report(
+        path,
+        title="MSAA Security Assessment",
+        sections=(ReportSection("Limitations", tuple(data.limitations or ["No additional limitations recorded."])),),
+        tables=tables,
+        qualification=DISCLAIMER + " This fallback is a static macro-free Open XML document.",
+    )

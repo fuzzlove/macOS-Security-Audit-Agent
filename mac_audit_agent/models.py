@@ -17,10 +17,23 @@ InvestigationNoteStatus = Literal["open", "reviewed", "follow_up", "resolved"]
 InvestigationPriority = Literal["low", "medium", "high"]
 ReviewState = Literal["not reviewed", "reviewed", "needs follow-up", "false positive", "confirmed concern"]
 MonitorEventType = Literal[
+    "zero_trust_evidence_collected",
+    "zero_trust_rapid_evidence_collection",
+    "consultant_timesheet_started",
+    "consultant_timesheet_stopped",
+    "consultant_timesheet_notes_saved",
+    "consultant_timesheet_exported",
+    "dns_evidence_collected",
+    "dns_client_validation_changed",
+    "dns_configuration_red_flag",
     "camera_activity_suspected",
     "camera_activity_confirmed",
     "camera_activity_stopped",
     "microphone_activity_suspected",
+    "microphone_activity_confirmed",
+    "microphone_activity_stopped",
+    "capture_device_connected",
+    "capture_device_disconnected",
     "capture_capable_process_observed",
     "capture_capable_process_closed",
     "capture_process_observed",
@@ -108,6 +121,8 @@ MonitorEventType = Literal[
     "execution_evidence_detected",
     "mitre_persistence_method_detected",
     "possible_shellcode_memory_detected",
+    "possible_keylogger_detected",
+    "dylib_hijack_detected",
     "unsigned_process_from_temp",
     "temp_process_with_network_connection",
     "browser_spawned_shell",
@@ -630,6 +645,7 @@ class LaunchItemSnapshot:
     keep_alive: bool = False
     suspicious: bool = False
     reasons: list[str] = field(default_factory=list)
+    content_sha256: str = ""
 
     def key(self) -> str:
         return self.path
@@ -929,14 +945,22 @@ class EventAlertTrace:
         payload.setdefault("suppression_reason", self.alert_suppression_reason)
         payload["rate_limiter_result"] = self.rate_limiter_result or self.cooldown_result
         payload["overlay_render_attempted"] = self.overlay_render_attempted or self.overlay_dispatch_attempted
-        payload["overlay_render_success"] = self.overlay_render_success or self.overlay_dispatch_result in {"shown", "verified"}
+        dispatch_result = str(payload.get("overlay_dispatch_result", ""))
+        verification_status = str(payload.get("render_verification_status", ""))
+        visible_alert_id = str(payload.get("visible_alert_id", "")).strip()
+        verified_statuses = {"verified", "verified_visible", "verified_by_notifier_window_state"}
+        payload["overlay_render_success"] = (
+            self.overlay_render_success
+            or self.overlay_dispatch_result in {"shown", "verified"}
+            or verification_status in verified_statuses
+            or (dispatch_result.upper() == "SUCCESS" and bool(visible_alert_id or payload.get("displayed_at")))
+        )
         payload["render_error"] = self.render_error or self.overlay_error
         payload["trace_consistency_status"] = self.trace_consistency_status or _alert_trace_consistency(payload)
         if not payload["render_verification_status"]:
-            dispatch_result = str(payload.get("overlay_dispatch_result", ""))
             suppression_reason = str(payload.get("alert_suppression_reason", "") or payload.get("suppression_reason", ""))
             if payload["overlay_render_success"] or (dispatch_result.upper() == "SUCCESS" and payload.get("displayed_at")):
-                payload["render_verification_status"] = "verified"
+                payload["render_verification_status"] = "verified_by_notifier_window_state"
             elif payload.get("alert_suppressed") and suppression_reason == "within_cooldown":
                 payload["render_verification_status"] = "skipped_within_cooldown"
             elif payload.get("alert_suppressed") and suppression_reason == "grouped_within_cooldown":

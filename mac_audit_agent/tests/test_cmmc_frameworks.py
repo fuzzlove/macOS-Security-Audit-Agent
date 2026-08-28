@@ -20,7 +20,16 @@ def test_cmmc_and_nist_source_registry_uses_official_sources() -> None:
     for source in sources:
         assert source.version
         assert source.retrieved_at
-        assert source.source_type in {"government_standard", "government_guidance", "industry_standard", "public_reference"}
+        assert source.source_type in {
+            "government_standard",
+            "government_guidance",
+            "government_reference",
+            "industry_standard",
+            "vendor_support_reference",
+            "vendor_security_reporting_reference",
+            "public_reference",
+            "internal_msaa_rule",
+        }
         assert source.source_url.startswith("https://")
         assert any(domain in source.source_url for domain in OFFICIAL_SOURCE_DOMAINS)
 
@@ -75,7 +84,21 @@ def test_cmmc_pre_uat_checks_pass(tmp_path) -> None:
         "frameworks.cmmc_reports",
         "frameworks.no_false_claims",
         "frameworks.cmmc_manual_evidence",
+        "standards.contractual_profile_separated",
+        "standards.catalog_complete_level2",
+        "scoring.level2_methodology_valid",
+        "scope.cui_boundary_complete",
+        "assessment.objective_determinations_consistent",
+        "reports.level2_conformant",
+        "incident.no_automatic_submission",
+        "roadmap.product_feature_gaps_complete",
         "acknowledgements.nsa_separate_from_author",
         "support_author.final_tab",
     }
-    assert all(check.status == "PASS" for check in checks)
+    by_id = {check.check_id: check for check in checks}
+    assert by_id["standards.catalog_complete_level2"].status == "BLOCKER"
+    assert by_id["standards.contractual_profile_separated"].status == "PASS"
+    assert by_id["scoring.level2_methodology_valid"].status == "PASS"
+    expected_blockers = {"standards.catalog_complete_level2", "scope.cui_boundary_complete", "assessment.objective_determinations_consistent", "reports.level2_conformant"}
+    assert {check.check_id for check in checks if check.status == "BLOCKER"} == expected_blockers
+    assert all(check.status == "PASS" for check in checks if check.check_id not in expected_blockers)

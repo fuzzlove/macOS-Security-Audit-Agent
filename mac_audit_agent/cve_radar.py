@@ -14,6 +14,9 @@ from typing import Any
 
 from mac_audit_agent.config import AuditConfig
 from mac_audit_agent.models import ScanResult, utc_now_iso
+from mac_audit_agent.performance.memory import cap_text_output
+from mac_audit_agent.performance.resource_budget import load_resource_budget
+from mac_audit_agent.performance.subprocess_runner import run_bounded_command
 from mac_audit_agent.storage import AuditDatabase, json_safe
 from mac_audit_agent.vulnerability_review import (
     APPLE_SECURITY_RELEASES_URL,
@@ -49,23 +52,21 @@ def _run_command(command: list[str], timeout: int = 5) -> str:
     executable = command[0] if Path(command[0]).exists() else shutil.which(command[0])
     if not executable:
         return ""
-    try:
-        completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
-    except (OSError, subprocess.TimeoutExpired):
+    result = run_bounded_command(command, timeout_seconds=timeout, max_output_bytes=200_000, priority="background_normal")
+    if result.timed_out or result.error:
         return ""
-    return (completed.stdout or completed.stderr or "").strip()
+    return cap_text_output(result.stdout or result.stderr, 200_000).strip()
 
 
 def _run_command_result(command: list[str], timeout: int = 5) -> tuple[str, bool]:
     executable = command[0] if Path(command[0]).exists() else shutil.which(command[0])
     if not executable:
         return "", False
-    try:
-        completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
-    except (OSError, subprocess.TimeoutExpired):
+    result = run_bounded_command(command, timeout_seconds=timeout, max_output_bytes=200_000, priority="background_normal")
+    if result.timed_out or result.error:
         return "", False
-    output = (completed.stdout or completed.stderr or "").strip()
-    return output, completed.returncode == 0
+    output = cap_text_output(result.stdout or result.stderr, 200_000).strip()
+    return output, result.returncode == 0
 
 
 def _parse_version(text: str) -> str:

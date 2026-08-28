@@ -1,0 +1,3 @@
+MSAA blocked a suspicious command before execution.
+
+The command attempted to download or decode content directly into an interpreter. Commands copied from websites should not be executed without independent verification.

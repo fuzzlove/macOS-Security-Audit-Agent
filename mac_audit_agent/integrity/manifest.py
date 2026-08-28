@@ -13,12 +13,15 @@ import subprocess
 import sys
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from mac_audit_agent.compat.datetime_compat import utc_now
 from mac_audit_agent.build_identity import detect_build_identity
+from mac_audit_agent.integrity.baseline_modes import baseline_mode_for_source_type
+from mac_audit_agent.integrity.exclusions import classify_path_category
 from mac_audit_agent.integrity.hasher import DEFAULT_EXCLUDED_PATTERNS, calculate_sha256, collect_integrity_files
+from mac_audit_agent.integrity.trust_states import IntegrityTrustState
 from mac_audit_agent.version import APP_VERSION
 
 
@@ -32,7 +35,7 @@ SourceType = Literal[
     "system_runtime",
     "user_runtime",
 ]
-TrustState = Literal["draft", "trusted", "expired", "revoked", "unknown"]
+TrustState = str
 
 SOURCE_TYPE_ALIASES = {
     "system_runtime": "system_daemon_runtime",
@@ -89,10 +92,18 @@ class IntegrityManifest:
     platform: str
     file_entries: list[IntegrityFileEntry] = field(default_factory=list)
     excluded_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDED_PATTERNS))
+    exclusions: list[str] = field(default_factory=list)
+    baseline_mode: str = "source_development"
+    source_root: str = ""
+    approved_change_id: str | None = None
+    generated_by: str = ""
+    verification_commands: list[str] = field(default_factory=list)
+    verification_results: list[dict[str, Any]] = field(default_factory=list)
     manifest_hash: str = ""
     signature_status: str = "unsigned"
     signature_algorithm: str = ""
     signature_key_id: str = ""
+    signature_path: str | None = None
     trust_state: TrustState = "trusted"
     notes: str = ""
     root_path: str = ""
@@ -103,14 +114,20 @@ class IntegrityManifest:
         return self.trust_state
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["files"] = payload["file_entries"]
+        return payload
+
+    @property
+    def files(self) -> list[IntegrityFileEntry]:
+        return self.file_entries
 
 
 TrustedManifest = IntegrityManifest
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return utc_now().isoformat()
 
 
 def _git(args: list[str], root: Path) -> str:
@@ -195,6 +212,7 @@ def _entry_for_path(path: Path, root: Path, source_category: str) -> IntegrityFi
 def _manifest_hash(manifest: IntegrityManifest) -> str:
     payload = manifest.to_dict()
     payload["manifest_hash"] = ""
+    payload.pop("files", None)
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     import hashlib
 
@@ -210,11 +228,25 @@ def create_integrity_manifest(
     build_id: str | None = None,
     notes: str = "",
     trust_state: TrustState = "trusted",
+    baseline_mode: str | None = None,
+    approved_change_id: str | None = None,
+    verification_commands: list[str] | None = None,
+    verification_results: list[dict[str, Any]] | None = None,
+    signature_status: str | None = None,
+    signature_path: str | None = None,
 ) -> IntegrityManifest:
     base = Path(root).resolve(strict=False)
     canonical_type = canonical_source_type(source_type)
     identity = detect_build_identity(base, install_mode=canonical_type if canonical_type in {"source_tree", "pip_package", "pyinstaller_app", "system_daemon_runtime", "user_notifier_runtime"} else None)  # type: ignore[arg-type]
     patterns = list(excluded_patterns or DEFAULT_EXCLUDED_PATTERNS)
+    mode = baseline_mode or baseline_mode_for_source_type(canonical_type)
+    effective_trust = trust_state
+    if trust_state == "trusted" and canonical_type == "source_tree":
+        effective_trust = (
+            IntegrityTrustState.TRUSTED_CODEX_APPROVED_CHANGE.value
+            if approved_change_id
+            else IntegrityTrustState.TRUSTED_DEVELOPMENT_BASELINE.value
+        )
     discovered = _git_tracked_files(base) if canonical_type == "source_tree" else []
     if not discovered:
         discovered = collect_integrity_files(base, canonical_type, patterns)
@@ -236,26 +268,29 @@ def create_integrity_manifest(
         platform=platform.platform(),
         file_entries=entries,
         excluded_patterns=patterns,
+        exclusions=patterns,
+        baseline_mode=mode,
+        source_root=str(base),
+        approved_change_id=approved_change_id,
+        generated_by=getpass.getuser(),
+        verification_commands=list(verification_commands or []),
+        verification_results=list(verification_results or []),
         signature_status="unsigned",
-        trust_state=trust_state,
+        signature_path=signature_path,
+        trust_state=effective_trust,
         notes=notes,
         root_path=str(base),
         dirty_source=_git_dirty(base) if canonical_type == "source_tree" else False,
     )
     manifest.manifest_hash = _manifest_hash(manifest)
+    if signature_status:
+        manifest.signature_status = signature_status
+        manifest.manifest_hash = _manifest_hash(manifest)
     return manifest
 
 
 def _source_category(path: Path) -> str:
-    suffix = path.suffix.lower()
-    parts = set(path.parts)
-    if suffix in {".png", ".jpg", ".jpeg", ".icns", ".ico", ".qss", ".css"} or "assets" in parts:
-        return "asset"
-    if suffix in {".plist", ".json", ".toml", ".yaml", ".yml", ".txt", ".md"}:
-        return "config_template"
-    if path.name in {"monitor.py", "user_notifier.py"}:
-        return "runtime"
-    return "source"
+    return classify_path_category(path.as_posix())
 
 
 def load_integrity_manifest(path: Path) -> IntegrityManifest:
@@ -264,14 +299,41 @@ def load_integrity_manifest(path: Path) -> IntegrityManifest:
     original_source_type = raw.get("source_type", "source_tree")
     raw.setdefault("trust_state", "trusted")
     raw["source_type"] = canonical_source_type(raw.get("source_type", "source_tree"))
-    entries = [IntegrityFileEntry(**item) for item in raw.get("file_entries", []) if isinstance(item, dict)]
+    raw_entries = raw.get("file_entries", raw.get("files", []))
+    for item in raw_entries:
+        if isinstance(item, dict) and "category" in item and "source_category" not in item:
+            item["source_category"] = item.pop("category")
+    entries = [IntegrityFileEntry(**{k: v for k, v in item.items() if k in IntegrityFileEntry.__dataclass_fields__}) for item in raw_entries if isinstance(item, dict)]
     raw["file_entries"] = entries
+    raw.pop("files", None)
+    raw.setdefault("excluded_patterns", raw.get("exclusions", list(DEFAULT_EXCLUDED_PATTERNS)))
+    raw.setdefault("exclusions", list(raw.get("excluded_patterns", list(DEFAULT_EXCLUDED_PATTERNS))))
+    raw.setdefault("baseline_mode", baseline_mode_for_source_type(raw.get("source_type", "source_tree")))
+    raw.setdefault("source_root", raw.get("root_path", ""))
+    raw.setdefault("approved_change_id", None)
+    raw.setdefault("generated_by", raw.get("created_by", ""))
+    raw.setdefault("verification_commands", [])
+    raw.setdefault("verification_results", [])
+    raw.setdefault("signature_path", None)
+    raw = {k: v for k, v in raw.items() if k in IntegrityManifest.__dataclass_fields__}
     manifest = IntegrityManifest(**raw)
     expected = manifest.manifest_hash
     if expected and _manifest_hash(manifest) != expected:
         legacy_payload = manifest.to_dict()
         legacy_payload["manifest_hash"] = ""
+        legacy_payload.pop("files", None)
         legacy_payload.pop("trust_state", None)
+        for new_key in [
+            "exclusions",
+            "baseline_mode",
+            "source_root",
+            "approved_change_id",
+            "generated_by",
+            "verification_commands",
+            "verification_results",
+            "signature_path",
+        ]:
+            legacy_payload.pop(new_key, None)
         legacy_payload["source_type"] = original_source_type
         legacy_hash = hashlib.sha256(
             json.dumps(legacy_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -279,6 +341,16 @@ def load_integrity_manifest(path: Path) -> IntegrityManifest:
         if has_trust_state or legacy_hash != expected:
             raise ValueError("integrity manifest hash mismatch")
     return manifest
+
+
+def select_manifest_path_for_root(root: Path, source_type: str = "source_tree") -> Path:
+    canonical = canonical_source_type(source_type)
+    base = Path(root)
+    if canonical == "source_tree":
+        return base / "msaa_integrity_manifest.json"
+    if canonical == "pip_package":
+        return base / "package_integrity_manifest.json"
+    return base / "integrity_manifest.json"
 
 
 def write_integrity_manifest(manifest: IntegrityManifest, path: Path) -> Path:

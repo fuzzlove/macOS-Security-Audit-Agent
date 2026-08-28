@@ -1,0 +1,5 @@
+# Anti-Ransomware Protocol 1.0
+
+Canonical schema: `schemas/anti_ransomware_protocol.json`. Maximum envelope size is 65,536 bytes. Envelopes bind message/correlation/incident/event identifiers, sender role/build, boot session, creation/expiration, connection-scoped one-time nonce, and deterministic payload length. Unknown fields, invalid UTF-8, non-finite numbers, downgrade, replay, wrong role/session, stale creation, excessive nesting/lists/strings, and path traversal are rejected with `AR014` or `AR024`. Pickle and arbitrary object deserialization are prohibited.
+
+`ACTION_REQUEST` is separately authorized after parsing. Allowed payload fields are `action`, `process_identity`, `idempotency_key`, and `rationale`. Identity-bound actions require exactly `pid`, `pid_version`, `boot_session_id`, `executable_sha256`, and `effective_uid`; the boot session must match the authenticated envelope. User-notifier actions are restricted to acknowledgement, allow-once, keep-paused, and administrator-review requests. Permanent trust, termination, block, resume, pause, rollback, and expiry are restricted to their administrative or system-engine roles.

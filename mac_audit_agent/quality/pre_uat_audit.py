@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from mac_audit_agent.models import utc_now_iso
 from mac_audit_agent.quality.alert_auditor import run_alert_audit
-from mac_audit_agent.quality.audit_models import AuditContext, AuditReport
+from mac_audit_agent.quality.audit_models import AuditContext, AuditReport, FunctionalCheck
 from mac_audit_agent.quality.audit_reporter import default_output_dir, write_reports
 from mac_audit_agent.quality.daemon_auditor import run_daemon_audit
 from mac_audit_agent.quality.export_auditor import run_export_audit
@@ -18,14 +18,25 @@ from mac_audit_agent.quality.scan_auditor import run_scan_audit
 from mac_audit_agent.quality.settings_auditor import run_settings_audit
 from mac_audit_agent.quality.ui_header_auditor import run_ui_header_audit
 from mac_audit_agent.quality.ui_control_auditor import run_ui_control_audit
+from mac_audit_agent.quality.button_functionality_auditor import run_button_functionality_audit
+from mac_audit_agent.quality.protection_auditor import run_protection_audit
+from mac_audit_agent.quality.runtime_compatibility_auditor import run_runtime_compatibility_audit
+from mac_audit_agent.quality.python_compat_auditor import run_python_compat_audit
+from mac_audit_agent.quality.button_layout_auditor import run_button_layout_audit
 from mac_audit_agent.quality.notifier_auditor import run_notifier_audit
 from mac_audit_agent.quality.network_intelligence_auditor import run_network_intelligence_audit
 from mac_audit_agent.quality.persistence_auditor import run_persistence_audit
 from mac_audit_agent.quality.report_auditor import run_report_audit
+from mac_audit_agent.quality.rootkit_auditor import run_rootkit_audit
 from mac_audit_agent.quality.data_freshness_auditor import run_freshness_audit
 from mac_audit_agent.quality.release_readiness import run_release_audit
+from mac_audit_agent.quality.release_integrity_auditor import run_release_integrity_audit
 from mac_audit_agent.quality.check_models import PreUATAuditResult
 from mac_audit_agent.quality.cmmc_auditor import run_cmmc_audit
+from mac_audit_agent.quality.force_auditor import run_force_audit
+from mac_audit_agent.quality.performance_auditor import run_performance_audit
+from mac_audit_agent.quality.runtime_auditor import run_runtime_headless_audit
+from mac_audit_agent.runtime.force_mode import ForceArgumentError, ForceMode, log_force_action, parse_force_argument
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -49,12 +60,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", type=Path, default=Path.home() / ".mac_audit_agent.sqlite3", help="Audit database path.")
     parser.add_argument("--output-dir", type=Path, default=None, help="Report output directory.")
     parser.add_argument("--run-safe-scan", action="store_true", help="Allow a safe non-destructive scan if no latest scan is available.")
+    parser.add_argument("--force", "-f", action="store_true", help="Rerun selected pre-UAT checks from fresh local diagnostics. Does not bypass blockers.")
     parser.add_argument("--allow-alert-render", action="store_true", help="Attempt real visible alert render. Use only in logged-in GUI session.")
     parser.add_argument("--interactive", action="store_true", help="Alias for --allow-alert-render when running alert verification from a logged-in GUI session.")
+    parser.add_argument("--ui-interactive", action="store_true", help="Allow explicit GUI-backed UI audits. Default full Pre-UAT remains headless/static.")
     return parser
 
 
 def run_pre_uat_audit(context: AuditContext) -> AuditReport:
+    from mac_audit_agent.quality.anti_ransomware_auditor import run_anti_ransomware_audit
     report = AuditReport(run_id=f"pre-uat-{uuid4().hex[:12]}", hostname=socket.gethostname(), started_at=utc_now_iso(), mode=context.mode)
     try:
         selected = _selected_modes(context.mode)
@@ -62,43 +76,68 @@ def run_pre_uat_audit(context: AuditContext) -> AuditReport:
             for check in build_registry():
                 _add_unique_check(report, check.skipped("Registry entry declared; covered by specialized auditor or pending deeper automation.", "Implement a concrete behavior probe if this remains skipped."))
         if "settings" in selected:
-            for check in run_settings_audit(context):
+            for check in _safe_checks(report, "run_python_compat_audit", run_python_compat_audit, context):
+                _add_unique_check(report, check)
+            for check in _safe_checks(report, "run_runtime_compatibility_audit", run_runtime_compatibility_audit, context):
+                _add_unique_check(report, check)
+            for check in _safe_checks(report, "run_runtime_headless_audit", run_runtime_headless_audit, context):
+                _add_unique_check(report, check)
+            for check in _safe_checks(report, "run_settings_audit", run_settings_audit, context):
+                _add_unique_check(report, check)
+            for check in _safe_checks(report, "run_force_audit", run_force_audit, context):
+                _add_unique_check(report, check)
+            for check in _safe_checks(report, "run_performance_audit", run_performance_audit, context):
                 _add_unique_check(report, check)
         if "daemon" in selected:
-            for check in run_daemon_audit(context):
+            for check in _safe_checks(report, "run_daemon_audit", run_daemon_audit, context):
                 _add_unique_check(report, check)
-        if "notifier" in selected:
-            for check in run_notifier_audit(context):
+            for check in _safe_checks(report, "run_protection_audit", run_protection_audit, context):
+                _add_unique_check(report, check)
+        if "notifier" in selected and "daemon" not in selected:
+            for check in _safe_checks(report, "run_notifier_audit", run_notifier_audit, context):
                 _add_unique_check(report, check)
         if "alerts" in selected:
-            for check in run_alert_audit(context):
+            for check in _safe_checks(report, "run_alert_audit", run_alert_audit, context):
                 _add_unique_check(report, check)
         if "exports" in selected:
-            for check in run_export_audit(context):
+            for check in _safe_checks(report, "run_export_audit", run_export_audit, context):
                 _add_unique_check(report, check)
-        if "reports" in selected:
-            for check in run_report_audit(context):
+        if "reports" in selected and "exports" not in selected:
+            for check in _safe_checks(report, "run_report_audit", run_report_audit, context):
                 _add_unique_check(report, check)
         if "scans" in selected:
-            for check in run_scan_audit(context):
+            for check in _safe_checks(report, "run_anti_ransomware_audit", run_anti_ransomware_audit, context):
                 _add_unique_check(report, check)
-            for check in run_network_intelligence_audit(context):
+            for check in _safe_checks(report, "run_scan_audit", run_scan_audit, context):
                 _add_unique_check(report, check)
-            for check in run_persistence_audit(context):
+            if "settings" not in selected:
+                for check in _safe_checks(report, "run_performance_audit", run_performance_audit, context):
+                    _add_unique_check(report, check)
+            for check in _safe_checks(report, "run_network_intelligence_audit", run_network_intelligence_audit, context):
+                _add_unique_check(report, check)
+            for check in _safe_checks(report, "run_persistence_audit", run_persistence_audit, context):
+                _add_unique_check(report, check)
+            for check in _safe_checks(report, "run_rootkit_audit", run_rootkit_audit, context):
                 _add_unique_check(report, check)
         if "ui" in selected:
-            for check in run_ui_header_audit(context):
+            for check in _safe_checks(report, "run_ui_header_audit", run_ui_header_audit, context):
                 _add_unique_check(report, check)
-            for check in run_ui_control_audit(context):
+            for check in _safe_checks(report, "run_ui_control_audit", run_ui_control_audit, context):
                 _add_unique_check(report, check)
-        if "freshness" in selected:
-            for check in run_freshness_audit(context):
+            for check in _safe_checks(report, "run_button_functionality_audit", run_button_functionality_audit, context):
+                _add_unique_check(report, check)
+            for check in _safe_checks(report, "run_button_layout_audit", run_button_layout_audit, context):
+                _add_unique_check(report, check)
+        if "freshness" in selected and "scans" not in selected:
+            for check in _safe_checks(report, "run_freshness_audit", run_freshness_audit, context):
                 _add_unique_check(report, check)
         if "frameworks" in selected:
-            for check in run_cmmc_audit(context):
+            for check in _safe_checks(report, "run_cmmc_audit", run_cmmc_audit, context):
                 _add_unique_check(report, check)
         if "release" in selected:
-            for check in run_release_audit(context):
+            for check in _safe_checks(report, "run_release_audit", run_release_audit, context):
+                _add_unique_check(report, check)
+            for check in _safe_checks(report, "run_release_integrity_audit", run_release_integrity_audit, context):
                 _add_unique_check(report, check)
     except Exception as exc:
         report.crashed = True
@@ -110,19 +149,34 @@ def run_pre_uat_audit(context: AuditContext) -> AuditReport:
 
 
 def _add_unique_check(report: AuditReport, check) -> None:
-    existing_by_id = {item.check_id: index for index, item in enumerate(report.checks)}
-    if check.check_id not in existing_by_id:
-        report.add(check)
-        return
-    existing = report.checks[existing_by_id[check.check_id]]
-    rank = {"PASS": 0, "SKIPPED": 1, "WARN": 2, "FAIL": 3, "BLOCKER": 4}
-    if rank.get(check.status, 0) > rank.get(existing.status, 0):
-        existing.status = check.status
-        existing.actual_result = check.actual_result
-        existing.recommended_fix = check.recommended_fix
-        existing.failure_stage = check.failure_stage
-    existing.evidence.update({f"duplicate_{len(existing.evidence)}": check.evidence} if check.evidence and check.evidence != existing.evidence else {})
-    existing.evidence["duplicate_merged"] = True
+    from mac_audit_agent.quality.check_consistency import normalize_check_status
+
+    check = normalize_check_status(check)
+    report.add(check)
+
+
+def _safe_checks(report: AuditReport, name: str, auditor, context: AuditContext) -> list[FunctionalCheck]:
+    try:
+        return list(auditor(context))
+    except Exception as exc:
+        return [
+            FunctionalCheck(
+                check_id=f"harness.{name}",
+                feature_area="Pre-UAT harness",
+                name=f"{name} completion",
+                description="The auditor completes without an uncaught exception.",
+                severity_if_failed="blocker",
+                test_type="harness",
+                command_or_callable=name,
+                expected_result="Auditor returns evidence and remaining audit groups continue.",
+                failure_stage="release_blocked",
+                root_cause_hint=type(exc).__name__,
+            ).harness_error(
+                f"{name} raised {type(exc).__name__}: {exc}",
+                "Fix the auditor failure and rerun Pre-UAT; other groups were allowed to continue.",
+                {"exception_type": type(exc).__name__},
+            )
+        ]
 
 
 def _selected_modes(mode: str) -> set[str]:
@@ -135,19 +189,33 @@ def exit_code_for(report: AuditReport, *, fail_on_blocker: bool = False) -> int:
     if report.crashed:
         return 4
     counts = report.counts
+    if counts["HARNESS_ERROR"]:
+        return 3
     if counts["BLOCKER"] and fail_on_blocker:
         return 3
     if counts["BLOCKER"]:
         return 3
-    if counts["FAIL"]:
+    if counts["FAIL"] or counts["NOT_VERIFIED"]:
         return 2
-    if counts["WARN"] or counts["SKIPPED"]:
+    if counts["WARN"] or counts["SKIPPED"] or counts["DEGRADED"]:
         return 1
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    try:
+        cleaned_argv, force_mode = parse_force_argument(raw_argv, command="pre_uat", supported_scopes={"diagnostics"}, default_scope="diagnostics", require_command=False)
+    except ForceArgumentError as exc:
+        print(str(exc), file=sys.stderr)
+        log_force_action("pre_uat", ForceMode(enabled=False, scope="unsupported"), result="rejected", error=str(exc))
+        return 2
+    args = build_parser().parse_args(cleaned_argv)
+    if args.force:
+        force_mode.enabled = True
+    if force_mode.enabled:
+        log_force_action("pre_uat", force_mode, action_taken="rerun_pre_uat_diagnostics", result="started")
+        print("Force enabled: cached data will be bypassed and the operation will run fresh.", file=sys.stderr)
     mode = "full"
     for candidate in ["settings", "alerts", "daemon", "notifier", "exports", "reports", "ui", "scans", "freshness", "frameworks", "release"]:
         if getattr(args, candidate):
@@ -162,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
         allow_alert_render=bool(args.allow_alert_render or args.interactive),
         allow_safe_scan=bool(args.run_safe_scan),
         fail_on_blocker=bool(args.fail_on_blocker),
+        ui_interactive=bool(args.ui_interactive),
     )
     report = run_pre_uat_audit(context)
     if args.json:

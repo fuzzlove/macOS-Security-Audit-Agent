@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import plistlib
 import re
 import stat
@@ -616,6 +617,7 @@ def parse_launchd_plist(plist_bytes: bytes, path: str) -> LaunchItemSnapshot:
         keep_alive=keep_alive,
         suspicious=suspicious,
         reasons=reasons,
+        content_sha256=hashlib.sha256(plist_bytes).hexdigest(),
     )
 
 

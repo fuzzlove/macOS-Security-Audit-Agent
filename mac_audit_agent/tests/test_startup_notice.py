@@ -17,6 +17,16 @@ from mac_audit_agent.ui.startup_notice import (
 )
 
 
+class _TestSingleInstance:
+    def acquire(self): return True
+    def consume_activation_request(self): return False
+    def release(self): return None
+
+
+def _disable_real_single_instance(monkeypatch) -> None:
+    monkeypatch.setattr(app_module.SingleInstanceLock, "for_app", lambda: _TestSingleInstance())
+
+
 def test_notice_text_is_explicitly_non_binding_and_explains_operational_limits() -> None:
     assert "not a contract" in STARTUP_NOTICE_TEXT
     assert "not acceptance of a binding agreement" in STARTUP_NOTICE_TEXT
@@ -24,6 +34,17 @@ def test_notice_text_is_explicitly_non_binding_and_explains_operational_limits()
     assert "Background monitoring is optional" in STARTUP_NOTICE_TEXT
     assert "separately confirmed" in STARTUP_NOTICE_TEXT
     assert "explicitly authorized" in STARTUP_NOTICE_TEXT
+
+
+def test_frozen_gui_remains_unprivileged_unless_policy_explicitly_requires_admin(monkeypatch) -> None:
+    monkeypatch.setattr(app_module.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(app_module.sys, "argv", ["Mac Audit Agent"])
+    monkeypatch.delenv("MSAA_REQUIRE_ADMIN_GUI", raising=False)
+
+    assert app_module._admin_required_for_launch() is False
+
+    monkeypatch.setenv("MSAA_REQUIRE_ADMIN_GUI", "true")
+    assert app_module._admin_required_for_launch() is True
 
 
 def test_recorded_notice_preview_is_recognized(tmp_path: Path) -> None:
@@ -85,15 +106,20 @@ def test_accepting_notice_still_continues_when_preview_cannot_be_recorded(tmp_pa
 
 
 def test_app_exit_before_main_window_when_notice_is_declined(monkeypatch) -> None:
+    _disable_real_single_instance(monkeypatch)
     windows = []
     monkeypatch.setattr(app_module, "QApplication", lambda argv: object())
+    monkeypatch.setattr(app_module, "assert_qapplication_allowed", lambda _context=None: object())
     monkeypatch.setattr(app_module, "preview_startup_notice", lambda: False)
+    monkeypatch.setattr(app_module, "require_ethics_completion", lambda: True)
+    monkeypatch.setattr(app_module, "require_current_eula_acceptance", lambda: True)
     monkeypatch.setattr(app_module, "MainWindow", lambda db_path: windows.append(db_path))
     assert app_module.main() == 0
     assert windows == []
 
 
 def test_app_opens_main_window_after_notice_is_previewed(monkeypatch) -> None:
+    _disable_real_single_instance(monkeypatch)
     calls = []
 
     class FakeApplication:
@@ -112,13 +138,19 @@ def test_app_opens_main_window_after_notice_is_previewed(monkeypatch) -> None:
             calls.append("show")
 
     monkeypatch.setattr(app_module, "QApplication", FakeApplication)
+    monkeypatch.setattr(app_module, "assert_qapplication_allowed", lambda _context=None: object())
     monkeypatch.setattr(app_module, "preview_startup_notice", lambda: calls.append("notice") or True)
+    monkeypatch.setattr(app_module, "require_ethics_completion", lambda: calls.append("ethics") or True)
+    monkeypatch.setattr(app_module, "require_current_eula_acceptance", lambda: calls.append("eula") or True)
+    monkeypatch.setattr(app_module, "_record_eula_monitor_event", lambda _window: calls.append("eula-event"))
+    monkeypatch.setattr(app_module, "_record_pending_ethics_monitor_event", lambda _window: calls.append("ethics-event"))
     monkeypatch.setattr(app_module, "MainWindow", FakeWindow)
     assert app_module.main() == 17
-    assert calls == ["application", "notice", "window", "show", "event-loop"]
+    assert calls == ["application", "notice", "ethics", "eula", "window", "ethics-event", "eula-event", "show", "event-loop"]
 
 
 def test_app_falls_back_when_default_database_is_readonly(tmp_path: Path, monkeypatch) -> None:
+    _disable_real_single_instance(monkeypatch)
     calls = []
     default_db = tmp_path / "readonly.sqlite"
     fallback_db = tmp_path / "state" / "audit.sqlite"
@@ -143,7 +175,12 @@ def test_app_falls_back_when_default_database_is_readonly(tmp_path: Path, monkey
 
     warnings = []
     monkeypatch.setattr(app_module, "QApplication", FakeApplication)
+    monkeypatch.setattr(app_module, "assert_qapplication_allowed", lambda _context=None: object())
     monkeypatch.setattr(app_module, "preview_startup_notice", lambda: True)
+    monkeypatch.setattr(app_module, "require_ethics_completion", lambda: True)
+    monkeypatch.setattr(app_module, "require_current_eula_acceptance", lambda: True)
+    monkeypatch.setattr(app_module, "_record_eula_monitor_event", lambda _window: None)
+    monkeypatch.setattr(app_module, "_record_pending_ethics_monitor_event", lambda _window: None)
     monkeypatch.setattr(app_module, "MainWindow", FakeWindow)
     monkeypatch.setattr(app_module, "default_gui_db_path", lambda: default_db)
     monkeypatch.setattr(app_module, "fallback_gui_db_path", lambda: fallback_db)
@@ -159,6 +196,7 @@ def test_app_falls_back_when_default_database_is_readonly(tmp_path: Path, monkey
 
 
 def test_app_uses_emergency_database_when_home_state_dir_is_not_writable(tmp_path: Path, monkeypatch) -> None:
+    _disable_real_single_instance(monkeypatch)
     calls = []
     default_db = tmp_path / "readonly.sqlite"
     fallback_db = tmp_path / "root-owned" / "audit.sqlite"
@@ -186,7 +224,12 @@ def test_app_uses_emergency_database_when_home_state_dir_is_not_writable(tmp_pat
 
     warnings = []
     monkeypatch.setattr(app_module, "QApplication", FakeApplication)
+    monkeypatch.setattr(app_module, "assert_qapplication_allowed", lambda _context=None: object())
     monkeypatch.setattr(app_module, "preview_startup_notice", lambda: True)
+    monkeypatch.setattr(app_module, "require_ethics_completion", lambda: True)
+    monkeypatch.setattr(app_module, "require_current_eula_acceptance", lambda: True)
+    monkeypatch.setattr(app_module, "_record_eula_monitor_event", lambda _window: None)
+    monkeypatch.setattr(app_module, "_record_pending_ethics_monitor_event", lambda _window: None)
     monkeypatch.setattr(app_module, "MainWindow", FakeWindow)
     monkeypatch.setattr(app_module, "default_gui_db_path", lambda: default_db)
     monkeypatch.setattr(app_module, "fallback_gui_db_path", lambda: fallback_db)

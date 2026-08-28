@@ -43,7 +43,7 @@ class HelpRenderer:
         <html>
         <head>
         <style>
-            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.48; color: #172033; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; line-height: 1.48; color: #172033; }}
             h1 {{ font-size: 26px; margin-bottom: 4px; }}
             h2 {{ font-size: 18px; margin-top: 22px; }}
             section.action {{ border-left: 4px solid #2563EB; background: #EFF6FF; padding: 10px 14px; margin: 16px 0; }}
@@ -64,7 +64,7 @@ class HelpRenderer:
         {onboarding}
         <section><h2>What Is This?</h2>{_paragraph(topic.user_friendly_explanation)}</section>
         <section><h2>Why It Matters</h2><ul>{_items(topic.when_this_matters)}</ul></section>
-        <section class="action"><h2>What Should I Do?</h2><ul>{_items(topic.what_you_should_do)}</ul></section>
+        <section class="action"><h2>How To — New to This?</h2><p>Start with these steps. You do not need prior MSAA experience.</p><ol>{_items(topic.what_you_should_do)}</ol></section>
         {advanced_section}
         {safety}
         {troubleshooting}

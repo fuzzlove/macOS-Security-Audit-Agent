@@ -1,0 +1,15 @@
+{
+  "schema_version":"1.0","gap":"AR-GAP-003","commit":"ffe40a5c73f86e909335b0483e3d5db6105ff069",
+  "states":["DESIGNED","IMPLEMENTED","NATIVE_BUILT","UNIT_TESTED","MOCK_INTEGRATION_TESTED","BLOCKED_CREDENTIALS","BLOCKED_HARDWARE","NOT_VERIFIED"],
+  "active_containment_ready":false,
+  "requirements":[
+    {"id":1,"name":"Developer-ID-signed native helper","state":"NATIVE_BUILT/BLOCKED_CREDENTIALS","evidence":"arm64 Mach-O SHA-256 7e8f11eb...; ad-hoc linker signature only; zero Developer ID identities"},
+    {"id":2,"name":"live authenticated XPC from signed engine","state":"NOT_VERIFIED","evidence":"source protocol/authentication tests only"},
+    {"id":3,"name":"native target identity revalidation","state":"IMPLEMENTED","evidence":"PID-version input plus UID/start/path/device/inode/SHA-256; live audit-token/CDHash signing comparison pending"},
+    {"id":4,"name":"crash-safe helper-owned watchdog","state":"IMPLEMENTED","evidence":"bounded native core and durable journal; separate guardian/helper-SIGKILL test pending"},
+    {"id":5,"name":"helper and engine crash/restart","state":"NOT_VERIFIED","evidence":"not installed"},
+    {"id":6,"name":"reboot reconciliation","state":"BLOCKED_HARDWARE","evidence":"no authorized disposable reboot host"},
+    {"id":7,"name":"Developer-ID fixture identity matrix","state":"BLOCKED_CREDENTIALS","evidence":"no Developer ID or second Team ID"},
+    {"id":8,"name":"no orphaned suspension","state":"UNIT_TESTED","evidence":"local fixture sweep zero; full fault matrix pending"}
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "developer_identities": [
+    {
+      "allowed_roles": [
+        "developer",
+        "release_manager",
+        "integrity_approver"
+      ],
+      "codex_account_reference": "",
+      "codex_identity_verification": "metadata_only",
+      "codex_operator_label": "",
+      "created_at": "2026-07-08T00:00:00Z",
+      "developer_id": "liquidsky",
+      "display_name": "Liquidsky Network Security",
+      "email": "",
+      "enrolled_yubikey_ids": [],
+      "git_signing_key_fingerprint": "",
+      "github_username": "",
+      "organization": "Liquidsky Network Security",
+      "status": "active"
+    }
+  ]
+}

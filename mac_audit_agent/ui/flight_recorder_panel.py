@@ -1,4 +1,3 @@
 from __future__ import annotations
 
 from mac_audit_agent.ui.intrusion_detection_panel import IntrusionDetectionPanel as FlightRecorderPanel
-

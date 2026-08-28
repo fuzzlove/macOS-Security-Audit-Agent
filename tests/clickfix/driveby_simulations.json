@@ -1,0 +1,267 @@
+[
+  {
+    "fixture_id": "CF-DRIVEBY-001",
+    "name": "Drive-by simulation 1",
+    "category": "driveby",
+    "description": "Drive-by simulation 1 supplied only as inert scanner data.",
+    "command_text": "<SIMULATED_DRIVEBY_1>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "browser_to_terminal_transition",
+      "clipboard_to_terminal",
+      "network_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "Fake browser verification",
+      "Malvertising redirect"
+    ],
+    "notes": "No fixture content may be executed.",
+    "simulation": true,
+    "simulated_decision": "block",
+    "simulated_rule_ids": [
+      "browser_to_terminal_transition",
+      "clipboard_to_terminal",
+      "network_to_interpreter"
+    ]
+  },
+  {
+    "fixture_id": "CF-DRIVEBY-002",
+    "name": "Drive-by simulation 2",
+    "category": "driveby",
+    "description": "Drive-by simulation 2 supplied only as inert scanner data.",
+    "command_text": "<SIMULATED_DRIVEBY_2>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "clickfix_social_engineering_context",
+      "trailing_newline"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "Fake browser verification",
+      "Malvertising redirect"
+    ],
+    "notes": "No fixture content may be executed.",
+    "simulation": true,
+    "simulated_decision": "block",
+    "simulated_rule_ids": [
+      "clickfix_social_engineering_context",
+      "trailing_newline"
+    ]
+  },
+  {
+    "fixture_id": "CF-DRIVEBY-003",
+    "name": "Drive-by simulation 3",
+    "category": "driveby",
+    "description": "Drive-by simulation 3 supplied only as inert scanner data.",
+    "command_text": "<SIMULATED_DRIVEBY_3>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "malvertising_context",
+      "network_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "Fake browser verification",
+      "Malvertising redirect"
+    ],
+    "notes": "No fixture content may be executed.",
+    "simulation": true,
+    "simulated_decision": "block",
+    "simulated_rule_ids": [
+      "malvertising_context",
+      "network_to_interpreter"
+    ]
+  },
+  {
+    "fixture_id": "CF-DRIVEBY-004",
+    "name": "Drive-by simulation 4",
+    "category": "driveby",
+    "description": "Drive-by simulation 4 supplied only as inert scanner data.",
+    "command_text": "<SIMULATED_DRIVEBY_4>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "crashfix_context",
+      "browser_to_terminal_transition"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "Fake browser verification",
+      "Malvertising redirect"
+    ],
+    "notes": "No fixture content may be executed.",
+    "simulation": true,
+    "simulated_decision": "block",
+    "simulated_rule_ids": [
+      "crashfix_context",
+      "browser_to_terminal_transition"
+    ]
+  },
+  {
+    "fixture_id": "CF-DRIVEBY-005",
+    "name": "Drive-by simulation 5",
+    "category": "driveby",
+    "description": "Drive-by simulation 5 supplied only as inert scanner data.",
+    "command_text": "<SIMULATED_DRIVEBY_5>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "browser_to_script_editor",
+      "applescript_url_scheme",
+      "shell_execution"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "Fake browser verification",
+      "Malvertising redirect"
+    ],
+    "notes": "No fixture content may be executed.",
+    "simulation": true,
+    "simulated_decision": "block",
+    "simulated_rule_ids": [
+      "browser_to_script_editor",
+      "applescript_url_scheme",
+      "shell_execution"
+    ]
+  },
+  {
+    "fixture_id": "CF-DRIVEBY-006",
+    "name": "Drive-by simulation 6",
+    "category": "driveby",
+    "description": "Drive-by simulation 6 supplied only as inert scanner data.",
+    "command_text": "<SIMULATED_DRIVEBY_6>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "unsigned_app_to_shell",
+      "quarantined_application_execution",
+      "network_stage"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "Fake browser verification",
+      "Malvertising redirect"
+    ],
+    "notes": "No fixture content may be executed.",
+    "simulation": true,
+    "simulated_decision": "block",
+    "simulated_rule_ids": [
+      "unsigned_app_to_shell",
+      "quarantined_application_execution",
+      "network_stage"
+    ]
+  },
+  {
+    "fixture_id": "CF-DRIVEBY-007",
+    "name": "Drive-by simulation 7",
+    "category": "driveby",
+    "description": "Drive-by simulation 7 supplied only as inert scanner data.",
+    "command_text": "<SIMULATED_DRIVEBY_7>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "drag_to_terminal",
+      "downloaded_file_execution"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "Fake browser verification",
+      "Malvertising redirect"
+    ],
+    "notes": "No fixture content may be executed.",
+    "simulation": true,
+    "simulated_decision": "block",
+    "simulated_rule_ids": [
+      "drag_to_terminal",
+      "downloaded_file_execution"
+    ]
+  }
+]

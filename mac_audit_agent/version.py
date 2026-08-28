@@ -5,7 +5,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-APP_VERSION = "1.0b"
+# Keep the runtime, wheel metadata, release manifest, About dialog, and doctor
+# output on the same PEP 440 version.  pyproject.toml is the release authority;
+# this constant is the import-safe mirror used before package metadata exists.
+APP_VERSION = "1.0b0"
 RUNTIME_MANIFEST_SCHEMA_VERSION = 1
 DATABASE_SCHEMA_VERSION = 1
 

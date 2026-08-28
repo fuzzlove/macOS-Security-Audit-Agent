@@ -6,6 +6,7 @@ from mac_audit_agent.notification_manager import NotificationManager
 from mac_audit_agent.quality.audit_models import AuditContext, FunctionalCheck
 from mac_audit_agent.monitor_settings import installed_monitor_values, load_settings, save_settings, settings_diagnostics
 from mac_audit_agent.runtime.db_path_resolver import get_active_monitor_db_path
+from mac_audit_agent.settings.settings_sync import repair_settings_sync
 from mac_audit_agent.storage import AuditDatabase
 from mac_audit_agent.user_notifier_status import canonical_user_notifier_status, status_to_runtime_values
 
@@ -45,6 +46,7 @@ def run_settings_audit(context: AuditContext) -> list[FunctionalCheck]:
         saved = save_settings(db, settings)
         reloaded = load_settings(db)
         save_settings(db, original, bump_version=False)
+        sync_repair = repair_settings_sync(db)
         diagnostics = settings_diagnostics(db, load_settings(db), runtime_values=NotificationManager(db).settings())
         missing = [name for name, path in SETTING_PATHS.items() if not hasattr(getattr(reloaded, path[0]), path[1])]
         version_incremented = int(saved.settings_version or 0) == before_version + 1
@@ -53,6 +55,7 @@ def run_settings_audit(context: AuditContext) -> list[FunctionalCheck]:
             "checked_settings": sorted(SETTING_PATHS),
             "settings_version_before": before_version,
             "settings_version_after": saved.settings_version,
+            "settings_sync_repair": sync_repair.to_dict(),
             "diagnostics_keys": sorted(diagnostics.keys()),
         }
         if missing:
@@ -100,7 +103,11 @@ def _settings_reconciliation_checks(db: AuditDatabase) -> list[FunctionalCheck]:
     elif "installed_manifest" in stale:
         checks.append(version_check.warn("Installed manifest settings metadata is stale, but live runtime is current.", "Run Repair Background Monitor or Repair Settings Sync to rebuild installed manifest metadata.", diagnostics))
     else:
-        checks.append(version_check.passed("Settings versions are aligned.", diagnostics))
+        alert_agent = diagnostics.get("user_alert_agent", {})
+        if alert_agent.get("required") and not alert_agent.get("deliverable"):
+            checks.append(version_check.passed("Settings versions are aligned, but User Alert Agent is unavailable.", diagnostics | {"status": "settings_synced_but_notifier_unavailable"}))
+        else:
+            checks.append(version_check.passed("Settings versions are aligned.", diagnostics))
 
     notifier_check = FunctionalCheck(
         "settings.notifier_status_consistency",
@@ -117,6 +124,20 @@ def _settings_reconciliation_checks(db: AuditDatabase) -> list[FunctionalCheck]:
         checks.append(notifier_check.failed("Stale installed notifier state is being displayed as current truth.", "Use canonical live user notifier status in settings diagnostics.", diagnostics))
     else:
         checks.append(notifier_check.passed("User notifier current status is canonical or stale values are labeled historical.", {"user_alert_agent": alert_agent, "historical_installed_state": historical}))
+
+    deliverability = FunctionalCheck(
+        "settings.user_alert_agent_deliverability",
+        "Settings",
+        "user alert agent deliverability",
+        "Required bottom-right alert agent is loaded, running, aligned to the active DB, and fresh.",
+        "blocker",
+        "settings",
+    )
+    if alert_agent.get("required") and not alert_agent.get("deliverable"):
+        deliverability.failure_stage = "notifier_not_running"
+        checks.append(deliverability.failed("Settings are synced, but User Alert Agent is unavailable.", "Repair User Alert Agent, then rerun notifier and alert verification.", diagnostics))
+    else:
+        checks.append(deliverability.passed("User Alert Agent deliverability is compatible with current settings.", {"user_alert_agent": alert_agent}))
 
     manifest_check = FunctionalCheck(
         "settings.installed_manifest_freshness",

@@ -1,0 +1,83 @@
+{
+  "generated_at": "2026-08-25T06:51:08Z",
+  "limitations": [
+    "Developer-machine signing is local trust metadata, not proof of physical possession.",
+    "This model does not protect against a fully compromised enrolled developer machine.",
+    "This is readiness/evidence support and is not a claim of CISA, DoD, CMMC, or NIST certification."
+  ],
+  "registry_version": "1",
+  "trusted_machines": [
+    {
+      "architecture": "arm64",
+      "boot_volume_uuid_hash": "3e5834ed0c71cfad999b038a8e80c353848ed06d4d270a79574dc0cbe8ed6585",
+      "developer_machine_id": "60ecd7de56e83834f0305a53",
+      "developer_name": "Liquidsky Network Security",
+      "enrolled_at": "2026-07-09T15:56:31Z",
+      "enrolled_by": "Liquidsky Network Security",
+      "hardware_uuid_hash": "be61a25330ec96cd80dccb4cefd3ef4a35f1723633c79e785a00b6b45483f013",
+      "keychain_backed": false,
+      "limitations": [
+        "Machine fingerprint values are salted SHA-256 hashes; raw serial and UUID values are not stored.",
+        "Developer-machine signing cannot protect against a compromised enrolled developer machine."
+      ],
+      "machine_fingerprint": "60ecd7de56e83834f0305a533afaf5bc3e4607a50a06e7df47b4950eaa988e36",
+      "machine_label": "Liquidsky Current Dev Mac",
+      "macos_version_at_enrollment": "15.7.2",
+      "organization": "Liquidsky Network Security",
+      "platform_serial_hash": "80e9a7edf70a69290c053f62720e15b9ff7552804e49b05deda6a8c3cc19a46c",
+      "public_key_fingerprint_sha256": "f9b49f6dcd64d3bd9cbaeeb72bca933e1998596b2896ef47be15582cc155f625",
+      "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEVCWORg310khnQnLZeN7GldKt6wQ7\nBjmDdQr1JSjIxFkwS9NjKei8pdGQyVGLfiTQxR25lczIUdmrEPNSvsMzpQ==\n-----END PUBLIC KEY-----\n",
+      "secure_enclave_backed": false,
+      "signing_key_label": "MSAA Developer Machine Liquidsky Current Dev Mac",
+      "trust_status": "active"
+    },
+    {
+      "architecture": "arm64",
+      "boot_volume_uuid_hash": "3c38653dd6eb60a7d251eba85c98476617d705491229dbd948adb1113f1aa93e",
+      "developer_machine_id": "c01d7234bed26a65efb56d07",
+      "developer_name": "Codex",
+      "enrolled_at": "2026-07-17T17:51:44Z",
+      "enrolled_by": "Codex",
+      "hardware_uuid_hash": "be61a25330ec96cd80dccb4cefd3ef4a35f1723633c79e785a00b6b45483f013",
+      "keychain_backed": false,
+      "limitations": [
+        "Machine fingerprint values are salted SHA-256 hashes; raw serial and UUID values are not stored.",
+        "Developer-machine signing cannot protect against a compromised enrolled developer machine."
+      ],
+      "machine_fingerprint": "c01d7234bed26a65efb56d077c929437e87788ac8fce48310ecb9bbc08634ece",
+      "machine_label": "MSAA Development Mac",
+      "macos_version_at_enrollment": "15.7.7",
+      "organization": "Liquidsky Network Security",
+      "platform_serial_hash": "80e9a7edf70a69290c053f62720e15b9ff7552804e49b05deda6a8c3cc19a46c",
+      "public_key_fingerprint_sha256": "9aac4b0346df922e6e7256988634e5ff171b440a97e4b27e7982426ecaceab71",
+      "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEEkIVe1/I1tjVfZKJw8YlbkQ9YwCb\nALWTEgX6+0sGU5VwUQdLiaSt3w5O7OSvjGtq7mIoTcMc//2r4/ReHfabmg==\n-----END PUBLIC KEY-----\n",
+      "secure_enclave_backed": false,
+      "signing_key_label": "MSAA Developer Machine MSAA Development Mac",
+      "trust_status": "active"
+    },
+    {
+      "architecture": "arm64",
+      "boot_volume_uuid_hash": "f9f7724528347625c2970132b16cb491a500beeb8eafe56f18af9c9009f4e78a",
+      "developer_machine_id": "666c096f1ddf77f8d2830be6",
+      "developer_name": "Liquidsky Network Security",
+      "enrolled_at": "2026-08-25T06:51:08Z",
+      "enrolled_by": "Liquidsky Network Security",
+      "hardware_uuid_hash": "be61a25330ec96cd80dccb4cefd3ef4a35f1723633c79e785a00b6b45483f013",
+      "keychain_backed": false,
+      "limitations": [
+        "Machine fingerprint values are salted SHA-256 hashes; raw serial and UUID values are not stored.",
+        "Developer-machine signing cannot protect against a compromised enrolled developer machine."
+      ],
+      "machine_fingerprint": "666c096f1ddf77f8d2830be615ac171f608d94fb5621b4bf04c9999d8c6eceb2",
+      "machine_label": "Liquidsky Endpoint Security Dev Mac",
+      "macos_version_at_enrollment": "15.7.7",
+      "organization": "Liquidsky Network Security",
+      "platform_serial_hash": "80e9a7edf70a69290c053f62720e15b9ff7552804e49b05deda6a8c3cc19a46c",
+      "public_key_fingerprint_sha256": "d58f1cabfe2780b8aee5ed866f26d5459cdaaa3052cf968a19f6a6e426ae177b",
+      "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAElsy4MkSR2XkZmXTBklLDbuZMrDUS\nSLOM1RX9DuSUi1pR2HSeY/TN2vCLNnjlr49ee2dE3fGqACnamyAQpfw4SQ==\n-----END PUBLIC KEY-----\n",
+      "secure_enclave_backed": false,
+      "signing_key_label": "MSAA Developer Machine Liquidsky Endpoint Security Dev Mac",
+      "trust_status": "active"
+    }
+  ]
+}

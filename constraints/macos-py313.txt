@@ -1,0 +1,2 @@
+# Candidate packaging toolchain; requires complete matrix qualification.
+-r ../requirements-build.txt

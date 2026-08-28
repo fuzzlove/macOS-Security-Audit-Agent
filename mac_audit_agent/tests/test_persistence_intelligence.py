@@ -3,15 +3,21 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import zipfile
 from pathlib import Path
 
 from mac_audit_agent.assessment import build_security_assessment
 from mac_audit_agent.models import BackgroundMonitorStatus
-from mac_audit_agent.persistence_intelligence.baseline import PersistenceBaselineManager
+from mac_audit_agent.persistence_intelligence.baseline import PersistenceBaselineManager, insecure_baseline_reasons
 from mac_audit_agent.persistence_intelligence.chain_view import build_chain_view
+from mac_audit_agent.persistence_intelligence.diagnostics import build_diagnostics
 from mac_audit_agent.persistence_intelligence.report_adapter import (
+    export_persistence_report_excel,
+    export_persistence_report_csv,
     export_persistence_report_html,
     export_persistence_report_json,
+    export_persistence_report_pdf,
+    export_persistence_report_text,
     persistence_findings_as_msaa_findings,
     persistence_findings_as_sarif_inputs,
 )
@@ -80,6 +86,18 @@ def test_launchd_scanner_parses_launchdaemon_and_disabled_state(tmp_path: Path) 
     assert item.mechanism == "launch_daemon"
     assert item.program == str(target)
     assert item.disabled is True
+
+
+def test_malformed_non_system_plist_remains_visible_as_red_flag(tmp_path: Path) -> None:
+    launch_agents = tmp_path / "Library" / "LaunchAgents"
+    launch_agents.mkdir(parents=True)
+    plist_path = launch_agents / "com.example.resistant.plist"
+    plist_path.write_bytes(b"not a plist")
+    result = LaunchdScanner().scan(ScanContext(home=tmp_path, system_root=tmp_path))
+    item = next(item for item in result.items if item.plist_path == str(plist_path))
+    assert item.risk_level in {"MEDIUM", "HIGH", "CRITICAL"}
+    assert any("unreadable or malformed" in value for value in item.evidence)
+    assert result.errors
 
 
 def test_world_writable_plist_increases_risk(tmp_path: Path) -> None:
@@ -191,9 +209,33 @@ def test_watch_events_include_added_removed_modified_and_hash_changed(tmp_path: 
     assert "persistence_target_hash_changed" in event_types
 
 
+def test_insecure_trusted_baseline_requires_exact_recorded_acknowledgement(tmp_path: Path) -> None:
+    _write_launch_agent(tmp_path)
+    report = PersistenceIntelligenceEngine(ScanContext(home=tmp_path, system_root=tmp_path), scanners=[LaunchdScanner()]).scan()
+    reasons = insecure_baseline_reasons(report)
+    assert reasons
+    manager = PersistenceBaselineManager(tmp_path / "baselines")
+
+    import pytest
+    with pytest.raises(PermissionError, match="I AGREE"):
+        manager.create_baseline("unsafe", report.items, risk_reasons=reasons, acknowledgement="I agree")
+    assert not (tmp_path / "baselines/unsafe.json").exists()
+
+    path = manager.create_baseline(
+        "unsafe", report.items, risk_reasons=reasons,
+        acknowledgement="I AGREE", acknowledged_by="authorized-test-user",
+    )
+    acceptance = json.loads(path.read_text(encoding="utf-8"))["risk_acceptance"]
+    assert acceptance["accepted"] is True
+    assert acceptance["acknowledgement"] == "I AGREE"
+    assert acceptance["acknowledged_by"] == "authorized-test-user"
+    assert acceptance["reasons"] == reasons
+
+
 def test_timeline_chain_and_reports_export(tmp_path: Path) -> None:
     _write_launch_agent(tmp_path)
     report = PersistenceIntelligenceEngine(ScanContext(home=tmp_path), scanners=[LaunchdScanner()]).scan()
+    report.items[0].program_arguments.extend(["--token", "secret-value"])
     timeline = build_timeline(report.items)
     chains = build_chain_view(report.items, report.findings)
     assert timeline
@@ -201,18 +243,54 @@ def test_timeline_chain_and_reports_export(tmp_path: Path) -> None:
     assert export_timeline(timeline, tmp_path / "timeline.md", "md").exists()
     html_path = export_persistence_report_html(report, tmp_path / "report.html")
     json_path = export_persistence_report_json(report, tmp_path / "report.json")
+    text_path = export_persistence_report_text(report, tmp_path / "report.txt")
+    pdf_path = export_persistence_report_pdf(report, tmp_path / "report.pdf")
+    excel_path = export_persistence_report_excel(report, tmp_path / "report.xlsx")
+    csv_path = export_persistence_report_csv(report, tmp_path / "report.csv")
+    from mac_audit_agent.persistence_intelligence.report_adapter import export_persistence_report_docx
+    docx_path = export_persistence_report_docx(report, tmp_path / "report.docx")
     html = html_path.read_text(encoding="utf-8")
     payload = json.loads(json_path.read_text(encoding="utf-8"))
+    text_report = text_path.read_text(encoding="utf-8")
     assert "Persistence Intelligence Report" in html
+    assert "Liquidsky Network Security" in html
+    assert "Persistence Mechanism Breakdown" in html
+    assert "Complete Persistence Inventory" in html
+    assert "<script" not in html.lower()
     assert "risk-badge" in html
+    assert payload["report_metadata"]["organization"] == "Liquidsky Network Security"
+    payload_text = json.dumps(payload)
+    assert payload_text.find("secret-value") == -1
+    assert payload_text.find("<REDACTED>") >= 0
     assert payload["items"]
     assert payload["items"][0]["risk_color"]["background"].startswith("#")
+    assert "SCANNER COVERAGE" in text_report
+    assert "INCIDENT REPORTING / EVIDENCE HANDLING" in text_report
+    assert "LIQUIDSKY NETWORK SECURITY" in text_report
+    assert "PERSISTENCE INVENTORY" in text_report
+    assert "How to reach/retain pass" in text_report
+    assert pdf_path.read_bytes().startswith(b"%PDF-")
+    assert excel_path.exists()
+    csv_text = csv_path.read_text(encoding="utf-8")
+    assert "Liquidsky Network Security" in csv_text
+    assert "inventory" in csv_text
+    assert "finding" in csv_text
+    assert docx_path.exists()
+    with zipfile.ZipFile(docx_path) as archive:
+        document_xml = archive.read("word/document.xml").decode("utf-8")
+        assert "Liquidsky Network Security" in document_xml
+        assert "Complete Persistence Inventory" in document_xml
+        assert not any(name.lower().endswith(("vbaproject.bin", ".exe", ".js")) for name in archive.namelist())
     msaa_findings = persistence_findings_as_msaa_findings(report)
     sarif_inputs = persistence_findings_as_sarif_inputs(report)
     assert msaa_findings
     assert sarif_inputs
     assert msaa_findings[0]["category"] == "Admin & Persistence"
     assert sarif_inputs[0]["rule_id"].startswith("MSAA.Persistence.")
+    diagnostics = build_diagnostics(report)
+    assert diagnostics["scanner_diagnostics"]
+    assert diagnostics["scanner_diagnostics"][0]["cause"]
+    assert diagnostics["scanner_diagnostics"][0]["passing_criteria"]
 
 
 def test_persistence_intelligence_tables_style_risk_cells(tmp_path: Path) -> None:
@@ -242,7 +320,79 @@ def test_persistence_intelligence_tables_style_risk_cells(tmp_path: Path) -> Non
     assert finding_severity.toolTip()
     assert timeline_severity.toolTip()
     assert panel.chain_text.toPlainText()
+    assert "Risk score:" in panel.chain_text.toPlainText()
+    assert "Evidence confidence:" in panel.chain_text.toPlainText()
+    assert "Concern / quarantine guidance:" in panel.chain_text.toPlainText()
     assert any(label in panel.chain_text.toPlainText() for label in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "UNKNOWN", "TRUSTED", "SUSPICIOUS"])
+    panel.close()
+    app.processEvents()
+
+
+def test_rootkit_kext_and_plist_rows_expose_guarded_removal_actions() -> None:
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+    from mac_audit_agent.rootkit_detection.models import ExtensionInventoryItem, RootkitScanResult, RootkitSuspectFinding
+    from mac_audit_agent.ui.persistence_intelligence_panel import PersistenceIntelligencePanel
+
+    app = QApplication.instance() or QApplication([])
+    panel = PersistenceIntelligencePanel()
+    extension = ExtensionInventoryItem(
+        extension_id="ext-1", type="kernel_extension", bundle_id="com.example.suspect",
+        path="/Library/Extensions/Suspect.kext", signed_status="unsigned", risk_flags=["extension signature is unsigned"],
+    )
+    finding = RootkitSuspectFinding(
+        finding_id="rootkit-1", title="Suspicious kernel extension", severity="high", confidence="high",
+        category="kernel_extension", description="Unsigned third-party extension", evidence=["found on disk: /Library/Extensions/Suspect.kext"],
+    )
+    panel.rootkit_result = RootkitScanResult("scan-1", "start", "end", "quick", extensions=[extension], findings=[finding])
+    panel._render_rootkit_result()
+
+    assert panel.rootkit_extension_table.item(0, 7).text() == "Quarantine / Forced Unload…"
+    assert panel.rootkit_findings_table.item(0, 6).text() == "Quarantine / Forced Unload…"
+    assert panel.rootkit_extension_table.item(0, 0).data(Qt.UserRole + 2) is not None
+    assert panel.rootkit_findings_table.item(0, 0).data(Qt.UserRole + 2) is not None
+    assert "restricts even the root account" in panel.rootkit_posture_table.item(0, 1).text()
+    assert "Not passing evidence" in panel.rootkit_posture_table.item(0, 4).text()
+    assert "csrutil" in panel.rootkit_posture_table.item(0, 5).text()
+    panel.close()
+    app.processEvents()
+
+
+def test_run_persistence_scan_includes_rootkit_and_risky_extension_review(tmp_path: Path, monkeypatch) -> None:
+    from PySide6.QtWidgets import QApplication
+    from mac_audit_agent.rootkit_detection.models import ExtensionInventoryItem, RootkitScanResult, RootkitSuspectFinding
+    from mac_audit_agent.ui.persistence_intelligence_panel import PersistenceIntelligencePanel
+
+    _write_launch_agent(tmp_path)
+    report = PersistenceIntelligenceEngine(ScanContext(home=tmp_path), scanners=[LaunchdScanner()]).scan()
+    extension = ExtensionInventoryItem(
+        extension_id="ext-integrated", type="kernel_extension", bundle_id="com.example.suspect",
+        path="/Library/Extensions/Suspect.kext", loaded=True, signed_status="unsigned",
+        risk_flags=["extension signature is unsigned"],
+    )
+    finding = RootkitSuspectFinding(
+        finding_id="rootkit-integrated", title="Suspicious kernel extension", severity="critical", confidence="high",
+        category="kernel_extension", description="Unsigned loaded kernel extension requires review",
+        evidence=["found on disk: /Library/Extensions/Suspect.kext"],
+    )
+    rootkit_result = RootkitScanResult(
+        "rootkit-integrated-scan", "start", "end", "quick", extensions=[extension], findings=[finding],
+    )
+    monkeypatch.setattr("mac_audit_agent.ui.persistence_intelligence_panel.run_rootkit_review", lambda **_kwargs: rootkit_result)
+
+    app = QApplication.instance() or QApplication([])
+    panel = PersistenceIntelligencePanel()
+    panel.engine = type("Engine", (), {"scan": lambda self: report})()
+    panel.run_scan()
+
+    assert panel.rootkit_result is rootkit_result
+    assert panel.summary_cards["Rootkit Suspects"][0].text() == "1"
+    assert panel.summary_cards["Risky Extensions"][0].text() == "1"
+    assert "Rootkit suspects: 1" in panel.summary.text()
+    assert "not confirmed malware" in panel.dashboard_state_label.text()
+    assert panel.rootkit_extension_table.item(0, 1).text() == "com.example.suspect"
+    assert panel.tabs.tabText(7) == "Rootkits & Kernel Extensions"
+    assert '"status": "completed"' in panel.diagnostics_text.toPlainText()
     panel.close()
     app.processEvents()
 

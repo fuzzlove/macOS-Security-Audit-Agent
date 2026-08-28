@@ -1,0 +1,15 @@
+{
+  "schema_version": "1.0",
+  "required": [
+    {"sensor_id": "endpoint_security", "display_name": "Endpoint Security", "criticality": "CRITICAL", "singleton": true, "capabilities": ["process_execution", "file_modification", "ransomware_telemetry"], "dependencies": ["endpoint_security_client", "full_disk_access", "signed_sensor"], "failure_domain": "Endpoint Security"},
+    {"sensor_id": "ransomware_monitor", "display_name": "Ransomware Monitor", "criticality": "CRITICAL", "singleton": true, "capabilities": ["ransomware_detection", "ransomware_evidence"], "dependencies": ["endpoint_security", "evidence_database", "ruleset"], "failure_domain": "Endpoint Security"},
+    {"sensor_id": "system_monitor", "display_name": "System Monitor", "criticality": "HIGH", "singleton": true, "capabilities": ["system_activity", "event_correlation", "evidence_persistence"], "dependencies": ["sqlite"], "failure_domain": "Database"},
+    {"sensor_id": "behavioral_telemetry", "display_name": "Behavioral Telemetry", "criticality": "HIGH", "singleton": true, "capabilities": ["behavioral_aggregation", "behavioral_baseline", "anomaly_detection"], "dependencies": ["system_monitor", "sqlite"], "failure_domain": "Behavioral Analytics"},
+    {"sensor_id": "malware_definitions", "display_name": "Malware Definitions", "criticality": "HIGH", "singleton": true, "capabilities": ["malware_hash_matching", "malware_rule_matching", "definition_provenance"], "dependencies": ["definition_store", "ruleset"], "failure_domain": "Definition Management"},
+    {"sensor_id": "user_notifier", "display_name": "User Alert Agent", "criticality": "HIGH", "singleton": true, "capabilities": ["critical_alert_delivery"], "dependencies": ["user_session", "notification_permission", "sqlite"], "failure_domain": "User Interface"},
+    {"sensor_id": "sensor_health_manager", "display_name": "Sensor Health Manager", "criticality": "CRITICAL", "singleton": true, "capabilities": ["sensor_health_assurance"], "dependencies": ["sqlite"], "failure_domain": "Health Assurance"}
+  ],
+  "optional": [
+    {"sensor_id": "yara_engine", "display_name": "YARA Rule Engine", "criticality": "MEDIUM", "enabled": false, "singleton": true, "capabilities": ["malware_rule_matching"], "dependencies": ["ruleset"], "failure_domain": "Rule Engine"}
+  ]
+}

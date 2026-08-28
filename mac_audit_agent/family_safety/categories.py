@@ -335,7 +335,7 @@ def canonical_family_safety_categories() -> list[FamilySafetyCategory]:
             "lockdown_mode_plus",
             "Lockdown Mode Plus",
             "Reviews additional macOS hardening settings that may complement Apple Lockdown Mode.",
-            "Lockdown Mode Plus is not Apple Lockdown Mode, does not replace it, and does not guarantee protection. It provides additional local hardening checks and guidance.",
+            "Lockdown Mode Plus is not Apple Lockdown Mode and does not replace Apple Lockdown Mode or guarantee protection. It provides additional local hardening checks and guidance.",
             "High-risk users, journalists, activists, executives, caregivers for targeted users, and security administrators.",
             "Users who need stronger protection benefit from reducing remote access, sharing, unknown devices, unknown apps, and update delays.",
             ["Apple Lockdown Mode manual verification", "remote access", "AirDrop", "Bluetooth", "USB devices", "profiles", "VPN/proxy/DNS", "browser extensions", "unknown apps", "LaunchAgents/LaunchDaemons", "admin users", "FileVault", "firewall", "automatic updates", "evidence snapshots"],

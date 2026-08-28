@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from time import perf_counter_ns
 from typing import Any, Callable, Literal
 
 from mac_audit_agent.models import utc_now_iso
 
 
-CheckStatus = Literal["PASS", "WARN", "FAIL", "SKIPPED", "BLOCKER"]
+CheckStatus = Literal["PASS", "DEGRADED", "WARN", "SKIPPED", "NOT_VERIFIED", "FAIL", "BLOCKER", "HARNESS_ERROR"]
 ReadinessDecision = Literal["READY FOR USER TESTING", "READY WITH WARNINGS", "READY ONLY AFTER FIXES", "NOT READY FOR USER TESTING"]
 FAILURE_STAGES = {
     "ui_control_missing",
@@ -54,18 +55,24 @@ class FunctionalCheck:
     duration_ms: int = 0
     timestamp: str = field(default_factory=utc_now_iso)
     callable_ref: Callable[..., "FunctionalCheck"] | None = field(default=None, repr=False, compare=False)
+    _started_ns: int = field(default_factory=perf_counter_ns, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload.pop("callable_ref", None)
+        payload.pop("_started_ns", None)
         return payload
+
+    def _finish(self) -> None:
+        self.duration_ms = max(1, int((perf_counter_ns() - self._started_ns) / 1_000_000))
+        self.timestamp = utc_now_iso()
 
     def passed(self, actual: str = "", evidence: dict[str, Any] | None = None) -> "FunctionalCheck":
         self.status = "PASS"
         self.actual_result = actual or self.expected_result or "verified"
         if evidence:
             self.evidence.update(evidence)
-        self.timestamp = utc_now_iso()
+        self._finish()
         return self
 
     def warn(self, actual: str, recommended_fix: str, evidence: dict[str, Any] | None = None) -> "FunctionalCheck":
@@ -74,7 +81,16 @@ class FunctionalCheck:
         self.recommended_fix = recommended_fix
         if evidence:
             self.evidence.update(evidence)
-        self.timestamp = utc_now_iso()
+        self._finish()
+        return self
+
+    def degraded(self, actual: str, recommended_fix: str, evidence: dict[str, Any] | None = None) -> "FunctionalCheck":
+        self.status = "DEGRADED"
+        self.actual_result = actual
+        self.recommended_fix = recommended_fix
+        if evidence:
+            self.evidence.update(evidence)
+        self._finish()
         return self
 
     def failed(self, actual: str, recommended_fix: str, evidence: dict[str, Any] | None = None) -> "FunctionalCheck":
@@ -85,7 +101,7 @@ class FunctionalCheck:
             self.failure_stage = "unknown"
         if evidence:
             self.evidence.update(evidence)
-        self.timestamp = utc_now_iso()
+        self._finish()
         return self
 
     def skipped(self, actual: str, recommended_fix: str = "", evidence: dict[str, Any] | None = None) -> "FunctionalCheck":
@@ -94,7 +110,25 @@ class FunctionalCheck:
         self.recommended_fix = recommended_fix
         if evidence:
             self.evidence.update(evidence)
-        self.timestamp = utc_now_iso()
+        self._finish()
+        return self
+
+    def not_verified(self, actual: str, recommended_fix: str = "", evidence: dict[str, Any] | None = None) -> "FunctionalCheck":
+        self.status = "NOT_VERIFIED"
+        self.actual_result = actual
+        self.recommended_fix = recommended_fix
+        if evidence:
+            self.evidence.update(evidence)
+        self._finish()
+        return self
+
+    def harness_error(self, actual: str, recommended_fix: str, evidence: dict[str, Any] | None = None) -> "FunctionalCheck":
+        self.status = "HARNESS_ERROR"
+        self.actual_result = actual
+        self.recommended_fix = recommended_fix
+        if evidence:
+            self.evidence.update(evidence)
+        self._finish()
         return self
 
 
@@ -111,17 +145,23 @@ class AuditReport:
     crash_error: str = ""
 
     def add(self, check: FunctionalCheck) -> FunctionalCheck:
+        from mac_audit_agent.quality.check_consistency import normalize_check_status
+
+        check = normalize_check_status(check)
+        if any(existing.check_id == check.check_id for existing in self.checks):
+            raise ValueError(f"duplicate check ID rejected: {check.check_id}")
         self.checks.append(check)
         return check
 
     @property
     def counts(self) -> dict[str, int]:
-        return {status: sum(1 for check in self.checks if check.status == status) for status in ["PASS", "WARN", "FAIL", "SKIPPED", "BLOCKER"]}
+        statuses = ["PASS", "DEGRADED", "WARN", "SKIPPED", "NOT_VERIFIED", "FAIL", "BLOCKER", "HARNESS_ERROR"]
+        return {status: sum(1 for check in self.checks if check.status == status) for status in statuses}
 
     @property
     def readiness_decision(self) -> ReadinessDecision:
         counts = self.counts
-        if counts["BLOCKER"]:
+        if counts["BLOCKER"] or counts["HARNESS_ERROR"] or counts["NOT_VERIFIED"]:
             return "NOT READY FOR USER TESTING"
         if counts["FAIL"]:
             return "READY ONLY AFTER FIXES"
@@ -154,3 +194,4 @@ class AuditContext:
     allow_exports: bool = True
     allow_safe_scan: bool = False
     fail_on_blocker: bool = False
+    ui_interactive: bool = False

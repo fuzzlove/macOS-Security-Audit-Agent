@@ -9,6 +9,7 @@ from mac_audit_agent.exporters import export_assessment_excel, export_assessment
 from mac_audit_agent.models import Finding, ScanResult, utc_now_iso
 from mac_audit_agent.quality.audit_models import AuditContext, FunctionalCheck
 from mac_audit_agent.reporting import export_scan_result_html, export_scan_result_json
+from mac_audit_agent.runtime.optional_dependencies import OptionalDependencyError
 
 
 def run_export_audit(context: AuditContext) -> list[FunctionalCheck]:
@@ -111,6 +112,13 @@ def _zip_check(check_id: str, name: str, severity: str, writer, *, expected_memb
             check.failure_stage = "export_failed"
             return check.failed(f"Office export missing {expected_member}.", "Verify Office document generation includes expected workbook/document parts.", {"path": str(path)})
         return check.passed("Office export package verified.", {"path": str(path), "members": len(names)})
+    except OptionalDependencyError as exc:
+        check.failure_stage = "missing_dependency"
+        return check.degraded(
+            str(exc),
+            "Install the office extra in source mode, or reinstall a complete desktop bundle in frozen mode.",
+            {"exception": type(exc).__name__, "error_code": exc.error_code, "optional_feature": True},
+        )
     except Exception as exc:
         check.failure_stage = "missing_dependency" if "requires" in str(exc).lower() else "export_failed"
         return check.failed(str(exc), f"Verify {name} dependency and export implementation.", {"exception": type(exc).__name__})

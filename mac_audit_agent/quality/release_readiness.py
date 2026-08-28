@@ -6,7 +6,8 @@ from mac_audit_agent.storage import AuditDatabase
 
 
 def run_release_audit(context: AuditContext) -> list[FunctionalCheck]:
-    check = FunctionalCheck("release.readiness", "Release", "release readiness", "Release readiness dashboard builds.", "critical", "smoke")
+    generated = FunctionalCheck("release.readiness_report_generated", "Release", "release readiness report generated", "Release readiness dashboard builds.", "critical", "smoke")
+    public_gate = FunctionalCheck("release.public_distribution_gate", "Release", "public distribution gate", "All required public-distribution predicates pass with current evidence.", "blocker", "release_gate")
     try:
         report = ReleaseReadinessEngine(AuditDatabase(context.db_path)).build_report(run_expensive=False)
         payload = report.to_dict()
@@ -32,13 +33,16 @@ def run_release_audit(context: AuditContext) -> list[FunctionalCheck]:
         }
         failed = [item for item in payload.get("checks", []) if str(item.get("status", "")).lower() in {"fail", "broken"}]
         if failed or release_status == "blocked":
-            return [check.passed("Release readiness report generated successfully. Public release is blocked; manual testing is not blocked.", evidence | {"failed": failed[:10]})]
+            return [
+                generated.passed("Release readiness report generated successfully.", evidence | {"failed": failed[:10]}),
+                public_gate.failed("Public distribution is blocked by current release evidence.", "Resolve the listed release checks and rerun the gate against the current tree and artifacts.", evidence),
+            ]
         if release_status and release_status != "ready":
-            return [check.passed("Release readiness report generated successfully. Public release needs non-blocking release work; manual testing is not blocked.", evidence)]
-        return [check.passed("Release readiness report generated.", payload)]
+            return [generated.passed("Release readiness report generated successfully.", evidence), public_gate.failed("Public distribution requirements are incomplete.", "Complete current clean-install, test-matrix, integrity, and packaging evidence.", evidence)]
+        return [generated.passed("Release readiness report generated.", evidence), public_gate.passed("Public distribution gate passed.", evidence)]
     except Exception as exc:
-        check.failure_stage = "unknown"
-        return [check.failed(str(exc), "Fix ReleaseReadinessEngine before UAT.", {"exception": type(exc).__name__})]
+        generated.failure_stage = "unknown"
+        return [generated.failed(str(exc), "Fix ReleaseReadinessEngine before UAT.", {"exception": type(exc).__name__})]
 
 
 __all__ = ["run_release_audit"]

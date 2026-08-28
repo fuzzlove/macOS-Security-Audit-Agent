@@ -98,6 +98,17 @@ def test_recovery_preview_snapshot_cleanup_and_preservation(tmp_path: Path, monk
     assert action.get("result_text")
 
 
+def test_recovery_center_treats_system_apple_cache_as_protected(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("mac_audit_agent.config.Path.home", lambda: tmp_path)
+    monkeypatch.setattr("mac_audit_agent.recovery_center.Path.home", lambda: tmp_path)
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    center = SystemRecoveryCenter(db, AuditConfig())
+    protected = Path("/Library/Caches/com.apple.amsengagement.classicdatavault")
+
+    assert center._is_protected(protected)
+    assert center._scan_candidate({"category": "review", "kind": "user-selected log folder", "path": protected}) == []
+
+
 def test_snapshot_only_action_is_logged(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("mac_audit_agent.config.Path.home", lambda: tmp_path)
     monkeypatch.setattr("mac_audit_agent.recovery_center.Path.home", lambda: tmp_path)

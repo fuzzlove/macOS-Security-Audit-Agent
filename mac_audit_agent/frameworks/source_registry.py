@@ -11,10 +11,12 @@ from typing import Any
 
 OFFICIAL_SOURCE_DOMAINS = (
     "ecfr.gov",
+    "acquisition.gov",
     "dodcio.defense.gov",
     "defense.gov",
     "acq.osd.mil",
     "cisa.gov",
+    "nvd.nist.gov",
     "nist.gov",
     "csrc.nist.gov",
     "nvlpubs.nist.gov",
@@ -22,6 +24,11 @@ OFFICIAL_SOURCE_DOMAINS = (
     "pcisecuritystandards.org",
     "attack.mitre.org",
     "mitre.org",
+    "developer.apple.com",
+    "support.apple.com",
+    "feedbackassistant.apple.com",
+    "security.apple.com",
+    "apple.com",
 )
 
 
@@ -40,6 +47,26 @@ class OfficialFrameworkSource:
     normative: bool = True
     source_type: str = "government_standard"
     notes: str = ""
+    document_type: str = "publication"
+    revision: str = ""
+    effective_date: str = ""
+    last_verified_at: str = ""
+    canonical_document_url: str = ""
+    contractual_status: str = "SUPPORTING"
+    authoritative_level: int = 5
+    supersedes: str = ""
+    superseded_by: str = ""
+    applicable_from: str = ""
+    applicable_until: str = ""
+    contract_clause_relationships: tuple[str, ...] = ()
+    content_pack_sha256: str = ""
+    parser_version: str = "msaa-standards-1"
+    human_review_status: str = "NOT_REVIEWED"
+    reviewer: str = ""
+    review_date: str = ""
+    change_summary: str = ""
+    migration_notes: str = ""
+    license_or_publication_terms: str = "US Government publication"
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -47,6 +74,11 @@ class OfficialFrameworkSource:
         payload["source_status"] = source_status(self)
         payload["cache_status"] = cache_status(self)
         payload["official_domain"] = is_official_source_url(self.source_url)
+        payload["issuer"] = self.issuing_authority
+        payload["official_url"] = self.source_url
+        payload["canonical_document_url"] = self.canonical_document_url or self.source_url
+        payload["document_sha256"] = self.hash_sha256
+        payload["normative_or_informative"] = "NORMATIVE" if self.normative else "INFORMATIVE"
         return payload
 
 
@@ -63,7 +95,8 @@ def official_framework_sources(*, retrieved_at: str | None = None, cache_dir: Pa
     cache = cache_dir or default_cache_dir()
     specs = [
         ("cmmc_32_cfr_170", "CMMC", "32 CFR Part 170, Cybersecurity Maturity Model Certification Program", "Electronic Code of Federal Regulations", "https://www.ecfr.gov/current/title-32/subtitle-A/chapter-I/subchapter-M/part-170", "32 CFR Part 170 current", "", True, "government_standard", "Normative CMMC program rule."),
-        ("cmmc_dodcio_resources", "CMMC", "DoD CIO CMMC Resources & Documentation", "Department of Defense Chief Information Officer", "https://dodcio.defense.gov/CMMC/Documentation/", "Current CMMC documentation portal", "", True, "government_guidance", "Official CMMC resources and documentation landing page."),
+        ("cmmc_dodcio_resources", "CMMC", "DoD CIO CMMC Resources & Documentation", "Department of Defense Chief Information Officer", "https://dodcio.defense.gov/cmmc/Resources-Documentation/", "Current CMMC documentation portal", "", True, "government_guidance", "Official CMMC resources and documentation landing page."),
+        ("far_52_204_21", "FAR", "FAR 52.204-21 Basic Safeguarding of Covered Contractor Information Systems", "Acquisition.gov", "https://www.acquisition.gov/far/52.204-21", "Current FAR clause", "", True, "government_standard", "Contractual foundation for the 15 Level 1 safeguards."),
         ("cmmc_level_1_assessment_guide", "CMMC", "CMMC Level 1 Assessment Guide", "Department of Defense Chief Information Officer", "https://dodcio.defense.gov/CMMC/Documentation/", "Current official guide if published", "", True, "government_guidance", "Use official DoD guide from the documentation portal when available; cached mode must label source status."),
         ("cmmc_level_2_assessment_guide", "CMMC", "CMMC Level 2 Assessment Guide", "Department of Defense Chief Information Officer", "https://dodcio.defense.gov/CMMC/Documentation/", "Current official guide if published", "", True, "government_guidance", "Use official DoD guide from the documentation portal when available; CMMC L2 maps to NIST SP 800-171 requirements."),
         ("cmmc_level_3_assessment_guide", "CMMC", "CMMC Level 3 Assessment Guide", "Department of Defense Chief Information Officer", "https://dodcio.defense.gov/CMMC/Documentation/", "Current official guide if published", "", True, "government_guidance", "Use official DoD guide from the documentation portal when available; advanced requirements may reference NIST SP 800-172."),
@@ -71,22 +104,38 @@ def official_framework_sources(*, retrieved_at: str | None = None, cache_dir: Pa
         ("nist_sp_800_171_r2", "NIST", "NIST SP 800-171 Rev. 2", "National Institute of Standards and Technology", "https://csrc.nist.gov/pubs/sp/800/171/r2/upd1/final", "Revision 2, update as of 2021-01-28; withdrawn/superseded", "2020-02", True, "government_standard", "NIST states the PDF is the authoritative source for Rev. 2 CUI security requirements."),
         ("nist_sp_800_171_r3", "NIST", "NIST SP 800-171 Rev. 3", "National Institute of Standards and Technology", "https://csrc.nist.gov/pubs/sp/800/171/r3/final", "Revision 3 final", "2024-05", True, "government_standard", "Current final revision for CUI security requirements."),
         ("nist_sp_800_171a", "NIST", "NIST SP 800-171A", "National Institute of Standards and Technology", "https://csrc.nist.gov/pubs/sp/800/171/a/final", "Final", "2018-06", True, "government_standard", "Assessment procedures for SP 800-171 requirements."),
+        ("nist_sp_800_171a_r3", "NIST", "NIST SP 800-171A Rev. 3", "National Institute of Standards and Technology", "https://csrc.nist.gov/pubs/sp/800/171/a/r3/final", "Revision 3 final", "2024-05-14", True, "government_standard", "Future-readiness assessment procedures; does not replace the contractual CMMC Rev. 2 baseline."),
         ("nist_sp_800_172", "NIST", "NIST SP 800-172", "National Institute of Standards and Technology", "https://csrc.nist.gov/pubs/sp/800/172/final", "Final", "2021-02", True, "government_standard", "Enhanced security requirements for protecting CUI."),
         ("nist_sp_800_172a", "NIST", "NIST SP 800-172A", "National Institute of Standards and Technology", "https://csrc.nist.gov/pubs/sp/800/172/a/final", "Final", "2022-03", True, "government_standard", "Assessment procedures for enhanced CUI requirements where applicable."),
+        ("nist_sp_800_172_r3", "NIST", "NIST SP 800-172 Rev. 3", "National Institute of Standards and Technology", "https://csrc.nist.gov/pubs/sp/800/172/r3/final", "Revision 3 final", "2026-05-13", True, "government_standard", "Final future-readiness source; not activated for current CMMC scoring."),
+        ("nist_sp_800_172a_r3", "NIST", "NIST SP 800-172A Rev. 3", "National Institute of Standards and Technology", "https://csrc.nist.gov/pubs/sp/800/172/a/r3/final", "Revision 3 final", "2026-05-13", True, "government_standard", "Final future-readiness procedures; not activated for current CMMC scoring."),
         ("nist_csf_2_0", "NIST", "NIST Cybersecurity Framework 2.0", "National Institute of Standards and Technology", "https://www.nist.gov/cyberframework", "2.0", "2024-02", True, "government_standard", "NIST CSF 2.0 framework reference."),
         ("nist_sp_800_53_r5", "NIST", "NIST SP 800-53 Rev. 5", "National Institute of Standards and Technology", "https://csrc.nist.gov/pubs/sp/800/53/r5/upd1/final", "Revision 5, update 1", "2020-09", True, "government_standard", "Security and privacy controls catalog."),
         ("cisa_cpg_2_0", "CISA", "Cybersecurity Performance Goals", "Cybersecurity and Infrastructure Security Agency", "https://www.cisa.gov/cybersecurity-performance-goals", "CPG 2.0 current public guidance", "", False, "government_guidance", "Public CISA baseline practices for cybersecurity outcomes."),
         ("cisa_kev_catalog", "CISA", "Known Exploited Vulnerabilities Catalog", "Cybersecurity and Infrastructure Security Agency", "https://www.cisa.gov/known-exploited-vulnerabilities-catalog", "Current catalog", "", False, "government_guidance", "Use for vulnerability exposure context, not as a local compliance claim."),
+        ("nvd_cve_api", "NVD", "NVD CVE API", "NIST / National Vulnerability Database", "https://nvd.nist.gov/developers/vulnerabilities", "NVD CVE API 2.0", "", False, "government_reference", "CVE enrichment and vulnerability metadata source; not local exploit confirmation."),
+        ("nvd_cve_data_feeds", "NVD", "NVD CVE Data Feeds", "NIST / National Vulnerability Database", "https://nvd.nist.gov/vuln/data-feeds", "Current NVD feed/catalog marker", "", False, "government_reference", "Offline/cache CVE enrichment source for vulnerability metadata."),
         ("cisa_secure_by_design", "CISA", "Secure by Design guidance", "Cybersecurity and Infrastructure Security Agency", "https://www.cisa.gov/securebydesign", "Current public guidance", "", False, "government_guidance", "Reference guidance for secure-by-design framing and defensive defaults."),
+        ("cisa_supply_chain_integrity_readiness", "CISA", "Software supply chain integrity readiness reference", "Cybersecurity and Infrastructure Security Agency", "https://www.cisa.gov/securebydesign", "Current public guidance", "", False, "government_guidance", "Readiness support reference for signed manifest evidence, provenance metadata, and reduced unauthorized modification risk; no CISA approval implied."),
+        ("nist_ssdf_800_218_integrity", "NIST", "NIST SP 800-218 Secure Software Development Framework integrity practices", "National Institute of Standards and Technology", "https://csrc.nist.gov/pubs/sp/800/218/final", "Final", "2022-02", True, "government_standard", "Readiness support reference for protecting software from unauthorized access/tampering, release integrity, and provenance evidence."),
         ("nsa_cybersecurity", "NSA", "NSA Cybersecurity Advisories and Guidance", "National Security Agency", "https://www.nsa.gov/Cybersecurity/", "Current public cybersecurity portal", "", False, "government_guidance", "Public NSA cybersecurity guidance and advisories reference."),
         ("nsa_cybersecurity_advisories", "NSA", "NSA Cybersecurity Advisories", "National Security Agency", "https://www.nsa.gov/Press-Room/Cybersecurity-Advisories-Guidance/", "Current public advisories", "", False, "government_guidance", "Use as public guidance alignment only; no endorsement or approval implied."),
         ("pci_dss_4_0_1", "PCI", "PCI DSS v4.0.1", "PCI Security Standards Council", "https://www.pcisecuritystandards.org/document_library/", "4.0.1", "2024-06", True, "industry_standard", "Industry payment-card security standard; not a government framework."),
         ("pci_dss_roc_aoc_templates", "PCI", "PCI DSS ROC/AOC Templates", "PCI Security Standards Council", "https://www.pcisecuritystandards.org/document_library/", "Current templates", "", False, "public_reference", "Reference only for report/evidence structure where payment-card relevance exists."),
         ("mitre_attack_enterprise", "MITRE", "MITRE ATT&CK Enterprise Matrix", "MITRE", "https://attack.mitre.org/matrices/enterprise/", "Current public matrix", "", False, "public_reference", "Public technique context reference; not a compliance framework."),
         ("mitre_attack_macos", "MITRE", "MITRE ATT&CK macOS Platform Techniques", "MITRE", "https://attack.mitre.org/platforms/macOS/", "Current public platform reference", "", False, "public_reference", "Use for macOS technique context and defensive mapping only."),
+        ("mitre_attack_enterprise_mitigations", "MITRE", "MITRE ATT&CK Enterprise Mitigations", "MITRE", "https://attack.mitre.org/mitigations/enterprise/", "Current public mitigations reference", "", False, "public_reference", "Defensive mitigation context only; ATT&CK mapping is not actor attribution."),
+        ("apple_feedback_assistant", "Apple", "Apple Feedback Assistant / Bug Reporting", "Apple", "https://developer.apple.com/bug-reporting/", "Current public documentation", "", False, "vendor_support_reference", "User-submitted diagnostic workflow reference; no automatic submission."),
+        ("apple_activity_monitor_system_diagnostics", "Apple", "Activity Monitor System Diagnostics Report", "Apple", "https://support.apple.com/guide/activity-monitor/run-a-system-diagnostics-report-actmntr2225/mac", "Current public documentation", "", False, "vendor_support_reference", "Apple system diagnostics collection reference; diagnostic content requires user review before sharing."),
+        ("apple_diagnostics", "Apple", "Apple Diagnostics for Mac", "Apple", "https://support.apple.com/102550", "Current public documentation", "", False, "vendor_support_reference", "Hardware diagnostics reference; MSAA records checklist/evidence only."),
+        ("apple_wireless_diagnostics", "Apple", "Wireless Diagnostics on Mac", "Apple", "https://support.apple.com/guide/mac-help/use-wireless-diagnostics-mchlf4de377f/mac", "Current public documentation", "", False, "vendor_support_reference", "Wireless diagnostic workflow reference; MSAA does not change network settings."),
+        ("apple_security_reporting", "Apple", "Apple Security Research / Reporting", "Apple", "https://security.apple.com/", "Current public documentation", "", False, "vendor_security_reporting_reference", "Apple security reporting / vulnerability disclosure reference; no Apple verification is implied."),
         ("dfars_252_204_7012", "DFARS", "DFARS 252.204-7012", "Electronic Code of Federal Regulations", "https://www.ecfr.gov/current/title-48/chapter-2/subchapter-H/part-252/subpart-252.2/section-252.204-7012", "Current eCFR", "", True, "government_standard", "Safeguarding covered defense information and cyber incident reporting clause."),
+        ("dfars_252_204_7008", "DFARS", "DFARS 252.204-7008", "Acquisition.gov", "https://www.acquisition.gov/dfars/252.204-7008-compliance-safeguarding-covered-defense-information-controls", "Current DFARS", "", True, "government_standard", "Compliance with safeguarding covered defense information controls."),
+        ("dfars_252_204_7019", "DFARS", "DFARS 252.204-7019", "Acquisition.gov", "https://www.acquisition.gov/dfars/252.204-7019-notice-nist-sp-800-171-dod-assessment-requirements", "Current DFARS", "", True, "government_standard", "Notice of NIST SP 800-171 DoD assessment requirements."),
         ("dfars_252_204_7020", "DFARS", "DFARS 252.204-7020", "Electronic Code of Federal Regulations", "https://www.ecfr.gov/current/title-48/chapter-2/subchapter-H/part-252/subpart-252.2/section-252.204-7020", "Current eCFR", "", True, "government_standard", "NIST SP 800-171 DoD assessment requirements clause."),
         ("dfars_252_204_7021", "DFARS", "DFARS 252.204-7021", "Electronic Code of Federal Regulations", "https://www.ecfr.gov/current/title-48/chapter-2/subchapter-H/part-252/subpart-252.2/section-252.204-7021", "Current eCFR", "", True, "government_standard", "CMMC requirements clause where applicable/current."),
+        ("dfars_252_204_7025", "DFARS", "DFARS 252.204-7025 Notice of CMMC Level Requirements", "Acquisition.gov", "https://www.acquisition.gov/dfars/252.204-7025-notice-cybersecurity-maturity-model-certification-level-requirements", "NOV 2025", "2025-11", True, "government_standard", "Solicitation provision for the required CMMC level."),
         ("dod_assessment_methodology", "DoD", "DoD Assessment Methodology references", "Department of Defense", "https://dodcio.defense.gov/CMMC/Documentation/", "Current official references", "", False, "government_guidance", "Use official DoD-published methodology references only."),
     ]
     return [

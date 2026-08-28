@@ -1,0 +1,28 @@
+{
+  "schema_version": "1.0",
+  "enabled": true,
+  "sensitivity": "high",
+  "monitor_only": true,
+  "queue_limit": 2048,
+  "correlation_window_seconds": 30,
+  "max_representative_evidence": 20,
+  "cve_freshness_hours": 168,
+  "inventory_interval_seconds": 3600,
+  "event_retention_days": 180,
+  "raw_evidence_retention_days": 30,
+  "allowed_management_uids": [0],
+  "redacted_environment_keys": ["PASSWORD", "TOKEN", "SECRET", "KEY", "COOKIE", "AUTH"],
+  "enabled_sensors": ["process_poll", "network_snapshot", "file_metadata", "package_inventory"],
+  "attack_data_path": "",
+  "cve_cache_path": "/Library/Application Support/MacAuditAgent/cache/rce-cve.json",
+  "framework_versions": {}
+  ,"injection_correlation_window_seconds": 30
+  ,"injection_novelty_threshold": 60
+  ,"injection_similarity_threshold": 50
+  ,"evidence_capture_tier": 1
+  ,"tier2_memory_capture_enabled": false
+  ,"evidence_max_bytes": 8388608
+  ,"evidence_encryption_required": false
+  ,"protected_process_categories": ["credentials", "identity", "classified", "regulated"]
+  ,"attack_freshness_hours": 720
+}

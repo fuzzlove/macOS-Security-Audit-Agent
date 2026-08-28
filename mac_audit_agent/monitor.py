@@ -14,7 +14,6 @@ try:
 except ImportError:  # pragma: no cover
     fcntl = None
 import getpass
-import json
 import logging
 import os
 import plistlib
@@ -22,12 +21,14 @@ import re
 import subprocess
 import time
 import signal
+import sqlite3
 import stat
 import traceback
+import threading
+from collections import deque
 from datetime import datetime, timedelta, timezone
 
 from mac_audit_agent.launch_agent import (
-    LAUNCH_AGENT_LABEL,
     MAC_AUDIT_AGENT_ENV_ROLE,
     MONITOR_ROLE_LEGACY,
     MONITOR_ROLE_SYSTEM,
@@ -38,11 +39,10 @@ from mac_audit_agent.launch_agent import (
     launchctl_target,
     launch_scope,
     monitor_log_root,
-    monitor_script_path,
-    project_root,
     verify_protected_monitor_integrity,
     runtime_monitor_script_path,
     runtime_root,
+    compatible_python_executable,
 )
 from mac_audit_agent.emergency_lockdown import enable_lockdown_with_user_policy
 from mac_audit_agent.hardware_monitor import HardwareMonitor, USBReconnectObserver
@@ -61,6 +61,10 @@ from mac_audit_agent.self_impact_watchdog import MonitorSelfImpactWatchdog, Self
 from mac_audit_agent.storage import AuditDatabase
 from mac_audit_agent.system_monitor_readiness import process_deployment_event_flow_request
 from mac_audit_agent.version import APP_VERSION
+from mac_audit_agent.anti_ransomware.prototype_observer import PrototypeRansomwareObserver
+from mac_audit_agent.anti_ransomware.live_fixture import parse_fixture_receipt
+from mac_audit_agent.rce_monitor.repository import RCERepository
+from mac_audit_agent.rce_monitor.service import RCEMonitorService
 
 
 LOGGER = logging.getLogger(__name__)
@@ -404,7 +408,7 @@ class BackgroundMonitorService:
         self.network_observer = NetworkStateObserver(self.network_monitor, poll_seconds=NETWORK_POLL_SECONDS)
         self.persistence_monitor = PersistenceMonitor(executor=self.executor)
         self.native_event_bridge = NativeEventBridge(self.db)
-        self.notifications = NotificationManager(self.db) if not self.system_daemon_mode else _DaemonNotificationManager(self.db)
+        self.notifications = NotificationManager(self.db, role=self.mode) if not self.system_daemon_mode else _DaemonNotificationManager(self.db)
         self.self_impact_watchdog = MonitorSelfImpactWatchdog()
         self.previous_privacy = None
         self.previous_session = None
@@ -416,6 +420,36 @@ class BackgroundMonitorService:
         self._last_heartbeat_written = 0.0
         self._last_sharing_poll = 0.0
         self._last_integrity_poll = 0.0
+        self._ransomware_observers: list[PrototypeRansomwareObserver] = []
+        self._ransomware_event_times: deque[float] = deque(maxlen=512)
+        self._ransomware_events_observed_total = 0
+        self._ransomware_fixture_receipts: deque[dict[str, str]] = deque(maxlen=128)
+        self._last_ransomware_burst_event = 0.0
+        self._ransomware_pending_events: deque[BackgroundMonitorEvent] = deque(maxlen=64)
+        self._ransomware_pending_lock = threading.Lock()
+        self._prototype_yara_scanner = None
+        self._definition_update_thread: threading.Thread | None = None
+        self._last_definition_update_start = 0.0
+        self._definition_update_pending: deque[dict[str, str]] = deque(maxlen=8)
+        self._definition_update_lock = threading.Lock()
+        self._clickfix_consumer = None
+        self._clickfix_shell_consumer = None
+        rce_config_value = os.environ.get("MSAA_RCE_CONFIG", "/Library/Application Support/MacAuditAgent/config/rce-monitor.json")
+        # Use a separate WAL connection to the same existing database. AuditDB
+        # intentionally wraps its connection with a lock proxy, and sharing
+        # that private proxy would couple transaction/locking internals.
+        self.rce_monitor: RCEMonitorService | None = None
+        try:
+            self.rce_monitor = RCEMonitorService(RCERepository(Path(self.db.path)), Path(rce_config_value))
+            self.db.set_background_monitor_state("rce_monitor_initialization", "ready")
+        except (OSError, RuntimeError, sqlite3.Error, ValueError) as exc:
+            # RCE enrichment is important, but a schema/version or database
+            # failure must not terminate the shared System Monitor and erase
+            # unrelated ransomware, persistence, and network visibility.
+            self.db.set_background_monitor_state(
+                "rce_monitor_initialization", f"degraded:{type(exc).__name__}"
+            )
+            self.db.set_background_monitor_state("rce_monitor_last_error", type(exc).__name__)
         self.monitor_settings = load_settings(self.db)
         self._last_settings_snapshot: tuple[bool, bool, bool, bool, bool, int] | None = None
         self.enabled_detectors = [
@@ -427,6 +461,7 @@ class BackgroundMonitorService:
             "suspicious_process_detector",
             "hardware_device_detector",
             "protected_monitor_integrity_detector",
+            "rce_behavior_monitor",
         ]
         self._detector_enabled_flags = {
             "detector_enabled_camera": "1",
@@ -437,6 +472,7 @@ class BackgroundMonitorService:
             "detector_enabled_process": "1",
             "detector_enabled_hardware": "1",
             "detector_enabled_integrity": "1",
+            "detector_enabled_rce": "1",
         }
         self._ensure_log_paths()
         if self.record_startup:
@@ -463,6 +499,11 @@ class BackgroundMonitorService:
                 else:
                     self._mark_detector_disabled("usb_device_detector", "Persistent Local EDR disabled by settings." if not self._persistent_local_edr_enabled() else "USB monitoring disabled by settings.")
                 observers_started = True
+                if self.system_daemon_mode:
+                    self._start_ransomware_prototype_observers()
+                    if self.rce_monitor is not None:
+                        self.rce_monitor.start()
+                    self._maybe_start_definition_update(force=True)
             while True:
                 if self.user_notifier_mode:
                     self.record_heartbeat()
@@ -488,6 +529,287 @@ class BackgroundMonitorService:
             except Exception as exc:
                 self._write_log_line(f"observer stop failed: {name}: {exc}")
                 self.db.set_background_monitor_state(f"{name}_stop_error", str(exc))
+        for observer in self._ransomware_observers:
+            try:
+                observer.stop()
+            except Exception as exc:
+                self._write_log_line(f"observer stop failed: anti_ransomware_prototype: {type(exc).__name__}")
+        self._ransomware_observers.clear()
+        if self._prototype_yara_scanner is not None:
+            self._prototype_yara_scanner.stop()
+            self._prototype_yara_scanner = None
+        if self._definition_update_thread is not None:
+            self._definition_update_thread.join(timeout=2.0)
+            self._definition_update_thread = None
+        if self.rce_monitor is not None:
+            self.rce_monitor.stop()
+
+    def _maybe_start_definition_update(self, *, force: bool = False) -> None:
+        """Run scheduled definition work off the sensor ingestion thread."""
+        if not self.system_daemon_mode:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_definition_update_start < 300:
+            return
+        if self._definition_update_thread is not None and self._definition_update_thread.is_alive():
+            self.db.set_background_monitor_state("malware_definitions_updater_state", "UPDATING")
+            return
+        self._last_definition_update_start = now
+
+        def worker() -> None:
+            started = time.monotonic()
+            try:
+                from mac_audit_agent.threat_definitions.manager import default_manager
+                from mac_audit_agent.threat_definitions.scheduler import DefinitionUpdateScheduler
+
+                manager = default_manager()
+                results = DefinitionUpdateScheduler(manager).run_due(activate=True)
+                status = manager.status()
+                payload = {
+                    "state": str(status.get("state", "UNKNOWN")),
+                    "active_release": str(status.get("active_version") or ""),
+                    "last_update": str(status.get("last_successful_update") or ""),
+                    "result": json.dumps(results, sort_keys=True, default=str)[:65536],
+                    "error": "",
+                }
+            except Exception as exc:
+                payload = {
+                    "state": "DEGRADED", "active_release": "", "last_update": "", "result": "",
+                    "error": f"{type(exc).__name__}: {str(exc)[:512]}",
+                }
+            finally:
+                payload["duration"] = f"{time.monotonic() - started:.3f}"
+                with self._definition_update_lock:
+                    self._definition_update_pending.append(payload)
+
+        self._definition_update_thread = threading.Thread(target=worker, name="MSAADefinitionUpdater", daemon=True)
+        self._definition_update_thread.start()
+
+    def _drain_definition_update_status(self) -> None:
+        with self._definition_update_lock:
+            payloads = list(self._definition_update_pending)
+            self._definition_update_pending.clear()
+        for payload in payloads:
+            self.db.set_background_monitor_state("malware_definitions_updater_state", payload["state"])
+            self.db.set_background_monitor_state("malware_definitions_active_release", payload["active_release"])
+            self.db.set_background_monitor_state("malware_definitions_last_update", payload["last_update"])
+            self.db.set_background_monitor_state("malware_definitions_last_result", payload["result"])
+            self.db.set_background_monitor_state("malware_definitions_last_error", payload["error"])
+            self.db.set_background_monitor_state("malware_definitions_update_duration_seconds", payload["duration"])
+            if payload["error"]:
+                self._write_log_line(f"malware definition update failed safely: error={payload['error'].split(':', 1)[0]}")
+
+    def _start_ransomware_prototype_observers(self) -> None:
+        """Start bounded fallback observation in the system LaunchDaemon.
+
+        Endpoint Security remains the production sensor. These explicit desktop
+        user folders provide delayed metadata-only prototype coverage.
+        """
+        home_value = os.environ.get("MSAA_GUI_HOME", "").strip()
+        if not home_value:
+            self.db.set_background_monitor_state("anti_ransomware_prototype_status", "disabled_missing_target_home")
+            return
+        home = Path(home_value).expanduser().resolve(strict=False)
+        roots = [path for path in (home / "Desktop", home / "Documents", home / "Downloads") if path.is_dir()]
+        state_root = Path("/Library/Application Support/MacAuditAgent/run/anti-ransomware-prototype")
+        started: list[str] = []
+        for root in roots:
+            try:
+                token = hashlib.sha256(str(root).encode()).hexdigest()[:12]
+                observer = PrototypeRansomwareObserver(
+                    root,
+                    state_directory=state_root / token,
+                    max_files=25_000,
+                    event_callback=self._handle_ransomware_prototype_event,
+                )
+                observer.start(); self._ransomware_observers.append(observer); started.append(root.name)
+            except (OSError, ValueError) as exc:
+                self._write_log_line(f"anti-ransomware prototype root unavailable: root={root.name} error={type(exc).__name__}")
+        self.db.set_background_monitor_state("anti_ransomware_prototype_status", "running" if started else "no_roots_available")
+        self.db.set_background_monitor_state("anti_ransomware_prototype_roots", json.dumps(started))
+        self.db.set_background_monitor_state("anti_ransomware_prototype_limitations", "delayed_metadata_no_process_attribution_no_containment")
+        self.db.set_background_monitor_state("anti_ransomware_prototype_events_observed_total", "0")
+        self.db.set_background_monitor_state("anti_ransomware_prototype_events_dropped_total", "0")
+        self.db.set_background_monitor_state("anti_ransomware_prototype_fixture_receipts", "[]")
+        self.db.set_background_monitor_state("anti_ransomware_prototype_last_fixture_challenge", "")
+        self.db.set_background_monitor_state("anti_ransomware_prototype_last_fixture_event", "")
+        self.enabled_detectors.append("anti_ransomware_development_observer")
+        try:
+            from mac_audit_agent.anti_ransomware.prototype_yara_scanner import PrototypeYaraScanner
+            from mac_audit_agent.anti_ransomware.definition_database import ActiveMacOSMalwareDatabase
+            from mac_audit_agent.anti_ransomware.yara_rule_manager import YaraRuleManager
+
+            manager = YaraRuleManager()
+            definition_database = ActiveMacOSMalwareDatabase()
+            scanner = PrototypeYaraScanner(
+                manager,
+                self._handle_prototype_yara_match,
+                definition_database=definition_database,
+                hash_callback=self._handle_prototype_hash_match,
+            )
+            yara_active = scanner.start()
+            self._prototype_yara_scanner = scanner if yara_active else None
+            capability = manager.backend.capability
+            definition_snapshot = scanner.definition_snapshot
+            self.db.set_background_monitor_state("anti_ransomware_yara_backend_state", capability.state)
+            self.db.set_background_monitor_state("anti_ransomware_yara_active", "1" if scanner.compiled is not None else "0")
+            self.db.set_background_monitor_state("anti_ransomware_yara_rule_count", str(len(manager.active_sources()) + len(definition_snapshot.yara_sources)))
+            self.db.set_background_monitor_state("anti_ransomware_hash_active", "1" if definition_snapshot.hash_backend.indicator_count else "0")
+            self.db.set_background_monitor_state("anti_ransomware_hash_indicator_count", str(definition_snapshot.hash_backend.indicator_count))
+            self.db.set_background_monitor_state("anti_ransomware_definition_version", definition_snapshot.version)
+            if scanner.compiled is not None:
+                self.enabled_detectors.append("anti_ransomware_prototype_yara")
+            if definition_snapshot.hash_backend.indicator_count:
+                self.enabled_detectors.append("anti_malware_definition_hashes")
+        except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+            self.db.set_background_monitor_state("anti_ransomware_yara_active", "0")
+            self.db.set_background_monitor_state("anti_ransomware_yara_backend_state", f"unavailable:{type(exc).__name__}")
+            self._write_log_line(f"anti-ransomware YARA unavailable: error={type(exc).__name__}")
+        self._write_log_line(f"anti-ransomware development observation started: roots={','.join(started) or 'none'}")
+
+    def _handle_ransomware_prototype_event(self, _event) -> None:
+        if self._prototype_yara_scanner is not None and getattr(_event, "operation", "") in {"created", "modified"}:
+            self._prototype_yara_scanner.submit(Path(_event.path))
+        now = time.monotonic()
+        with self._ransomware_pending_lock:
+            self._ransomware_events_observed_total += 1
+            observed_total = self._ransomware_events_observed_total
+        self._ransomware_event_times.append(now)
+        while self._ransomware_event_times and now - self._ransomware_event_times[0] > 10.0:
+            self._ransomware_event_times.popleft()
+        count = len(self._ransomware_event_times)
+        self.db.set_background_monitor_state("anti_ransomware_prototype_last_event", utc_now_iso())
+        self.db.set_background_monitor_state("anti_ransomware_prototype_window_count", str(count))
+        self.db.set_background_monitor_state("anti_ransomware_prototype_events_observed_total", str(observed_total))
+        self.db.set_background_monitor_state(
+            "anti_ransomware_prototype_events_dropped_total",
+            str(sum(observer.observer.dropped_events for observer in self._ransomware_observers)),
+        )
+        fixture_receipt = parse_fixture_receipt(getattr(_event, "path", ""))
+        if fixture_receipt is not None:
+            receipt = {
+                **fixture_receipt,
+                "operation": str(getattr(_event, "operation", "unknown"))[:32],
+                "observed_at": utc_now_iso(),
+            }
+            with self._ransomware_pending_lock:
+                identity = (receipt["challenge"], receipt["stage"])
+                if not any((item["challenge"], item["stage"]) == identity for item in self._ransomware_fixture_receipts):
+                    self._ransomware_fixture_receipts.append(receipt)
+                receipts = list(self._ransomware_fixture_receipts)
+            self.db.set_background_monitor_state(
+                "anti_ransomware_prototype_fixture_receipts",
+                json.dumps(receipts, sort_keys=True, separators=(",", ":")),
+            )
+            self.db.set_background_monitor_state(
+                "anti_ransomware_prototype_last_fixture_challenge", receipt["challenge"]
+            )
+            self.db.set_background_monitor_state(
+                "anti_ransomware_prototype_last_fixture_event", receipt["observed_at"]
+            )
+        if count < 50 or now - self._last_ransomware_burst_event < 60.0:
+            return
+        self._last_ransomware_burst_event = now
+        event = self._build_event(
+            "ransomware_file_activity_burst_observed",
+            f"Development observer recorded {count} file metadata changes within 10 seconds. No process attribution or ransomware conclusion is available.",
+            severity="medium", confidence="low", source="anti_ransomware_development_observer",
+            trigger_subsource="bounded_metadata_burst", current_state="review_required",
+        )
+        # Observer callbacks run off the monitor thread. Queue the event so all
+        # SQLite writes and notification policy evaluation remain on run_once.
+        with self._ransomware_pending_lock:
+            self._ransomware_pending_events.append(event)
+
+    def _handle_prototype_yara_match(self, _path: Path, rule_names: tuple[str, ...]) -> None:
+        event = self._build_event(
+            "ransomware_yara_pattern_observed",
+            f"Prototype YARA scanning matched {len(rule_names)} active rule(s) in a changed file. The path is withheld; review is required and a match alone does not prove ransomware.",
+            severity="high", confidence="medium", source="anti_ransomware_prototype_yara",
+            trigger_subsource="bounded_yara_on_change", current_state="review_required",
+        )
+        with self._ransomware_pending_lock:
+            self._ransomware_pending_events.append(event)
+
+    def _handle_prototype_hash_match(self, _path: Path, matches) -> None:
+        algorithms = sorted({str(item.algorithm).upper() for item in matches})
+        legacy_only = bool(algorithms) and all(item in {"MD5", "SHA1"} for item in algorithms)
+        event = self._build_event(
+            "malware_hash_indicator_observed",
+            f"The active signed macOS threat database matched {len(matches)} file-hash indicator(s) ({', '.join(algorithms)}). "
+            + ("Only a legacy correlation hash matched; corroborating evidence is required. " if legacy_only else "")
+            + "The path is withheld and no automatic deletion was performed.",
+            severity="medium" if legacy_only else "high",
+            confidence="medium" if legacy_only else "high",
+            source="anti_malware_definition_database",
+            trigger_subsource="bounded_hash_on_change",
+            current_state="review_required",
+        )
+        with self._ransomware_pending_lock:
+            self._ransomware_pending_events.append(event)
+
+    def _drain_ransomware_prototype_events(self) -> list[BackgroundMonitorEvent]:
+        with self._ransomware_pending_lock:
+            events = list(self._ransomware_pending_events)
+            self._ransomware_pending_events.clear()
+        return events
+
+    def _consume_clickfix_events(self) -> list[BackgroundMonitorEvent]:
+        """Bridge verified user-session ClickFix records into daemon events."""
+        home_value = os.environ.get("MSAA_GUI_HOME", "").strip()
+        if not home_value:
+            return []
+        try:
+            if self._clickfix_consumer is None:
+                from mac_audit_agent.clickfix.evidence import ClickFixEvidenceStore
+                from mac_audit_agent.clickfix.models import GuardProfile
+                from mac_audit_agent.clickfix.native_journal import NativeJournalConsumer
+                from mac_audit_agent.clickfix.policy import ClickFixPolicy
+                from mac_audit_agent.clickfix.service import ClickFixService
+                journal = Path(home_value) / "Library/Application Support/MacAuditAgent/ClickFixGuard/events.jsonl"
+                store = ClickFixEvidenceStore(Path("/Library/Application Support/MacAuditAgent/clickfix_evidence.sqlite3"))
+                service = ClickFixService(store, ClickFixPolicy.for_profile(GuardProfile.WARN))
+                self._clickfix_consumer = NativeJournalConsumer(journal, service)
+            outcomes = self._clickfix_consumer.consume()
+            self.db.set_background_monitor_state("clickfix_daemon_bridge_status", "active")
+            events = []
+            for outcome in outcomes:
+                if outcome.get("disposition") != "POTENTIAL_CLICKFIX":
+                    continue
+                events.append(self._build_event(
+                    "potential_clickfix_command_detected",
+                    "The authenticated user-session ClickFix sensor reported command-like clipboard content at the Spotlight shortcut. Clipboard content is not included.",
+                    severity="critical", confidence="high", source="clickfix_guard",
+                    trigger_subsource="verified_native_journal", current_state="potential_clickfix",
+                ))
+            return events
+        except Exception as exc:
+            self.db.set_background_monitor_state("clickfix_daemon_bridge_status", f"error:{type(exc).__name__}")
+            self._write_log_line(f"ClickFix journal bridge failed: error={type(exc).__name__}")
+            return []
+
+    def _consume_clickfix_shell_events(self) -> list[BackgroundMonitorEvent]:
+        """Bridge privacy-safe shell decisions; never trust or ingest command text."""
+        home_value = os.environ.get("MSAA_GUI_HOME", "").strip()
+        if not home_value: return []
+        try:
+            if self._clickfix_shell_consumer is None:
+                from mac_audit_agent.clickfix.shell_journal import ShellEventJournalConsumer
+                cursor=int(self.db.get_background_monitor_state("clickfix_shell_journal_cursor","0") or "0")
+                self._clickfix_shell_consumer=ShellEventJournalConsumer(Path(home_value)/"Library/Logs/MSAA/clickfix-events.jsonl",cursor=cursor)
+            records=self._clickfix_shell_consumer.consume()
+            self.db.set_background_monitor_state("clickfix_shell_journal_cursor",str(self._clickfix_shell_consumer.last_cursor))
+            self.db.set_background_monitor_state("clickfix_shell_daemon_bridge_status","active")
+            events=[]
+            for record in records:
+                kind=str(record.get("event_type") or "")
+                severity="high" if record.get("decision")=="block" else "medium" if record.get("decision")=="warn" else "warning"
+                events.append(self._build_event("clickfix_shell_guard_event",f"The user-session ClickFix shell guard reported {kind}. Command text was not collected; review the local event hash and rule identifiers.",severity=severity,confidence=str(record.get("confidence") or "medium"),source="clickfix_shell_guard",trigger_subsource="privacy_safe_shell_journal",current_state="prevented_or_review_required"))
+            return events
+        except Exception as exc:
+            self.db.set_background_monitor_state("clickfix_shell_daemon_bridge_status",f"error:{type(exc).__name__}")
+            self._write_log_line(f"ClickFix shell journal bridge failed: error={type(exc).__name__}")
+            return []
 
     def _sync_usb_observer_settings(self) -> None:
         if self.user_notifier_mode:
@@ -517,6 +839,8 @@ class BackgroundMonitorService:
             self.record_heartbeat()
             return self.process_pending_notifications()
         cycle_started = time.monotonic()
+        self._maybe_start_definition_update()
+        self._drain_definition_update_status()
         self._update_runtime_state()
         if not self._persistent_local_edr_enabled():
             reason = "Persistent Local EDR disabled by settings."
@@ -528,6 +852,10 @@ class BackgroundMonitorService:
             return []
         all_events: list[BackgroundMonitorEvent] = []
         all_events.extend(self.native_event_bridge.drain())
+        all_events.extend(self._drain_ransomware_prototype_events())
+        if self.system_daemon_mode:
+            all_events.extend(self._consume_clickfix_events())
+            all_events.extend(self._consume_clickfix_shell_events())
         all_events.extend(process_deployment_event_flow_request(self.db))
         detector_errors: dict[str, str] = {}
         detector_counts: dict[str, dict[str, int]] = {}
@@ -541,6 +869,7 @@ class BackgroundMonitorService:
             ("suspicious_process_detector", self._run_suspicious_process_detector),
             ("hardware_device_detector", self._run_hardware_detector),
             ("protected_monitor_integrity_detector", self._run_integrity_detector),
+            ("rce_behavior_monitor", self._run_rce_detector),
         ]
         zero_reason_map = {
             "camera_process_detector": "no capture-capable process found",
@@ -551,6 +880,7 @@ class BackgroundMonitorService:
             "suspicious_process_detector": "no suspicious process found",
             "hardware_device_detector": "no USB topology change or explicit moisture marker found",
             "protected_monitor_integrity_detector": "no protected monitor integrity change",
+            "rce_behavior_monitor": "no RCE candidate observed; degraded polling coverage remains active",
         }
         if not self._network_activity_monitoring_enabled():
             zero_reason_map["network_state_detector"] = "Network activity monitoring disabled by settings."
@@ -595,6 +925,91 @@ class BackgroundMonitorService:
         if warning is not None:
             all_events.append(warning)
         return all_events
+
+    def _run_rce_detector(self) -> list[BackgroundMonitorEvent]:
+        """Run the evidence-preserving RCE analyzer in the system daemon.
+
+        RCE records use dedicated typed tables. A summary is mirrored into
+        monitor state without duplicating or weakening the RCE evidence chain.
+        """
+        if not self.system_daemon_mode:
+            self.db.set_background_monitor_state("rce_monitor_status", "system_daemon_required")
+            return []
+        if self.rce_monitor is None:
+            self.db.set_background_monitor_state("rce_monitor_status", "DEGRADED_INITIALIZATION_FAILED")
+            return []
+        events = self.rce_monitor.run_once()
+        status = self.rce_monitor.status()
+        self.db.set_background_monitor_state("rce_monitor_status", str(status.get("state", "unknown")))
+        self.db.set_background_monitor_state("rce_monitor_sensor_mode", str(status.get("sensor_mode", "unknown")))
+        self.db.set_background_monitor_state("rce_monitor_last_cycle", str(status.get("last_cycle", "")))
+        self.db.set_background_monitor_state("rce_monitor_last_error", str(status.get("last_error", "")))
+        self.db.set_background_monitor_state("rce_monitor_event_count", str(status.get("event_count", 0)))
+        notifications: list[BackgroundMonitorEvent] = []
+        for item in events:
+            is_health = item.event_type in {
+                "RCE_SENSOR_DEGRADED",
+                "RCE_TELEMETRY_LOSS",
+                "RCE_MONITOR_HEALTH_FAILURE",
+                "PROCESS_INJECTION_SENSOR_DEGRADED",
+                "PROCESS_INJECTION_TELEMETRY_LOSS",
+            }
+            if not is_health and item.event_type != "SUSPECTED_REMOTE_CODE_EXECUTION":
+                # Precursors remain in the immutable RCE evidence repository and
+                # Host IDS. Alert Center receives the correlated investigation,
+                # not one alert for every intermediate primitive.
+                continue
+            process = item.process or item.target_process or {}
+            rule_id = item.rule_ids[0] if item.rule_ids else ("RCE-HEALTH-001" if is_health else "RCE-BEHAVIOR-001")
+            evidence = item.why_flagged or "; ".join(item.observed_behavior[:4])
+            notifications.append(
+                BackgroundMonitorEvent(
+                    event_id=f"monitor-{item.event_id}",
+                    timestamp=item.observed_at,
+                    event_type="monitor_blindness_detected" if is_health else "execution_evidence_detected",
+                    severity=item.severity if item.severity in {"info", "low", "medium", "high", "critical"} else "high",
+                    source="rce_behavior_monitor",
+                    process_name=str(process.get("name") or Path(str(process.get("executable", ""))).name),
+                    pid=process.get("pid") if isinstance(process.get("pid"), int) else None,
+                    evidence=evidence or "MSAA recorded a bounded RCE-monitor evidence candidate.",
+                    confidence="high" if item.confidence == "critical" else "low" if item.confidence == "info" else item.confidence if item.confidence in {"low", "medium", "high"} else "low",
+                    recommendation="; ".join(item.recommended_validation[:3]),
+                    metadata_json=json.dumps(
+                        {
+                            "rce_event_id": item.event_id,
+                            "rce_event_type": item.event_type,
+                            "rce_classification": item.rce_classification,
+                            "rce_subtype": item.rce_subtype,
+                            "confidence_score": item.confidence_score,
+                            "reason_codes": [reason.code for reason in item.reason_evidence],
+                            "timeline": [entry.__dict__ for entry in item.timeline],
+                            "sensor_coverage": item.sensor_coverage,
+                            "evidence_completeness": item.evidence_completeness_label,
+                            "rule_ids": item.rule_ids,
+                            "sensor_health": item.sensor_health,
+                            "telemetry_gaps": item.telemetry_gaps,
+                            "evidence_references": item.evidence_references,
+                            "raw_event_hashes": item.raw_event_hashes,
+                            "claim_boundary": "behavioral evidence; exploitation and CVE identity require validation",
+                        },
+                        sort_keys=True,
+                    ),
+                    rule_id=rule_id,
+                    rule_name="RCE sensor health" if is_health else "RCE behavior candidate",
+                    trigger_source=item.source_sensor,
+                    trigger_rule_id=rule_id,
+                    trigger_rule_name="RCE sensor health" if is_health else "RCE behavior candidate",
+                    raw_signal_summary="; ".join(item.matching_signals[:5]),
+                    normalized_signal=item.event_type,
+                    evidence_hash=item.raw_event_hashes[0] if item.raw_event_hashes else "",
+                    correlation_id=item.correlation_id,
+                    recommended_verification_steps=list(item.recommended_validation[:5]),
+                    source_trace=item.evidence_references[0] if item.evidence_references else "",
+                    duplicate_group_key=f"rce:{item.group_id}",
+                    duplicate_category="material_change",
+                )
+            )
+        return notifications
 
     def _evaluate_self_impact(
         self,
@@ -1095,6 +1510,48 @@ class BackgroundMonitorService:
             if hasattr(self.notifications, "update_security_overlay"):
                 self.notifications.update_security_overlay(event)
             return None
+        # The system daemon owns detection and persistence only. GUI policy and
+        # rendering belong exclusively to the per-user notifier. Evaluating the
+        # event here used to mark it handled (usually skipped_non_interactive),
+        # which made the notifier's read-only transport silently miss the alert.
+        if self.system_daemon_mode:
+            event.notification_sent = False
+            event.notification_error = ""
+            event.notification_returncode = None
+            event.notification_decision = "queued_for_user_notifier"
+            event.notification_reason = "system_daemon_published"
+            event.popup_allowed = True
+            self.db.update_monitor_event_notification(
+                event.event_id,
+                notification_sent=False,
+                notification_error="",
+                notification_returncode=None,
+                notification_decision=event.notification_decision,
+                notification_reason=event.notification_reason,
+                cooldown_remaining_seconds=0,
+                popup_allowed=True,
+                visible_alert_shown=False,
+                alert_style=str(event.alert_style or "neutral_grey"),
+                cooldown_suppressed=False,
+                last_suppression_reason="",
+            )
+            try:
+                self.db.update_event_alert_trace(
+                    trace_id,
+                    alert_queue_enqueued=True,
+                    notification_policy_checked=False,
+                    notification_policy_result="pending_notifier_policy",
+                    overlay_dispatch_result="queued_for_user_notifier",
+                    render_verification_status="queued_not_yet_rendered",
+                )
+            except Exception:
+                pass
+            self._write_log_line(
+                f"event published for user notifier: event_id={event.event_id} "
+                f"type={event.event_type} severity={event.severity}"
+            )
+            self._evaluate_emergency_lockdown_policy(event)
+            return event.event_id
         self._route_log_only_activity_overlay(event)
         force_visible_alert = False
         if not _skip_storm_detection:
@@ -1377,8 +1834,33 @@ class BackgroundMonitorService:
                 self.db.set_background_monitor_state("last_event_consumed_at", event.timestamp)
                 continue
             force_visible_alert = False
+            try:
+                metadata = json.loads(event.metadata_json or "{}")
+                force_visible_alert = bool(metadata.get("force_delivery") or metadata.get("bypass_cooldown") or metadata.get("requires_visible_render"))
+            except json.JSONDecodeError:
+                force_visible_alert = False
             if not self._should_notify_event(event, notify_force=force_visible_alert):
                 suppressed_count += 1
+                # notification_sent is the queue's processed bit. A policy
+                # suppression must be finalized or it remains at the head of
+                # the notifier queue forever and starves newer critical alerts.
+                event.notification_sent = True
+                event.notification_decision = event.notification_decision or "suppressed_by_policy"
+                event.notification_reason = event.notification_reason or event.last_suppression_reason or "log_only"
+                self.db.update_monitor_event_notification(
+                    event.event_id,
+                    notification_sent=True,
+                    notification_error="",
+                    notification_returncode=event.notification_returncode,
+                    notification_decision=event.notification_decision,
+                    notification_reason=event.notification_reason,
+                    cooldown_remaining_seconds=event.cooldown_remaining_seconds,
+                    popup_allowed=False,
+                    visible_alert_shown=False,
+                    alert_style=str(event.alert_style or "neutral_grey"),
+                    cooldown_suppressed=bool(event.cooldown_suppressed),
+                    last_suppression_reason=event.last_suppression_reason or event.notification_reason,
+                )
                 self.db.set_background_monitor_state("last_notification_decision", event.notification_decision or "log_only")
                 self.db.set_background_monitor_state("last_suppression_reason", event.last_suppression_reason or event.notification_reason or "log_only")
                 cursor_after = event.event_id
@@ -1442,6 +1924,15 @@ class BackgroundMonitorService:
                     last_suppression_reason=event.last_suppression_reason,
                 )
                 notified.append(event)
+                # The persistent overlay is a single visible presentation
+                # surface. Processing another popup in the same poll would
+                # overwrite its state before Qt can map and acknowledge this
+                # event. Leave remaining events queued for the next poll.
+                if bool(event.popup_allowed):
+                    cursor_after = event.event_id
+                    self.db.set_background_monitor_state("last_event_consumed", cursor_after)
+                    self.db.set_background_monitor_state("last_event_consumed_at", event.timestamp)
+                    break
             else:
                 suppressed_count += 1
                 self.db.set_background_monitor_state("last_notification_decision", event.notification_decision or "log_only")
@@ -1889,6 +2380,7 @@ class BackgroundMonitorService:
                 "launch_daemons": current_inventory["launch_daemons"],
                 "launch_agents": current_inventory["launch_agents"],
                 "login_items": current_inventory["login_items"],
+                "persistence_artifacts": current_inventory["persistence_artifacts"],
             }
         )
         self._store_current_snapshot()
@@ -2325,6 +2817,7 @@ class BackgroundMonitorService:
             snapshot["launch_daemons"] = current_inventory["launch_daemons"]
             snapshot["launch_agents"] = current_inventory["launch_agents"]
             snapshot["login_items"] = current_inventory["login_items"]
+            snapshot["persistence_artifacts"] = current_inventory["persistence_artifacts"]
         except Exception as exc:
             self._write_log_line(f"snapshot persistence error: {exc}")
         if privacy is None:
@@ -2826,7 +3319,8 @@ def _write_crash_details(db_path: Path, exc: BaseException) -> None:
 def _doctor_payload(service: BackgroundMonitorService) -> tuple[int, dict[str, object]]:
     root = runtime_root()
     monitor_path = runtime_monitor_script_path()
-    self_test_command = ["/usr/bin/python3", str(monitor_path), "--self-test", "--db-path", str(service.db.path)]
+    expected_python = compatible_python_executable()
+    self_test_command = [expected_python, str(monitor_path), "--self-test", "--db-path", str(service.db.path)]
     payload: dict[str, object] = {
         "plist_path": str(default_launch_agent_paths().plist_path),
         "stdout_log_path": str(STDOUT_MONITOR_LOG),
@@ -2858,7 +3352,7 @@ def _doctor_payload(service: BackgroundMonitorService) -> tuple[int, dict[str, o
             try:
                 plist_payload = plistlib.loads(plist_path.read_bytes())
                 program_arguments = list(plist_payload.get("ProgramArguments", []))
-                expected_program_arguments = ["/usr/bin/python3", str(monitor_path), "--run"]
+                expected_program_arguments = [expected_python, str(monitor_path), "--run"]
                 payload["plist_program_arguments"] = program_arguments
                 if program_arguments != expected_program_arguments:
                     failures.append(

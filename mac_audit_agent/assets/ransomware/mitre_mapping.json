@@ -1,0 +1,24 @@
+{
+  "metadata": {
+    "schema_version": "1.0",
+    "version": "1.0.0",
+    "updated": "2026-07-16T00:00:00Z",
+    "verified": true
+  },
+  "mappings": {
+    "encryption_burst": [{"technique_id": "T1486", "technique": "Data Encrypted for Impact", "tactic": "Impact", "url": "https://attack.mitre.org/techniques/T1486/"}],
+    "rapid_file_encryption": [{"technique_id": "T1486", "technique": "Data Encrypted for Impact", "tactic": "Impact", "url": "https://attack.mitre.org/techniques/T1486/"}],
+    "probable_ransomware_behavior": [{"technique_id": "T1486", "technique": "Data Encrypted for Impact", "tactic": "Impact", "url": "https://attack.mitre.org/techniques/T1486/"}],
+    "mass_deletion": [{"technique_id": "T1485", "technique": "Data Destruction", "tactic": "Impact", "url": "https://attack.mitre.org/techniques/T1485/"}],
+    "recovery_tamper": [{"technique_id": "T1490", "technique": "Inhibit System Recovery", "tactic": "Impact", "url": "https://attack.mitre.org/techniques/T1490/"}],
+    "defense_tamper": [{"technique_id": "T1562.001", "technique": "Impair Defenses: Disable or Modify Tools", "tactic": "Defense Evasion", "url": "https://attack.mitre.org/techniques/T1562/001/"}],
+    "launch_agent": [{"technique_id": "T1547", "technique": "Boot or Logon Autostart Execution", "tactic": "Persistence", "url": "https://attack.mitre.org/techniques/T1547/"}],
+    "launch_daemon": [{"technique_id": "T1547", "technique": "Boot or Logon Autostart Execution", "tactic": "Persistence", "url": "https://attack.mitre.org/techniques/T1547/"}],
+    "scheduled_task": [{"technique_id": "T1053", "technique": "Scheduled Task/Job", "tactic": "Persistence", "url": "https://attack.mitre.org/techniques/T1053/"}],
+    "credential_dumping": [{"technique_id": "T1003", "technique": "OS Credential Dumping", "tactic": "Credential Access", "url": "https://attack.mitre.org/techniques/T1003/"}],
+    "system_discovery": [{"technique_id": "T1082", "technique": "System Information Discovery", "tactic": "Discovery", "url": "https://attack.mitre.org/techniques/T1082/"}],
+    "directory_discovery": [{"technique_id": "T1083", "technique": "File and Directory Discovery", "tactic": "Discovery", "url": "https://attack.mitre.org/techniques/T1083/"}],
+    "application_layer_protocol": [{"technique_id": "T1071", "technique": "Application Layer Protocol", "tactic": "Command and Control", "url": "https://attack.mitre.org/techniques/T1071/"}],
+    "supported_exfiltration": [{"technique_id": "T1041", "technique": "Exfiltration Over C2 Channel", "tactic": "Exfiltration", "url": "https://attack.mitre.org/techniques/T1041/"}]
+  }
+}

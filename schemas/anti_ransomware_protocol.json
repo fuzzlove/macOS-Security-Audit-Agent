@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://msaa.local/schemas/anti-ransomware-protocol-1.0.json",
+  "title": "MSAA Anti-Ransomware IPC Envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol_version", "schema_version", "message_type", "message_id", "correlation_id", "boot_session_id", "sender_role", "sender_build_id", "created_at", "expires_at", "nonce", "payload_length", "payload"],
+  "properties": {
+    "protocol_version": {"const": "1.0"},
+    "schema_version": {"const": "1.0"},
+    "message_type": {"enum": ["SENSOR_EVENT", "HEALTH_QUERY", "HEALTH_RESPONSE", "NOTIFICATION", "ACKNOWLEDGEMENT", "ACTION_REQUEST", "ACTION_RESPONSE"]},
+    "message_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "correlation_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "incident_id": {"type": "string", "maxLength": 128},
+    "event_id": {"type": "string", "maxLength": 128},
+    "boot_session_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "sender_role": {"enum": ["NATIVE_SENSOR", "SYSTEM_ENGINE", "USER_NOTIFIER", "ADMIN_CLIENT", "DIAGNOSTIC_CLIENT"]},
+    "sender_build_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "created_at": {"type": "string", "format": "date-time", "maxLength": 64},
+    "expires_at": {"type": "string", "format": "date-time", "maxLength": 64},
+    "nonce": {"type": "string", "pattern": "^[A-Za-z0-9_-]{16,128}$"},
+    "payload_length": {"type": "integer", "minimum": 0, "maximum": 65536},
+    "payload": {"type": "object", "maxProperties": 64}
+  }
+}

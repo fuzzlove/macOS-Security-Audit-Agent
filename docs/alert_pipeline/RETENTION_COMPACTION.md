@@ -1,0 +1,5 @@
+# Retention and compaction
+
+Normal volume retains individual canonical records. An exact-duplicate storm retains the first raw event, configured initial raw records, newest raw event, and threshold, escalation, material-change, reopened, and protected records. Every receipt retains event ID, sequence, timestamps, source, fingerprint, priority, disposition, digest, and chain position. The aggregate retains counts, time range, severity/confidence, bounded entity/source distributions, and rolling digest.
+
+When an intermediate raw duplicate is compacted, `raw_retained=0` explicitly marks reduced event-level fidelity. `resilient_compactions` records count, range, policy version, reason, rolling digest, and `fidelity_reduced=1`; the chained decision audit identifies the triggering receipt. This is controlled fidelity reduction, not lossless compaction. Cleanup must not follow symlinks or delete current incident evidence. Current code compacts duplicate bodies under logical pressure but does not archive or delete ledger rows automatically; operators must capacity-plan and review retention before deployment.

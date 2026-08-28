@@ -12,6 +12,7 @@ CHECK_AREA_MAP = {
     "scan.visibility_integrity": ("CMMC-L1-SI-1", "supporting_evidence"),
     "alert.delivery_trace": ("CMMC-L2-AU-1", "direct"),
     "exports.evidence_package": ("CMMC-L2-AU-1", "supporting_evidence"),
+    "integrity.signing": ("CMMC-L2-SI-2", "supporting_evidence"),
     "scan.baseline_drift": ("CMMC-L2-CM-1", "supporting_evidence"),
     "persistence.workflow": ("CMMC-L2-CM-1", "supporting_evidence"),
     "alert.bottom_right_rendering": ("CMMC-L2-IR-1", "supporting_evidence"),

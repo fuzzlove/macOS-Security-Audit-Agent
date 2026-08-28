@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from enum import StrEnum
 from typing import Any
+
+from mac_audit_agent.compat.enum import StrEnum
 
 
 class CommandOrigin(StrEnum):

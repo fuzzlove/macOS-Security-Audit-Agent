@@ -9,7 +9,7 @@ import signal
 import socket
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +19,52 @@ from mac_audit_agent.models import RawLogEntry, utc_now_iso
 MAX_CAPTURE_DURATION_SECONDS = 600
 ALLOWED_CAPTURE_FILTERS = {"", "host 127.0.0.1", "tcp", "udp"}
 INTERFACE_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+ALLOWED_SNAPSHOT_LENGTHS = {96, 0}
+
+
+@dataclass(frozen=True)
+class PacketCaptureReadiness:
+    tcpdump_path: str
+    tcpdump_available: bool
+    interfaces: tuple[str, ...]
+    bpf_devices_present: bool
+    capture_permission_ready: bool
+    evidence_dir: str
+    evidence_dir_writable: bool
+    free_bytes: int
+    ready: bool
+    setup_steps: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def assess_packet_capture_readiness(evidence_dir: Path | None = None) -> PacketCaptureReadiness:
+    destination = evidence_dir or default_evidence_dir()
+    writable = False
+    try:
+        destination.mkdir(parents=True, exist_ok=True)
+        writable = destination.is_dir() and os.access(destination, os.W_OK)
+    except OSError:
+        pass
+    devices = sorted(Path("/dev").glob("bpf*")) if Path("/dev").exists() else []
+    permission = os.geteuid() == 0 or any(os.access(device, os.R_OK | os.W_OK) for device in devices)
+    try: free_bytes = shutil.disk_usage(destination if destination.exists() else destination.parent).free
+    except OSError: free_bytes = 0
+    interfaces = tuple(list_capture_interfaces())
+    tool = tcpdump_available()
+    steps = (
+        "Confirm written authorization, incident/case identifier, collection scope, retention, and who may access the capture.",
+        "Use macOS /usr/sbin/tcpdump. It is built in; no Python packet-capture package is required.",
+        "Administrator capture access is required. If BPF access is not configured, run the generated sudo tcpdump command in Terminal; never enter an administrator password into MSAA.",
+        "Select the narrowest interface and BPF host/port filter that still preserves the incident evidence you need.",
+        "Choose headers-only (96 bytes) for lower exposure or full packets only when payload preservation is explicitly authorized.",
+        "Verify the protected evidence folder and available disk space, then stop and hash the capture before analysis or transfer.",
+    )
+    return PacketCaptureReadiness("/usr/sbin/tcpdump", tool, interfaces, bool(devices), permission,
+                                  str(destination), writable, free_bytes,
+                                  tool and bool(interfaces) and permission and writable and free_bytes > 100 * 1024 * 1024,
+                                  steps)
 
 
 def list_capture_interfaces() -> list[str]:
@@ -45,12 +91,19 @@ def sanitize_capture_filter(value: str) -> str:
     if candidate in ALLOWED_CAPTURE_FILTERS:
         return candidate
     match = re.fullmatch(r"port\s+(\d{1,5})", candidate)
-    if not match:
+    if match:
+        port = int(match.group(1))
+        if port < 1 or port > 65535:
+            raise ValueError("Port filter must be between 1 and 65535.")
+        return f"port {port}"
+    # This remains an argv-only invocation (never a shell command). Permit useful
+    # analyst-reviewed BPF expressions while preventing option injection.
+    if len(candidate) > 256 or not re.fullmatch(r"[A-Za-z0-9.:_()/ -]+", candidate):
+        raise ValueError("Capture filter contains unsupported characters or is too long.")
+    tokens = candidate.replace("(", " ( ").replace(")", " ) ").split()
+    if not tokens or any(token.startswith("-") for token in tokens) or candidate.count("(") != candidate.count(")"):
         raise ValueError("Capture filter is invalid.")
-    port = int(match.group(1))
-    if port < 1 or port > 65535:
-        raise ValueError("Port filter must be between 1 and 65535.")
-    return f"port {port}"
+    return candidate
 
 
 def validate_capture_duration(value: int) -> int:
@@ -70,7 +123,10 @@ def packet_capture_output_paths(evidence_dir: Path, timestamp: str) -> tuple[Pat
     return evidence_dir / f"{stem}.pcap", evidence_dir / f"{stem}.json"
 
 
-def build_tcpdump_command(interface: str, output_path: Path, duration_seconds: int, capture_filter: str = "") -> list[str]:
+def build_tcpdump_command(interface: str, output_path: Path, duration_seconds: int, capture_filter: str = "",
+                          snapshot_length: int = 96) -> list[str]:
+    if snapshot_length not in ALLOWED_SNAPSHOT_LENGTHS:
+        raise ValueError("Snapshot length must be 96 (headers) or 0 (full packet).")
     command = [
         "/usr/sbin/tcpdump",
         "-i",
@@ -81,6 +137,9 @@ def build_tcpdump_command(interface: str, output_path: Path, duration_seconds: i
         str(validate_capture_duration(duration_seconds)),
         "-W",
         "1",
+        "-s",
+        str(snapshot_length),
+        "-U",
     ]
     normalized_filter = sanitize_capture_filter(capture_filter)
     if normalized_filter:
@@ -116,6 +175,7 @@ class PacketCaptureSession:
         capture_filter: str,
         evidence_dir: Path,
         user_confirmed: bool,
+        snapshot_length: int = 96,
         popen_factory: Any = subprocess.Popen,
     ) -> None:
         self.interface = sanitize_interface_name(interface)
@@ -123,11 +183,14 @@ class PacketCaptureSession:
         self.capture_filter = sanitize_capture_filter(capture_filter)
         self.evidence_dir = evidence_dir
         self.user_confirmed = user_confirmed
+        if snapshot_length not in ALLOWED_SNAPSHOT_LENGTHS:
+            raise ValueError("Snapshot length must be 96 (headers) or 0 (full packet).")
+        self.snapshot_length = snapshot_length
         self.popen_factory = popen_factory
         timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
         self.capture_id = f"packet-capture-{timestamp}"
         self.pcap_path, self.metadata_path = packet_capture_output_paths(self.evidence_dir, timestamp)
-        self.command = build_tcpdump_command(self.interface, self.pcap_path, self.duration_seconds, self.capture_filter)
+        self.command = build_tcpdump_command(self.interface, self.pcap_path, self.duration_seconds, self.capture_filter, self.snapshot_length)
         self.process: Any = None
         self.start_time = ""
         self.end_time = ""
@@ -215,6 +278,9 @@ class PacketCaptureSession:
             try:
                 sha256 = compute_sha256(self.pcap_path)
                 file_size = self.pcap_path.stat().st_size
+                self.pcap_path.with_suffix(self.pcap_path.suffix + ".sha256").write_text(
+                    f"{sha256}  {self.pcap_path.name}\n", encoding="utf-8"
+                )
             except OSError:
                 sha256 = ""
                 file_size = 0
@@ -225,16 +291,24 @@ class PacketCaptureSession:
             "duration_seconds": self.duration_seconds,
             "interface": self.interface,
             "filter": self.capture_filter,
+            "snapshot_length": self.snapshot_length,
             "pcap_path": str(self.pcap_path),
             "pcap_sha256": sha256,
             "file_size_bytes": file_size,
             "command_used": self.command,
+            "capture_program": "/usr/sbin/tcpdump",
+            "collector_hostname": socket.gethostname(),
+            "collector_effective_uid": os.geteuid(),
             "exit_code": self.exit_code,
             "stderr_summary": self.stderr_text[:500],
             "user_confirmed": bool(self.user_confirmed),
             "status": self.status,
         }
-        self.metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        self.metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        metadata_digest = compute_sha256(self.metadata_path)
+        self.metadata_path.with_suffix(self.metadata_path.suffix + ".sha256").write_text(
+            f"{metadata_digest}  {self.metadata_path.name}\n", encoding="utf-8"
+        )
         logs = [
             RawLogEntry("packet_capture", self.manual_command_preview(), self.start_time or utc_now_iso(), None, "", f"capture {self.status} started interface={self.interface}"),
             RawLogEntry("packet_capture", str(self.pcap_path), metadata["end_time"], self.exit_code, metadata["stderr_summary"], f"status={self.status} sha256={sha256 or 'unavailable'}"),

@@ -11,9 +11,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from mac_audit_agent.alert_styles import get_alert_style, validate_alert_styles
+from mac_audit_agent.alert_styles import get_alert_style, resolve_alert_severity, validate_alert_styles
 from mac_audit_agent.models import AlertDeliveryRecord, BackgroundMonitorEvent, EventAlertTrace, NotificationCapabilities, utc_now_iso
 from mac_audit_agent.rules import canonical_event_type, rule_for_event
+from mac_audit_agent.runtime.python_compat import current_python_gui_compatibility
+from mac_audit_agent.ui.gui_context import ensure_overlay_render_allowed
 
 
 SEVERITY_LEVELS = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
@@ -25,6 +27,12 @@ IMPORTANT_EVENT_TYPES = {
     "camera_activity_confirmed",
     "camera_activity_stopped",
     "microphone_activity_suspected",
+    "possible_keylogger_detected",
+    "dylib_hijack_detected",
+    "microphone_activity_confirmed",
+    "microphone_activity_stopped",
+    "capture_device_connected",
+    "capture_device_disconnected",
     "capture_capable_process_observed",
     "screen_locked",
     "screen_unlocked",
@@ -61,7 +69,10 @@ IMPORTANT_EVENT_TYPES = {
 ACTIVITY_OVERLAY_EVENT_TYPES = {
     "bluetooth_device_connected",
     "camera_activity_confirmed",
+    "possible_keylogger_detected",
+    "dylib_hijack_detected",
     "camera_activity_stopped",
+    "microphone_activity_confirmed",
     "camera_activity_suspected",
     "capture_capable_process_observed",
     "capture_capable_process_closed",
@@ -183,6 +194,13 @@ MANDATORY_VISIBLE_ALERT_EVENT_TYPES = {
     "heartbeat_stale",
     "db_not_updating",
     "notifier_not_running",
+    "rootkit_suspect_detected",
+    "hidden_port_mismatch_detected",
+    "suspicious_kernel_extension_detected",
+    "suspicious_system_extension_detected",
+    "system_integrity_weakened",
+    "persistence_network_correlation_detected",
+    "visibility_mismatch_detected",
 }
 MANDATORY_IDLE_NOTICE_EVENT_TYPES = {
     "idle_resume_detected",
@@ -226,6 +244,13 @@ MANDATORY_CRITICAL_EVENT_TYPES = {
     "heartbeat_stale",
     "db_not_updating",
     "notifier_not_running",
+    "rootkit_suspect_detected",
+    "hidden_port_mismatch_detected",
+    "suspicious_kernel_extension_detected",
+    "suspicious_system_extension_detected",
+    "system_integrity_weakened",
+    "persistence_network_correlation_detected",
+    "visibility_mismatch_detected",
 }
 MANDATORY_USB_VISIBLE_EVENT_TYPES = {
     "new_usb_device_detected",
@@ -264,6 +289,13 @@ CRITICAL_POPUP_ALLOWLIST = {
     "system_moisture_detected",
     "protected_monitor_tamper_detected",
     "monitor_self_impact_warning",
+    "rootkit_suspect_detected",
+    "hidden_port_mismatch_detected",
+    "suspicious_kernel_extension_detected",
+    "suspicious_system_extension_detected",
+    "system_integrity_weakened",
+    "persistence_network_correlation_detected",
+    "visibility_mismatch_detected",
 }
 BROWSER_HELPER_KEYWORDS = {
     "operahelper",
@@ -286,6 +318,12 @@ DEFAULT_EVENT_PREFERENCES: dict[str, dict[str, object]] = {
     "launchdaemon_added": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
     "alert_storm_detected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
     "camera_activity_confirmed": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "possible_keylogger_detected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "dylib_hijack_detected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "microphone_activity_confirmed": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "overlay"},
+    "microphone_activity_stopped": {"enabled": True, "severity": "info", "notify": False, "cooldown_seconds": 60, "notification_mode": "none"},
+    "capture_device_connected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "capture_device_disconnected": {"enabled": True, "severity": "info", "notify": False, "cooldown_seconds": 60, "notification_mode": "none"},
     "camera_activity_stopped": {"enabled": True, "severity": "info", "notify": False, "cooldown_seconds": 60, "notification_mode": "none"},
     "camera_activity_suspected": {"enabled": True, "severity": "medium", "notify": False, "cooldown_seconds": 120, "notification_mode": "none"},
     "microphone_activity_suspected": {"enabled": True, "severity": "medium", "notify": False, "cooldown_seconds": 120, "notification_mode": "none"},
@@ -333,6 +371,13 @@ DEFAULT_EVENT_PREFERENCES: dict[str, dict[str, object]] = {
     "system_moisture_detected": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
     "protected_monitor_tamper_detected": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
     "user_notifier_integrity_mismatch": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "rootkit_suspect_detected": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "hidden_port_mismatch_detected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "suspicious_kernel_extension_detected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "suspicious_system_extension_detected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "system_integrity_weakened": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "persistence_network_correlation_detected": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
+    "visibility_mismatch_detected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
     "integrity_verified": {"enabled": True, "severity": "info", "notify": False, "cooldown_seconds": 300, "notification_mode": "none"},
     "integrity_modified": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
     "integrity_missing_files": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "overlay"},
@@ -373,6 +418,10 @@ VISIBLE_ALERT_CATEGORY_EVENT_TYPES = {
         "camera_activity_confirmed",
         "camera_activity_stopped",
         "microphone_activity_suspected",
+        "microphone_activity_confirmed",
+        "microphone_activity_stopped",
+        "capture_device_connected",
+        "capture_device_disconnected",
         "lid_opened",
         "lid_closed",
         "possible_lid_opened",
@@ -642,10 +691,12 @@ def send_alert_dialog(title, message, runner=None):
 
 
 class NotificationManager:
-    def __init__(self, db, runner=None, popen_factory=None) -> None:
+    def __init__(self, db, runner=None, popen_factory=None, *, role: str = "") -> None:
         self.db = db
         self.runner = runner or subprocess.run
         self.popen_factory = popen_factory or subprocess.Popen
+        self.role = role
+        self._custom_popen_factory = popen_factory is not None
         self.alert_queue = AlertQueueManager(self)
         self.alert_overlay_manager = AlertOverlayManager(self)
         self._cfaa_ack_process = None
@@ -1209,6 +1260,16 @@ class NotificationManager:
         event.event_type = event_type
         if not hasattr(event, "_original_severity_for_alert"):
             setattr(event, "_original_severity_for_alert", str(event.severity))
+        cvss_score = None
+        try:
+            metadata = json.loads(str(event.metadata_json or "{}"))
+            if isinstance(metadata, dict):
+                cvss_score = metadata.get("cvss_score")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            metadata = {}
+        if cvss_score not in {None, ""}:
+            event.severity = resolve_alert_severity(str(event.severity), cvss_score=cvss_score)
+            setattr(event, "_cvss_score_for_alert", cvss_score)
         category = self._alert_category_for_event(event_type)
         monitoring_disabled_reason = self._monitoring_disabled_reason(event_type, settings)
         if monitoring_disabled_reason:
@@ -1263,7 +1324,7 @@ class NotificationManager:
             return AlertDecision(True, style, "idle activity after inactivity", cooldown, persistent)
 
         if self._is_mandatory_visible_event(event_type):
-            persistent = event.severity == "critical" and bool(settings.get("persistent_alerts", True))
+            persistent = event.severity in {"high", "critical"} and bool(settings.get("persistent_alerts", True))
             style = self._style_for_visible_alert(event, category=category)
             cooldown = self.alert_queue.cooldown_for(event)
             last_timestamp = self.db.get_background_monitor_state(self._visible_alert_last_key(event), "")
@@ -1277,7 +1338,7 @@ class NotificationManager:
             return AlertDecision(True, style, f"{category} mandatory visible alert", cooldown, persistent)
 
         if event.severity in {"medium", "high", "critical"}:
-            persistent = event.severity == "critical" and bool(settings.get("persistent_alerts", True))
+            persistent = event.severity in {"high", "critical"} and bool(settings.get("persistent_alerts", True))
             style = self._style_for_visible_alert(event, category=category)
             cooldown = self.alert_queue.cooldown_for(event)
             last_timestamp = self.db.get_background_monitor_state(self._visible_alert_last_key(event), "")
@@ -1842,7 +1903,10 @@ class NotificationManager:
         attempts: list[tuple[list[str], object]] = []
         overlay_shown = self.show_visible_security_alert(event, reason=event.notification_reason or "policy", force=force)
         overlay_attempted = True
-        overlay_success = bool(getattr(event, "visible_alert_shown", False))
+        # A successful dispatch is sufficient for the notifier queue to hand
+        # ownership to the renderer. Actual visibility is acknowledged
+        # asynchronously by security_overlay and recorded on the alert trace.
+        overlay_success = bool(overlay_shown)
         notification_mode = str(settings.get("notification_mode", "overlay"))
         fallback_enabled = bool(settings.get("os_notification_fallback_enabled", False))
         if fallback_enabled and not overlay_shown and notification_mode in {"notification", "both"}:
@@ -1975,11 +2039,18 @@ class NotificationManager:
         same_type = previous.get("active", False) and previous.get("event_type") == event.event_type
         summary = event.evidence.strip().replace("\n", " ")
         alert_style = get_alert_style(decision.style)
-        recommended_action = "Preserve Evidence Snapshot" if alert_style.severity in {"critical", "high"} else "Review Timeline"
+        if event.event_type == "system_moisture_detected":
+            recommended_action = "Disconnect power and stop charging if safe"
+        else:
+            recommended_action = "Preserve Evidence Snapshot" if alert_style.severity in {"critical", "high"} else "Review Timeline"
         payload = {
             "active": True,
+            "event_id": event.event_id,
+            "trace_id": self._event_alert_trace_id(event),
+            "source_db_path": str(self.db.path),
             "event_type": event.event_type,
             "severity": str(getattr(event, "_original_severity_for_alert", event.severity)),
+            "cvss_score": getattr(event, "_cvss_score_for_alert", None),
             "canonical_severity": alert_style.severity,
             "style": decision.style,
             "title": self._overlay_title_for(event, decision),
@@ -1998,6 +2069,32 @@ class NotificationManager:
             "cooldown_suppressed": bool(event.cooldown_suppressed),
             "cooldown_remaining_seconds": int(event.cooldown_remaining_seconds or 0),
             "buttons": self._overlay_buttons_for(event),
+            "action_buttons": [
+                {
+                    "label": "Open Timeline",
+                    "action_type": "open_timeline",
+                    "enabled": bool(event.event_id),
+                    "tooltip": "Open the Security Timeline for this alert.",
+                    "accessible_name": "Open Timeline",
+                    "payload": {"event_id": event.event_id, "trace_id": self._event_alert_trace_id(event)},
+                },
+                {
+                    "label": "Preserve Evidence Snapshot",
+                    "action_type": "preserve_evidence_snapshot",
+                    "enabled": bool(event.event_id),
+                    "tooltip": "Preserve a non-destructive evidence snapshot for review.",
+                    "accessible_name": "Preserve Evidence Snapshot",
+                    "payload": {"event_id": event.event_id, "trace_id": self._event_alert_trace_id(event)},
+                },
+                {
+                    "label": "Acknowledge",
+                    "action_type": "acknowledge",
+                    "enabled": True,
+                    "tooltip": "Acknowledge and hide this alert.",
+                    "accessible_name": "Acknowledge",
+                    "payload": {"event_id": event.event_id, "trace_id": self._event_alert_trace_id(event)},
+                },
+            ],
         }
         temporary = state_path.with_suffix(".tmp")
         try:
@@ -2038,21 +2135,27 @@ class NotificationManager:
                 overlay_error=str(exc),
             )
             return False
-        event.visible_alert_id = getattr(event, "visible_alert_id", "") or event.event_id
         self.db.set_background_monitor_state("security_overlay_status", f"active: {event.event_type}")
         self.db.set_background_monitor_state("last_alert_decision", event.notification_decision or decision.reason)
         self.db.set_background_monitor_state("suppressed_alert_count", self.db.get_background_monitor_state("suppressed_alert_count", "0"))
         self.db.set_background_monitor_state("last_suppression_reason", event.last_suppression_reason or decision.reason)
         launched = self._ensure_security_overlay_process()
         self._increment_state_counter("overlay_render_attempts")
-        event.visible_alert_shown = bool(launched)
+        # Starting the renderer is not evidence that macOS mapped a window.
+        # The overlay process records the event-specific visible acknowledgement
+        # after Qt has shown and exposed the widget.
+        event.visible_alert_shown = False
+        event.visible_alert_id = ""
         self.db.set_background_monitor_state("overlay_dispatch_result", "SUCCESS" if launched else "FAILED")
         self.db.set_background_monitor_state("overlay_manager_alive", "1" if launched or self._security_overlay_pid_alive() else "0")
         if not launched:
             count = int(self.db.get_background_monitor_state("overlay_error_count", "0") or "0") + 1
             self.db.set_background_monitor_state("overlay_error_count", str(count))
-            self.db.set_background_monitor_state("last_overlay_exception", "overlay manager not running or failed to launch")
-            self.db.set_background_monitor_state("last_overlay_error", "overlay manager not running or failed to launch")
+            existing_overlay_error = self.db.get_background_monitor_state("last_overlay_error", "")
+            generic_overlay_error = "overlay manager not running or failed to launch"
+            if not existing_overlay_error:
+                self.db.set_background_monitor_state("last_overlay_exception", generic_overlay_error)
+                self.db.set_background_monitor_state("last_overlay_error", generic_overlay_error)
             self.db.set_background_monitor_state("last_alert_failure_stage", "overlay_process_launch")
             self.db.set_background_monitor_state("alert_delivery_degraded", "1")
         else:
@@ -2064,8 +2167,6 @@ class NotificationManager:
             self.db.set_background_monitor_state("last_alert_color", alert_style.background)
             self.db.set_background_monitor_state("last_alert_opacity", "1.0")
             self.db.set_background_monitor_state("alert_style_validation", "PASS" if not validate_alert_styles() else "FAIL")
-            self.db.set_background_monitor_state("last_alert_displayed_at", event.timestamp)
-            self.db.set_background_monitor_state(self._visible_alert_last_key(event), event.timestamp)
             self._play_visible_alert_sound(event)
         self._record_alert_delivery(
             event,
@@ -2082,8 +2183,9 @@ class NotificationManager:
             alert_required=True,
             alert_suppressed=False if decision.show else True,
             alert_suppression_reason="" if decision.show else (event.last_suppression_reason or decision.reason),
-            visible_alert_id=event.visible_alert_id,
-            displayed_at=event.timestamp if launched else "",
+            visible_alert_id="",
+            displayed_at="",
+            render_verification_status="overlay_process_launched_render_pending" if launched else "failed_overlay_exception",
         )
         self._write_alert_pipeline_log(
             event,
@@ -2120,19 +2222,68 @@ class NotificationManager:
     def _ensure_security_overlay_process(self) -> bool:
         if self._security_overlay_pid_alive():
             return True
-        script_path = Path(__file__).resolve().parent / "security_overlay.py"
+        if not self._custom_popen_factory:
+            allowed, reason = ensure_overlay_render_allowed(role=self.role)
+            if not allowed:
+                self.db.set_background_monitor_state("last_overlay_error", "overlay_render_disallowed_in_current_context")
+                self.db.set_background_monitor_state("last_overlay_exception", reason)
+                self.db.set_background_monitor_state("last_alert_failure_stage", "failed_qt_context")
+                self.db.set_background_monitor_state("overlay_render_context_reason", reason)
+                return False
+            compat = current_python_gui_compatibility()
+            self.db.set_background_monitor_state("user_notifier_python_executable", compat.executable)
+            self.db.set_background_monitor_state("user_notifier_python_version", compat.version)
+            if not compat.supported_for_gui:
+                self.db.set_background_monitor_state("last_overlay_error", "unsupported_python_gui_runtime")
+                self.db.set_background_monitor_state("last_overlay_exception", compat.reason)
+                self.db.set_background_monitor_state("last_alert_failure_stage", "failed_qt_context")
+                return False
         state_path = self._overlay_state_path()
         pid_path = self._overlay_pid_path()
         try:
+            stderr_target = self.db.logs_dir / "security_overlay.stderr.log"
+            stdout_target = self.db.logs_dir / "security_overlay.stdout.log"
+            writable, _reason = self._path_parent_writable(stderr_target)
+            if not writable:
+                user_log_dir = Path.home() / "Library" / "Logs" / "MacAuditAgent"
+                stderr_target = user_log_dir / "security_overlay.stderr.log"
+                stdout_target = user_log_dir / "security_overlay.stdout.log"
+            stderr_target.parent.mkdir(parents=True, exist_ok=True)
+            stderr_handle = stderr_target.open("a", encoding="utf-8")
+            stdout_handle = stdout_target.open("a", encoding="utf-8")
             process = self.popen_factory(
-                [sys.executable, str(script_path), "--state-path", str(state_path)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                [
+                    sys.executable,
+                    "-m",
+                    "mac_audit_agent.security_overlay",
+                    "--state-path",
+                    str(state_path),
+                    "--parent-pid",
+                    str(os.getpid()),
+                ],
+                stdout=stdout_handle,
+                stderr=stderr_handle,
                 text=True,
                 env={**os.environ, **NOTIFICATION_PATH_ENV},
             )
+            try:
+                stderr_handle.close()
+                stdout_handle.close()
+            except Exception:
+                pass
             pid_path.parent.mkdir(parents=True, exist_ok=True)
             pid_path.write_text(str(process.pid), encoding="utf-8")
+            self.db.set_background_monitor_state("security_overlay_stderr_path", str(stderr_target))
+            self.db.set_background_monitor_state("security_overlay_stdout_path", str(stdout_target))
+            # Catch immediate import/preflight failures instead of blessing a
+            # Popen PID that has already exited.
+            if hasattr(process, "poll"):
+                time.sleep(0.15)
+                if process.poll() is not None:
+                    pid_path.unlink(missing_ok=True)
+                    self.db.set_background_monitor_state("last_overlay_error", "overlay_process_exited_during_startup")
+                    self.db.set_background_monitor_state("last_alert_failure_stage", "overlay_process_startup")
+                    return False
             return True
         except OSError as exc:
             self._write_fallback_log(f"security overlay launch unavailable: {exc}")
@@ -2397,6 +2548,8 @@ class NotificationManager:
             return
 
     def _overlay_title_for(self, event: BackgroundMonitorEvent, decision: AlertDecision) -> str:
+        if event.event_type == "system_moisture_detected":
+            return "Critical Liquid/Moisture Warning"
         if event.event_type == "lockdown_mode_requires_user_action":
             return "Emergency Lockdown Action Required"
         if event.event_type == "emergency_lockdown_failed":
@@ -2416,6 +2569,17 @@ class NotificationManager:
         return readable or "Security Alert"
 
     def _overlay_details_for(self, event: BackgroundMonitorEvent, decision: AlertDecision) -> str:
+        if event.event_type == "system_moisture_detected":
+            try:
+                metadata = json.loads(event.metadata_json or "{}")
+            except json.JSONDecodeError:
+                metadata = {}
+            component = str(metadata.get("affected_component", "unspecified hardware area")) if isinstance(metadata, dict) else "unspecified hardware area"
+            return (
+                f"macOS emitted an affirmative liquid/moisture warning for {component}. Permanent physical damage is not confirmed. "
+                "If exposure is plausible, disconnect power and accessories if safe, stop charging, shut down the Mac, and arrange "
+                "Apple or authorized-service inspection. Do not use heat or compressed air. Preserve this alert and related logs."
+            )
         if event.event_type == "lockdown_mode_requires_user_action":
             return (
                 "A critical security event triggered Emergency Lockdown policy. macOS requires user confirmation to enable Lockdown Mode. "

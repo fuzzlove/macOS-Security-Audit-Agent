@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {
+      "id": "organization_yara",
+      "name": "Organization YARA Feed",
+      "type": "yara",
+      "enabled": false,
+      "url": "https://definitions.example.invalid/msaa/macos.yar",
+      "trust_level": 4,
+      "source_confidence": 0.9,
+      "required": false,
+      "license": "administrator-review-required",
+      "commercial_use_status": "REVIEW_REQUIRED",
+      "update_interval_seconds": 21600,
+      "timeout_seconds": 30,
+      "max_download_bytes": 67108864
+    },
+    {
+      "id": "organization_hashes",
+      "name": "Organization Malware Hash Feed",
+      "type": "json_intelligence",
+      "enabled": false,
+      "url": "https://definitions.example.invalid/msaa/malware-hashes.json",
+      "trust_level": 4,
+      "source_confidence": 0.9,
+      "required": false,
+      "license": "administrator-review-required",
+      "commercial_use_status": "REVIEW_REQUIRED",
+      "update_interval_seconds": 21600,
+      "timeout_seconds": 30,
+      "max_download_bytes": 104857600,
+      "auth_header": "Auth-Key",
+      "auth_env": "MSAA_DEFINITION_SOURCE_API_KEY"
+    }
+  ]
+}

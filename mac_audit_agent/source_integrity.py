@@ -5,7 +5,10 @@ from pathlib import Path
 from typing import Protocol
 
 from mac_audit_agent.build_identity import detect_build_identity
+from mac_audit_agent.integrity.authority import IntegrityAuthority
+from mac_audit_agent.integrity.dev_manifest import verify_manifest as verify_development_manifest
 from mac_audit_agent.integrity.manifest import create_integrity_manifest
+from mac_audit_agent.integrity.manifest_paths import integrity_manifest_paths
 from mac_audit_agent.integrity.verifier import verify_integrity_manifest
 from mac_audit_agent.version import APP_VERSION, current_git_commit
 
@@ -73,7 +76,7 @@ def _legacy_verify_from_store(baseline: dict, *, root: Path) -> dict:
         "exact_mismatch_reason": "",
         "baseline_file_count": len(baseline.get("files", {}) if isinstance(baseline.get("files", {}), dict) else {}),
     }
-    if trust_state != "trusted":
+    if trust_state not in {"trusted", "trusted_development_baseline"}:
         status = "stale" if trust_state == "expired" else trust_state if trust_state in {"draft", "revoked", "unknown"} else "unknown"
         return {
             **base_payload,
@@ -190,6 +193,10 @@ def verify_source_integrity(
         payload.setdefault("trust_state", "unknown")
         return payload
 
+    authority_payload = _authority_source_integrity_payload(base)
+    if authority_payload["status"] == "verified" or not initialize:
+        return authority_payload
+
     baseline = _load_baseline(store)
     if baseline:
         if root is None:
@@ -197,6 +204,16 @@ def verify_source_integrity(
             if recorded_root:
                 base = Path(str(recorded_root)).expanduser().resolve(strict=False)
         return _legacy_verify_from_store(baseline, root=base)
+
+    if initialize:
+        # Security invariant: initialization must not silently trust a source
+        # checkout or opportunistically adopt a manifest from disk.
+        return _missing_source_integrity_payload(base, initialize=initialize)
+
+    canonical_manifest = integrity_manifest_paths(base).source_development_manifest
+    if canonical_manifest.exists():
+        summary = verify_development_manifest(base, manifest_path=canonical_manifest, policy="dev")
+        return _development_summary_payload(summary, base)
 
     default_manifest = base / "msaa_integrity_manifest.json"
     if default_manifest.exists():
@@ -210,14 +227,113 @@ def verify_source_integrity(
         payload.setdefault("trust_state", "unknown")
         return payload
 
+    return _missing_source_integrity_payload(base, initialize=initialize)
+
+
+def _authority_source_integrity_payload(base: Path) -> dict:
+    status = IntegrityAuthority(base, "dev").status()
+    verified = status.status == "verified" and status.trust_state == "trusted_developer_machine_signed_manifest"
+    changed = list(status.source_modified_files or status.modified_files)
+    missing = list(status.missing_files)
+    added = list(status.extra_files)
+    overall_status = "verified" if verified else "modified" if changed or missing or added else "failed"
+    return {
+        "status": overall_status,
+        "overall_status": overall_status,
+        "trust_state": status.trust_state,
+        "integrity_health_display_title": status.integrity_health_display_title,
+        "integrity_health_display_message": status.integrity_health_display_message,
+        "source_type": "source_tree",
+        "manifest_path": status.manifest_path,
+        "signature_path": status.signature_path,
+        "manifest_app_version": APP_VERSION,
+        "current_app_version": detect_build_identity(base, install_mode="source_tree").app_version,
+        "manifest_build_id": "",
+        "current_build_id": detect_build_identity(base, install_mode="source_tree").build_id,
+        "manifest_git_commit": "",
+        "current_git_commit": current_git_commit(),
+        "mismatch_details": changed + missing + added,
+        "exact_mismatch_reason": status.reason,
+        "tamper_detected": not verified and bool(changed or missing or added),
+        "baseline_valid": verified,
+        "file_count": status.checked_files + len(changed) + len(missing),
+        "matched_count": status.checked_files,
+        "mismatched_count": len(changed),
+        "missing_count": len(missing),
+        "extra_count": len(added),
+        "changed_files": changed,
+        "missing_files": missing,
+        "added_files": added,
+        "generated_modified_files": list(status.generated_modified_files),
+        "hash_algorithms": HASH_ALGORITHMS,
+        "last_checked": "",
+        "errors": [] if verified else [status.reason],
+        "warnings": [] if verified else [status.recommended_action],
+        "recommended_actions": [status.recommended_action] if status.recommended_action else [],
+        "authority": status.to_dict(),
+    }
+
+
+def _development_summary_payload(summary, base: Path) -> dict:
+    metadata = summary.manifest_metadata
+    changed = [item.relative_path for item in summary.modified_files]
+    missing = [item.relative_path for item in summary.missing_files]
+    added = [item.relative_path for item in summary.unexpected_files]
+    overall_status = "verified" if summary.ok else "modified"
+    return {
+        "status": overall_status,
+        "overall_status": overall_status,
+        "trust_state": "trusted_development_baseline" if summary.ok else "modified_unapproved",
+        "integrity_health_display_title": "Trusted Development Baseline" if summary.ok else "Unapproved Source Modification",
+        "integrity_health_display_message": "MSAA source files match the signed development integrity manifest." if summary.ok else "Protected source files differ from the selected integrity manifest.",
+        "source_type": "source_tree",
+        "manifest_path": metadata.get("manifest_path", str(integrity_manifest_paths(base).source_development_manifest)),
+        "manifest_app_version": APP_VERSION,
+        "current_app_version": detect_build_identity(base, install_mode="source_tree").app_version,
+        "manifest_build_id": metadata.get("build_id", ""),
+        "current_build_id": detect_build_identity(base, install_mode="source_tree").build_id,
+        "manifest_git_commit": metadata.get("git_commit", ""),
+        "current_git_commit": current_git_commit(),
+        "mismatch_details": changed + missing + added,
+        "exact_mismatch_reason": "Canonical development manifest verified." if summary.ok else "Canonical development manifest differs from source tree.",
+        "tamper_detected": not summary.ok,
+        "baseline_valid": summary.ok,
+        "file_count": summary.protected_files_verified + len(changed) + len(missing),
+        "matched_count": summary.protected_files_verified,
+        "changed_files": changed,
+        "missing_files": missing,
+        "added_files": added,
+        "hash_algorithms": HASH_ALGORITHMS,
+        "last_checked": metadata.get("generated_at", ""),
+        "errors": summary.schema_errors + summary.signature_errors,
+        "warnings": ["Canonical development manifest is unsigned."] if summary.unsigned_manifest_warning else [],
+        "recommended_actions": [summary.to_dict().get("recommended_remediation", "")],
+    }
+
+
+def _missing_source_integrity_payload(base: Path, *, initialize: bool = False) -> dict:
     # Security invariant: verification never records current files as trusted.
     # Use record_source_integrity_baseline() or the manifest CLI after a trusted install/build.
+    paths = integrity_manifest_paths(base)
+    legacy_present = any(path.exists() for path in paths.legacy_manifest_paths)
+    trust_state = "manifest_path_divergence" if legacy_present else "missing_manifest"
+    reason = (
+        "Legacy manifest exists but the canonical development manifest is missing."
+        if legacy_present
+        else "No trusted source integrity manifest exists."
+    )
     return {
-        "status": "unknown",
-        "overall_status": "unknown",
-        "trust_state": "unknown",
+        "status": "failed",
+        "overall_status": "failed",
+        "trust_state": trust_state,
+        "integrity_health_display_title": "Manifest Path Mismatch" if legacy_present else "Missing Integrity Manifest",
+        "integrity_health_display_message": (
+            "Integrity tools are using different manifest paths. Rebuild using the canonical policy manifest."
+            if legacy_present
+            else "No canonical integrity manifest exists for the selected policy."
+        ),
         "source_type": "source_tree",
-        "manifest_path": "",
+        "manifest_path": str(paths.source_development_manifest),
         "manifest_app_version": "",
         "current_app_version": detect_build_identity(base, install_mode="source_tree").app_version,
         "manifest_build_id": "",
@@ -225,7 +341,7 @@ def verify_source_integrity(
         "manifest_git_commit": "",
         "current_git_commit": current_git_commit(),
         "mismatch_details": [],
-        "exact_mismatch_reason": "No trusted source integrity manifest exists.",
+        "exact_mismatch_reason": reason,
         "tamper_detected": False,
         "baseline_valid": False,
         "file_count": 0,
@@ -234,7 +350,7 @@ def verify_source_integrity(
         "added_files": [],
         "hash_algorithms": HASH_ALGORITHMS,
         "last_checked": "",
-        "errors": ["No trusted source integrity manifest exists."],
+        "errors": [reason],
         "warnings": ["Current files were not recorded as trusted automatically." if initialize else "Verification requires an existing trusted manifest."],
-        "recommended_actions": ["Create a trusted manifest only after installing or building MSAA from a trusted source."],
+        "recommended_actions": ["Run integrity rehash --policy dev only after confirming this MSAA source tree is trusted."],
     }

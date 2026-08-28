@@ -7,7 +7,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from mac_audit_agent.event_correlation import correlation_id_for_event
 from mac_audit_agent.models import BackgroundMonitorEvent, Finding, ScanResult, utc_now_iso
+from mac_audit_agent.runtime.app_paths import get_ai_summary_path
+from mac_audit_agent.secure_io import MigrationResult, PersistenceResult, migrate_legacy_json, secure_atomic_write_json
 from mac_audit_agent.storage import AuditDatabase
 from mac_audit_agent.workflow_layer import InvestigatorWorkflowLayer, WorkflowContextWindow
 
@@ -186,6 +189,7 @@ class IntrusionCorrelationReport:
     recent_events: list[dict[str, Any]] = field(default_factory=list)
     ai_summary: dict[str, Any] = field(default_factory=dict)
     ai_summary_path: str = ""
+    ai_summary_persistence: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -199,6 +203,7 @@ class IntrusionCorrelationReport:
             "recent_events": list(self.recent_events),
             "ai_summary": dict(self.ai_summary),
             "ai_summary_path": self.ai_summary_path,
+            "ai_summary_persistence": dict(self.ai_summary_persistence),
             "counts": {
                 "patterns": len(self.patterns),
                 "top_patterns": len(self.top_patterns),
@@ -242,7 +247,6 @@ class IntrusionCorrelationEngine:
             redact_usernames=self.db.get_background_monitor_state("redact_usernames", "1") == "1",
             redact_ips=self.db.get_background_monitor_state("redact_ips", "1") == "1",
         )
-        ai_path = self.write_ai_summary(ai_summary)
         return IntrusionCorrelationReport(
             generated_at=now,
             scan_id=scan_id,
@@ -253,7 +257,8 @@ class IntrusionCorrelationEngine:
             coverage=coverage,
             recent_events=recent_events,
             ai_summary=ai_summary,
-            ai_summary_path=str(ai_path),
+            ai_summary_path="",
+            ai_summary_persistence={"attempted": False, "succeeded": False, "path": None, "error_code": None, "error_message": None},
         )
 
     def build_context_window_for_event(self, event: dict[str, Any] | BackgroundMonitorEvent, *, window_minutes: int = 15) -> WorkflowContextWindow:
@@ -499,7 +504,7 @@ class IntrusionCorrelationEngine:
                 "event_type": str(item.get("event_type", "")),
                 "severity": str(item.get("severity", "")),
                 "evidence": str(item.get("evidence", item.get("summary", ""))),
-                "correlation_id": str(item.get("correlation_id", "")),
+                "correlation_id": correlation_id_for_event(item),
             }
             for item in ordered
         ]
@@ -728,7 +733,7 @@ class IntrusionCorrelationEngine:
                     "event_type": item.get("event_type", ""),
                     "severity": item.get("severity", ""),
                     "summary": _redact(str(item.get("evidence", item.get("summary", ""))), usernames=redact_usernames, ips=redact_ips),
-                    "correlation_id": item.get("correlation_id", ""),
+                    "correlation_id": correlation_id_for_event(item),
                 }
             )
         return {
@@ -757,8 +762,18 @@ class IntrusionCorrelationEngine:
             gaps.append("No recent monitor events are available.")
         return gaps
 
+    def persist_ai_summary(self, summary: dict[str, Any], output_path: Path | None = None) -> PersistenceResult:
+        target = Path(output_path) if output_path is not None else get_ai_summary_path()
+        return secure_atomic_write_json(summary, target, base_directory=target.parent, enforce_directory_mode=output_path is None)
+
+    def migrate_legacy_ai_summary(self, *, legacy_path: Path | None = None, destination: Path | None = None) -> MigrationResult:
+        source = Path(legacy_path) if legacy_path is not None else Path.home() / "reports" / "ai_summary.json"
+        target = Path(destination) if destination is not None else get_ai_summary_path()
+        return migrate_legacy_json(source, target)
+
     def write_ai_summary(self, summary: dict[str, Any], output_path: Path | None = None) -> Path:
-        base = output_path or (self.db.path.parent / "reports" / "ai_summary.json")
-        base.parent.mkdir(parents=True, exist_ok=True)
-        base.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
-        return base
+        """Backward-compatible explicit export wrapper using secure persistence."""
+        result = self.persist_ai_summary(summary, output_path)
+        if not result.succeeded or result.path is None:
+            raise OSError(result.error_code or "REPORT_ATOMIC_REPLACE_FAILED")
+        return result.path

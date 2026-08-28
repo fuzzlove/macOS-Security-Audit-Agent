@@ -309,6 +309,7 @@ class CollectorSuite:
         }
         physical_devices = self._collect_physical_device_artifacts(system_info, command_results)
         hardware = self._collect_hardware_artifact(system_info, command_results)
+        attacker_discovery_exposure = self._collect_attacker_discovery_exposure(command_results)
         system_integrity_artifacts["physical_devices"] = physical_devices
         system_integrity_artifacts["hardware"] = hardware
         system_integrity_report = SystemIntegrityEngine().analyze_artifacts(system_integrity_artifacts)
@@ -347,10 +348,37 @@ class CollectorSuite:
             "ssh_artifacts": ssh_artifacts,
             "physical_devices": physical_devices,
             "hardware": hardware,
+            "attacker_discovery_exposure": attacker_discovery_exposure,
             "system_integrity": system_integrity_report.to_dict(),
         }
         scan_result.baseline_diff = comparison.to_dict()
         return scan_result
+
+    def _collect_attacker_discovery_exposure(self, command_results: list) -> dict:
+        checks = []
+        for result in command_results:
+            command_id = self._result_command_id(result)
+            if not command_id.startswith("discovery."):
+                continue
+            exit_code = get_exit_code(result)
+            output = get_stdout(result)
+            checks.append(
+                {
+                    "command_id": command_id,
+                    "status": "observable" if exit_code == 0 and bool(output.strip()) else "not_observed" if exit_code == 0 else "collection_error",
+                    "exit_code": exit_code,
+                    "output_present": bool(output.strip()),
+                    "output_length": len(output),
+                    "evidence_reference": f"command_result:{command_id}",
+                }
+            )
+        return {
+            "schema_version": "1.0",
+            "qualification": "These checks describe information visible to a local process. Observable metadata is not by itself a vulnerability and does not prove attacker discovery activity.",
+            "checks": checks,
+            "observable_count": sum(item["status"] == "observable" for item in checks),
+            "collection_error_count": sum(item["status"] == "collection_error" for item in checks),
+        }
 
     def collect_network_discovery(
         self,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from mac_audit_agent.packet_capture import (
     MAX_CAPTURE_DURATION_SECONDS,
     PacketCaptureSession,
+    assess_packet_capture_readiness,
     build_tcpdump_command,
     sanitize_capture_filter,
     sanitize_interface_name,
@@ -65,8 +67,41 @@ def test_interface_name_is_sanitized() -> None:
 def test_filter_input_is_sanitized() -> None:
     assert sanitize_capture_filter("tcp") == "tcp"
     assert sanitize_capture_filter("port 443") == "port 443"
+    assert sanitize_capture_filter("host 192.0.2.4 and tcp port 443") == "host 192.0.2.4 and tcp port 443"
+    with pytest.raises(ValueError): sanitize_capture_filter("-i en1")
+    with pytest.raises(ValueError): sanitize_capture_filter("tcp; whoami")
+
+
+def test_readiness_checks_tool_permission_storage_and_interfaces(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("mac_audit_agent.packet_capture.tcpdump_available", lambda: True)
+    monkeypatch.setattr("mac_audit_agent.packet_capture.list_capture_interfaces", lambda: ["en0"])
+    monkeypatch.setattr("mac_audit_agent.packet_capture.os.geteuid", lambda: 0)
+    readiness = assess_packet_capture_readiness(tmp_path / "evidence")
+    assert readiness.ready
+    assert readiness.capture_permission_ready
+    assert readiness.evidence_dir_writable
+
+
+def test_capture_dependency_installer_uses_only_allowlisted_visible_homebrew_command(tmp_path: Path, monkeypatch):
+    import mac_audit_agent.dependency_installer as installer
+
+    brew = tmp_path / "brew"
+    brew.write_text("#!/bin/sh\n", encoding="utf-8")
+    brew.chmod(0o700)
+    captured = {}
+
+    def runner(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(command, 0, "opened", "")
+
+    monkeypatch.setattr(installer, "HOMEBREW_PATHS", (brew,))
+    result = installer.open_network_capture_install_in_terminal(str(brew), "wireshark-chmodbpf", runner=runner)
+    assert result.status == "terminal_opened"
+    assert "install --cask wireshark-chmodbpf" in captured["command"][2]
+    assert captured["kwargs"]["shell"] is False
     with pytest.raises(ValueError):
-        sanitize_capture_filter("tcp and port 443")
+        installer.open_network_capture_install_in_terminal(str(brew), "not-approved", runner=runner)
 
 
 def test_command_is_built_as_argv_list_not_shell_string(tmp_path: Path) -> None:
@@ -139,6 +174,9 @@ def test_metadata_json_is_written_and_sha256_calculated(tmp_path: Path) -> None:
     metadata = json.loads(session.metadata_path.read_text(encoding="utf-8"))
     assert metadata["pcap_sha256"] == result.metadata["pcap_sha256"]
     assert metadata["file_size_bytes"] == len(b"pcap-bytes")
+    assert metadata["snapshot_length"] == 96
+    assert session.pcap_path.with_suffix(".pcap.sha256").exists()
+    assert session.metadata_path.with_suffix(".json.sha256").exists()
 
 
 def test_failed_tcpdump_creates_clear_error(tmp_path: Path) -> None:

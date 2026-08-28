@@ -9,6 +9,22 @@ from mac_audit_agent.operational_health import (
     OperationalHealthState,
     analyze_operational_health,
 )
+from .manager import SensorReliabilityCoordinator, default_coordinator
+from .models import (
+    CapabilityHealth,
+    CoverageLevel,
+    Criticality,
+    DependencyState,
+    PermissionState,
+    PlatformHealthReport,
+    PlatformState,
+    ReasonCode,
+    SensorDependency,
+    SensorDescriptor,
+    SensorHealthProvider,
+    SensorHealthSnapshot,
+    SensorState,
+)
 
 __all__ = [
     "HealthCheck",
@@ -20,4 +36,19 @@ __all__ = [
     "OperationalHealthReport",
     "OperationalHealthState",
     "analyze_operational_health",
+    "CapabilityHealth",
+    "CoverageLevel",
+    "Criticality",
+    "DependencyState",
+    "PermissionState",
+    "PlatformHealthReport",
+    "PlatformState",
+    "ReasonCode",
+    "SensorDependency",
+    "SensorDescriptor",
+    "SensorHealthProvider",
+    "SensorHealthSnapshot",
+    "SensorReliabilityCoordinator",
+    "SensorState",
+    "default_coordinator",
 ]

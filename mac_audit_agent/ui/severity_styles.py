@@ -5,13 +5,6 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-try:
-    from PySide6.QtCore import Qt
-    from PySide6.QtGui import QBrush, QColor, QFont
-except Exception:  # pragma: no cover - allows report/export imports without Qt
-    Qt = None  # type: ignore[assignment]
-    QBrush = QColor = QFont = None  # type: ignore[assignment]
-
 
 SOLID_HEX_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
@@ -179,6 +172,12 @@ def make_severity_tooltip(value: Any, score: Any = None, score_type: str | None 
 def apply_severity_to_table_item(item, severity: Any, score: Any = None, score_type: str | None = None, *, reasons: list[str] | None = None, text: str | None = None) -> None:
     if item is None:
         return
+    try:
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QBrush, QColor, QFont
+    except Exception:  # pragma: no cover - report/export contexts do not need Qt styling
+        Qt = None  # type: ignore[assignment]
+        QBrush = QColor = QFont = None  # type: ignore[assignment]
     normalized = normalize_severity(severity, score, score_type)
     style = SEVERITY_STYLES[normalized]
     item.setText(text if text is not None else style.label)

@@ -1,0 +1,234 @@
+[
+  {
+    "fixture_id": "CF-DESTRUCT-001",
+    "name": "Delete Root Filesystem",
+    "category": "destructive_symbolic",
+    "description": "Delete Root Filesystem supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_DELETE_ROOT_FILESYSTEM>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "destructive_filesystem_intent"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-DESTRUCT-002",
+    "name": "Delete User Home",
+    "category": "destructive_symbolic",
+    "description": "Delete User Home supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_DELETE_USER_HOME>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "destructive_filesystem_intent"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-DESTRUCT-003",
+    "name": "Erase System Volume",
+    "category": "destructive_symbolic",
+    "description": "Erase System Volume supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_ERASE_SYSTEM_VOLUME>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "destructive_disk_intent"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-DESTRUCT-004",
+    "name": "Overwrite Disk Device",
+    "category": "destructive_symbolic",
+    "description": "Overwrite Disk Device supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_OVERWRITE_DISK_DEVICE>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "raw_disk_write_intent"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-DESTRUCT-005",
+    "name": "Recursive Permission Destruction",
+    "category": "destructive_symbolic",
+    "description": "Recursive Permission Destruction supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_RECURSIVE_PERMISSION_DESTRUCTION>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "destructive_permission_change"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-DESTRUCT-006",
+    "name": "Disable Security Controls And Delete Data",
+    "category": "destructive_symbolic",
+    "description": "Disable Security Controls And Delete Data supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_DISABLE_SECURITY_CONTROLS_AND_DELETE_DATA>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "compound_destructive_intent"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-DESTRUCT-007",
+    "name": "Fork Or Resource Exhaustion",
+    "category": "destructive_symbolic",
+    "description": "Fork Or Resource Exhaustion supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_FORK_OR_RESOURCE_EXHAUSTION>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "denial_of_service_intent"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-DESTRUCT-008",
+    "name": "Mass Process Termination",
+    "category": "destructive_symbolic",
+    "description": "Mass Process Termination supplied only as inert scanner data.",
+    "command_text": "<ATTEMPT_MASS_PROCESS_TERMINATION>",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "destructive_process_control"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  }
+]

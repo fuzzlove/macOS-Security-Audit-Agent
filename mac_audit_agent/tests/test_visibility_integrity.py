@@ -91,3 +91,11 @@ def test_report_includes_visibility_status(tmp_path: Path) -> None:
     html = html_path.read_text(encoding="utf-8")
     assert "Visibility Integrity" in html
     assert "Component Statuses" in html
+
+
+def test_visibility_ui_exposes_component_specific_context_repairs() -> None:
+    source=(Path(__file__).resolve().parents[1]/"ui/main_window.py").read_text(encoding="utf-8")
+    assert "_show_visibility_repair_menu" in source
+    assert '"System Daemon Status":panel.repair_system_monitor_deployment' in source
+    assert '"User Notifier Status":panel.repair_user_alert_agent' in source
+    assert '"Apple Exposure Assessment Freshness":lambda:self.refresh_apple_security_forecast' in source

@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://msaa.local/schemas/rce-event-1.0.json",
+  "title": "MSAA RCE Event",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "event_id", "event_type", "observed_at", "severity", "confidence", "confidence_basis", "review_state", "rule_ids", "observed_behavior", "matching_signals", "unknowns", "evidence_references", "cve_correlations", "redaction_status", "event_classification", "sensor_reliability", "telemetry_gaps", "source_process", "target_process", "normalized_primitives", "injection_likelihood", "maliciousness_confidence", "technique_match_confidence", "novelty_score", "evidence_completeness"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "event_id": {"type": "string", "minLength": 1},
+    "event_type": {"enum": ["RCE_BEHAVIOR_CANDIDATE", "POSSIBLE_REMOTE_CODE_EXECUTION", "LIKELY_REMOTE_CODE_EXECUTION", "CONFIRMED_REMOTE_CODE_EXECUTION", "RCE_VULNERABILITY_EXPOSURE", "CVE_BEHAVIORAL_SIMILARITY", "CVE_PROBABLE_MATCH", "CVE_EXACT_PRODUCT_VERSION_MATCH", "RCE_SENSOR_DEGRADED", "RCE_TELEMETRY_LOSS", "RCE_POLICY_TAMPER", "RCE_MONITOR_HEALTH_FAILURE", "PROCESS_INJECTION_SENSOR_DEGRADED", "PROCESS_INJECTION_TELEMETRY_LOSS"]},
+    "severity": {"enum": ["info", "low", "medium", "high", "critical"]},
+    "confidence": {"enum": ["low", "medium", "high"]},
+    "review_state": {"enum": ["OPEN", "UNREVIEWED", "INVESTIGATING"]},
+    "disposition": {"type": "string"},
+    "observed_behavior": {"type": "array", "items": {"type": "string"}},
+    "matching_signals": {"type": "array", "items": {"type": "string"}},
+    "cve_correlations": {"type": "array", "items": {"type": "object"}}
+    ,"injection_analysis": {"type": "object"}
+    ,"event_classification": {"type": "string"}
+    ,"sensor_reliability": {"type": "integer", "minimum": 0, "maximum": 100}
+    ,"telemetry_gaps": {"type": "array", "items": {"type": "string"}}
+    ,"source_process": {"type": "object"}
+    ,"target_process": {"type": "object"}
+    ,"normalized_primitives": {"type": "array", "items": {"type": "string"}}
+    ,"injection_likelihood": {"type": "integer", "minimum": 0, "maximum": 100}
+    ,"maliciousness_confidence": {"type": "integer", "minimum": 0, "maximum": 100}
+    ,"technique_match_confidence": {"type": "integer", "minimum": 0, "maximum": 100}
+    ,"novelty_score": {"type": "integer", "minimum": 0, "maximum": 100}
+    ,"evidence_completeness": {"type": "integer", "minimum": 0, "maximum": 100}
+  }
+}

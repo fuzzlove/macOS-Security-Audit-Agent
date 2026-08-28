@@ -2,14 +2,15 @@ from __future__ import annotations
 
 from mac_audit_agent.help.help_center import DEFAULT_HELP_CENTER
 from mac_audit_agent.help.topic_models import HelpTopic
+from mac_audit_agent.help.diagnostic_registry import resolve_diagnostic_topic
 
 
 def _topics() -> dict[str, HelpTopic]:
     return DEFAULT_HELP_CENTER.topics
 
 
-def get_help_topic(topic_id: str) -> HelpTopic | None:
-    return DEFAULT_HELP_CENTER.get_topic(topic_id)
+def get_help_topic(topic_id) -> HelpTopic | None:
+    return resolve_diagnostic_topic(topic_id) or DEFAULT_HELP_CENTER.get_topic(str(topic_id).strip().lower().replace("-", "_"))
 
 
 def list_help_topics() -> list[HelpTopic]:

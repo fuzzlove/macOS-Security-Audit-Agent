@@ -22,8 +22,37 @@ MOISTURE_RE = re.compile(
     r"|\b(?:detected|present)\b.{0,48}\b(?:moisture|liquid|water)\b",
     re.IGNORECASE,
 )
+NEGATED_MOISTURE_RE = re.compile(
+    r"\b(?:no|not|without)\b.{0,32}\b(?:moisture|liquid|water)\b"
+    r"|\b(?:moisture|liquid|water)\b.{0,32}\b(?:not\s+detected|absent|cleared|resolved|normal|false|no\s+longer)\b"
+    r"|\b(?:moisture|liquid|water)\s*(?:detected|present|warning)?\s*[:=]\s*(?:0|false|no|off)\b",
+    re.IGNORECASE,
+)
 SELF_QUERY_MARKERS = {"log run noninteractively", "eventmessage contains", "--predicate"}
 INTERNAL_USB_PORT_TYPE = "2"
+
+
+def is_affirmative_moisture_marker(value: str) -> bool:
+    """Return true only for an explicit, non-negated liquid/moisture warning."""
+    text = " ".join(str(value).split())
+    if not text or any(marker in text.lower() for marker in SELF_QUERY_MARKERS):
+        return False
+    return bool(MOISTURE_RE.search(text)) and not bool(NEGATED_MOISTURE_RE.search(text))
+
+
+def moisture_affected_component(value: str) -> str:
+    text = str(value).lower()
+    if any(token in text for token in ("usb-c", "usbc", "type-c")):
+        return "USB-C port"
+    if "thunderbolt" in text:
+        return "Thunderbolt port"
+    if any(token in text for token in ("charging port", "charge port", "charger", "power adapter")):
+        return "charging interface"
+    if "keyboard" in text:
+        return "keyboard area"
+    if "trackpad" in text:
+        return "trackpad area"
+    return "unspecified hardware area"
 
 
 def run_command(command: list[str]) -> tuple[int, str, str]:
@@ -73,7 +102,7 @@ class HardwareMonitor:
         moisture_markers = {
             line.strip()[:500]
             for line in marker_text.splitlines()
-            if MOISTURE_RE.search(line) and not any(marker in line.lower() for marker in SELF_QUERY_MARKERS)
+            if is_affirmative_moisture_marker(line)
         }
         capability = "monitoring explicit registry and unified-log markers" if hpm_code == 0 or log_code == 0 else "explicit-marker monitoring unavailable"
         return HardwareMonitorSnapshot(
@@ -134,16 +163,35 @@ class HardwareMonitor:
             events.extend(self.nearby_bluetooth_events(previous.nearby_bluetooth_devices, current.nearby_bluetooth_devices, timestamp=timestamp))
         previous_markers = previous.moisture_markers if previous else set()
         for marker in sorted(current.moisture_markers - previous_markers):
+            affected_component = moisture_affected_component(marker)
             events.append(
                 self._event(
                     timestamp=timestamp,
                     event_type="system_moisture_detected",
                     severity="critical",
                     source="hardware_moisture_marker",
-                    evidence=f"System moisture-related marker detected: {marker}",
+                    evidence=(
+                        "macOS hardware telemetry emitted an affirmative liquid/moisture warning marker "
+                        f"for {affected_component}: {marker}"
+                    ),
                     confidence="high",
-                    recommendation="Disconnect external power and accessories, stop using the affected port, and inspect the system before reconnecting devices.",
-                    metadata={"marker": marker, "capability": current.moisture_capability},
+                    recommendation=(
+                        "If liquid contact is plausible, disconnect external power and accessories if safe, stop using the "
+                        "affected interface, shut the Mac down, and do not charge it. Do not use heat or compressed air. "
+                        "Arrange Apple or authorized-service inspection and preserve this alert as evidence. If no liquid "
+                        "contact occurred, validate the source as a possible hardware-log artifact."
+                    ),
+                    metadata={
+                        "marker": marker,
+                        "capability": current.moisture_capability,
+                        "affected_component": affected_component,
+                        "hardware_risk_type": "liquid_or_moisture_warning",
+                        "observation_status": "AFFIRMATIVE_SYSTEM_MARKER",
+                        "physical_damage_status": "POSSIBLE_NOT_CONFIRMED",
+                        "requires_human_confirmation": True,
+                        "evidence_source": "macOS I/O Registry and/or unified log",
+                        "safety_priority": "disconnect_power_and_stop_charging_if_safe",
+                    },
                     rule=rule_for_event("system_moisture_detected"),
                     previous_state="no moisture marker",
                     current_state=marker,
@@ -576,29 +624,79 @@ class HardwareMonitor:
 
 
 class USBReconnectObserver:
-    def __init__(self, monitor: HardwareMonitor, poll_seconds: float = 1.0, quiet_window_seconds: float = 0.0) -> None:
+    _owner_lock = threading.RLock()
+    _active_owner: "USBReconnectObserver | None" = None
+
+    def __init__(self, monitor: HardwareMonitor, poll_seconds: float = 1.0, quiet_window_seconds: float = 0.0, max_queue_size: int = 1024) -> None:
         self.monitor = monitor
         self.poll_seconds = max(0.25, poll_seconds)
         self.quiet_window_seconds = max(0.0, quiet_window_seconds)
-        self.events: queue.Queue[BackgroundMonitorEvent] = queue.Queue()
+        self.events: queue.Queue[BackgroundMonitorEvent] = queue.Queue(maxsize=max(1, max_queue_size))
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._state = "STOPPED"
+        self._lifecycle_lock = threading.RLock()
+        self._generation = 0
+        self.last_error = ""
+
+    @property
+    def state(self) -> str:
+        with self._lifecycle_lock:
+            return self._state
 
     @property
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def start(self) -> None:
-        if self.running:
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="mac-audit-usb-observer", daemon=True)
-        self._thread.start()
+    def start(self) -> bool:
+        with self._lifecycle_lock, self._owner_lock:
+            if self.running or self._state in {"STARTING", "RUNNING"}:
+                return False
+            owner = type(self)._active_owner
+            if owner is not None and owner is not self and owner.running:
+                self._state = "FAILED"
+                self.last_error = "THR314001 duplicate USB observer start rejected"
+                raise RuntimeError(self.last_error)
+            type(self)._active_owner = self
+            self._state = "STARTING"
+            self._stop.clear()
+            self._generation += 1
+            self._thread = threading.Thread(target=self._run_owned, args=(self._generation,), name="mac-audit-usb-observer", daemon=False)
+            self._thread.start()
+            self._state = "RUNNING"
+            return True
 
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=max(1.0, self.poll_seconds * 2))
+    def stop(self) -> bool:
+        with self._lifecycle_lock:
+            thread = self._thread
+            if thread is None:
+                self._state = "STOPPED"
+                return True
+            self._state = "STOPPING"
+            self._stop.set()
+        thread.join(timeout=max(1.0, self.poll_seconds * 2))
+        stopped = not thread.is_alive()
+        with self._lifecycle_lock, self._owner_lock:
+            self._state = "STOPPED" if stopped else "FAILED"
+            if stopped:
+                self._thread = None
+                if type(self)._active_owner is self:
+                    type(self)._active_owner = None
+            else:
+                self.last_error = "THR314002 USB observer did not stop within the bounded timeout"
+        return stopped
+
+    def _run_owned(self, generation: int) -> None:
+        try:
+            self._run()
+        except Exception as exc:
+            with self._lifecycle_lock:
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                self._state = "FAILED"
+        finally:
+            with self._owner_lock:
+                if self._generation == generation and type(self)._active_owner is self:
+                    type(self)._active_owner = None
 
     def drain(self) -> list[BackgroundMonitorEvent]:
         drained = []
@@ -607,6 +705,16 @@ class USBReconnectObserver:
                 drained.append(self.events.get_nowait())
             except queue.Empty:
                 return drained
+
+    def _enqueue(self, event: BackgroundMonitorEvent) -> bool:
+        """Apply bounded backpressure without silently dropping security events."""
+        while not self._stop.is_set():
+            try:
+                self.events.put(event, timeout=max(0.25, self.poll_seconds))
+                return True
+            except queue.Full:
+                continue
+        return False
 
     def _run(self) -> None:
         previous = self.monitor.collect_usb_devices()
@@ -621,7 +729,8 @@ class USBReconnectObserver:
                 if self.quiet_window_seconds <= 0:
                     new_events = self.monitor.usb_connection_events(previous, current)
                     for event in new_events:
-                        self.events.put(event)
+                        if not self._enqueue(event):
+                            return
                 else:
                     if pending_previous is None:
                         pending_previous = previous
@@ -642,7 +751,8 @@ class USBReconnectObserver:
                             continue
                     if event.event_type == "usb_inventory_changed" and skipped_transient_removal:
                         continue
-                    self.events.put(event)
+                    if not self._enqueue(event):
+                        return
                 pending_previous = None
                 pending_current = None
             previous = current

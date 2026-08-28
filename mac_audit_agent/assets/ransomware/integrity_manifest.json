@@ -1,0 +1,11 @@
+{
+  "schema_version": "1.0",
+  "version": "1.0.0",
+  "generated": "2026-07-16T00:00:00Z",
+  "algorithm": "sha256",
+  "files": {
+    "government_references.json": "a26cf4713d262c54f1f037d139a525bcdde5053ccb13a8bcdbbe904fbaeabb77",
+    "mitre_mapping.json": "c3774f9b21b3f36b9273afc787ff83654e9ca47f49c5193eb572e2178f3e394f",
+    "response_playbooks.json": "da5da0edac0aff18b91eb119a1feb9689139578d1ff85ba1336db116fd82dc3d"
+  }
+}

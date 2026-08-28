@@ -21,6 +21,20 @@ MECHANISM_MITRE: dict[str, list[str]] = {
     "support_directory": ["T1059"],
     "user_group": ["T1136"],
     "tcc_indicator": ["T1562"],
+    "login_hook": ["T1037.002"],
+    "logout_hook": ["T1037.002"],
+    "startup_script": ["T1037"],
+    "event_rule": ["T1546"],
+    "directory_services_plugin": ["T1546"],
+    "spotlight_importer": ["T1546"],
+    "quicklook_plugin": ["T1546"],
+    "dylib_insert": ["T1574.006"],
+    "dock_tile_plugin": ["T1546"],
+    "embedded_login_helper": ["T1547.015"],
+    "ssh_authorized_key": ["T1098.004"],
+    "ssh_configuration": ["T1098"],
+    "applescript_persistence": ["T1059.002", "T1546"],
+    "application_bundle": ["T1547.015"],
 }
 
 

@@ -12,6 +12,7 @@ CONTEXT_HELP_TOPICS: dict[str, str] = {
     "Operational Health": "operational_health",
     "Apple Exposure Assessment": "apple_exposure",
     "Persistence Intelligence": "persistence_intelligence",
+    "Keylogger Detection": "keylogger_detection",
     "Network Intelligence": "network_intelligence",
     "Live Response Collection": "live_response",
     "Family & Safety Center": "family_safety",
@@ -20,6 +21,7 @@ CONTEXT_HELP_TOPICS: dict[str, str] = {
     "Settings": "settings",
     "Integrity Verification": "integrity_verification",
     "Pre-UAT Audit": "pre_uat_audit",
+    "Framework Coverage": "framework_coverage",
 }
 
 

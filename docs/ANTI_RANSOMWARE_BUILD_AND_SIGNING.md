@@ -1,0 +1,7 @@
+# Anti-Ransomware Build and Signing
+
+Stable production helpers use `/Applications/Mac Audit Agent.app/Contents/Helpers` and `/Library/Application Support/MacAuditAgent/bin`; persistent services never use one-file extraction, Homebrew Python, PYTHONPATH, or a checkout. Required CI secrets are `DEVELOPER_ID_APPLICATION`, `DEVELOPER_ID_INSTALLER`, Apple Team ID, provisioning profile, and notary credentials; none are embedded.
+
+The intended sequence is native release build, PyInstaller one-directory helpers, nested signing with least entitlements, main-app signing, `pkgbuild`/`productbuild`, `codesign --verify --deep --strict`, entitlement inspection, `spctl --assess`, `notarytool submit --wait`, staple, and validation. The Endpoint Security daemon is wrapped in `MSAAEndpointSecuritySensor.app` so its approved Developer ID provisioning profile can be embedded at `Contents/embedded.provisionprofile`. The sensor signature claims only the profile-bound application identifier, Team ID, and `com.apple.developer.endpoint-security.client`; the entitlement is not applied to the Python engine, containment helper, or GUI.
+
+Set `MSAA_TEAM_ID`, `MSAA_DEVELOPER_ID_APPLICATION_IDENTITY`, and `MSAA_PROVISIONING_PROFILE`, then run `scripts/sign_active_containment_release.sh`. Signing fails unless the profile authorizes the exact sensor App ID and Endpoint Security entitlement and contains the selected signing certificate. The current machine still has zero valid signing identities and no approved profile, so no signed artifact was produced here.

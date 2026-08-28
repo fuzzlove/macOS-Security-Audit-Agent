@@ -77,11 +77,13 @@ def test_db_path_alignment_flags_user_db_when_system_daemon_is_active(tmp_path: 
     user_db_path = tmp_path / "user.sqlite"
     system_db_path = tmp_path / "system.sqlite"
     AuditDatabase(system_db_path).record_monitor_heartbeat("2026-07-05T12:00:00+00:00")
+    AuditDatabase(user_db_path).set_background_monitor_state("monitor_mode", "system")
 
     def fake_default_monitor_db_path(scope: str | None = None) -> Path:
         return system_db_path if scope == "system" else user_db_path
 
     monkeypatch.setattr(resolver, "default_monitor_db_path", fake_default_monitor_db_path)
+    monkeypatch.setattr(__import__("mac_audit_agent.runtime.topology", fromlist=["SYSTEM_DB"]), "SYSTEM_DB", system_db_path)
 
     alignment = resolver.validate_db_path_alignment(
         settings_db_path=user_db_path,
@@ -124,14 +126,18 @@ def test_release_readiness_audit_reports_blocked_release_without_blocking_manual
 
     checks = run_release_audit(context)
 
+    assert checks[0].check_id == "release.readiness_report_generated"
     assert checks[0].status == "PASS"
     assert checks[0].evidence["release_readiness_report_generated"] is True
     assert checks[0].evidence["release_status"] == "blocked"
     assert checks[0].evidence["release_ready_for_public_distribution"] is False
     assert checks[0].evidence["release_blocking_count"] == 1
+    assert checks[1].check_id == "release.public_distribution_gate"
+    assert checks[1].status == "BLOCKER"
 
 
-def test_pre_uat_audit_merges_duplicate_check_ids(tmp_path: Path) -> None:
+def test_pre_uat_audit_rejects_duplicate_check_ids(tmp_path: Path) -> None:
+    import pytest
     from mac_audit_agent.quality.audit_models import AuditReport, FunctionalCheck
     from mac_audit_agent.quality.pre_uat_audit import _add_unique_check
 
@@ -140,12 +146,12 @@ def test_pre_uat_audit_merges_duplicate_check_ids(tmp_path: Path) -> None:
     duplicate = FunctionalCheck("exports.word", "Exports", "Word", "Word export", "high").failed("missing dependency", "Install dependency.")
 
     _add_unique_check(report, first)
-    _add_unique_check(report, duplicate)
+    with pytest.raises(ValueError, match="duplicate check ID rejected: exports.word"):
+        _add_unique_check(report, duplicate)
 
     assert len(report.checks) == 1
     assert report.checks[0].check_id == "exports.word"
-    assert report.checks[0].status == "FAIL"
-    assert report.checks[0].evidence["duplicate_merged"] is True
+    assert report.checks[0].status == "PASS"
 
 
 def test_alert_trace_storage_prevents_overlay_success_when_event_store_failed(tmp_path: Path) -> None:

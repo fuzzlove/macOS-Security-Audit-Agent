@@ -7,7 +7,7 @@ name = "macos-security-audit-agent"
 version = "1.0b0"
 description = "Local-first macOS security audit, monitoring, and investigation agent."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.9,<3.15"
 license = "MIT"
 authors = [
   { name = "Mac Audit Agent contributors" }
@@ -20,33 +20,127 @@ classifiers = [
   "Intended Audience :: System Administrators",
   "Operating System :: MacOS",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Security",
   "Topic :: System :: Monitoring",
 ]
 dependencies = [
-  "PySide6>=6.6",
-  "openpyxl>=3.1",
-  "python-docx>=1.1",
+  "cryptography>=43,<47",
+  "certifi>=2025.1",
 ]
 
 [project.optional-dependencies]
-dev = [
-  "pytest>=7.4",
+compat = [
+  # Python 3.11 added tomllib. This keeps configuration-backed optional
+  # features usable without making the stdlib-only doctor depend on pip.
+  "tomli>=2.0,<3; python_version < '3.11'",
 ]
-packaging = [
+dev = [
+  "pytest>=8.4",
+  "pytest-timeout>=2.4",
+  "ruff>=0.5",
   "build>=1.2",
   "twine>=5.0",
+  "pyinstaller>=6.15",
 ]
-pyinstaller = [
-  "pyinstaller>=6.0",
+development = [
+  "pytest>=8.4",
+  "pytest-timeout>=2.4",
+  "ruff>=0.5",
+  "build>=1.2",
+  "twine>=5.0",
+  "pyinstaller>=6.15",
+]
+gui = [
+  "PySide6>=6.10.1,<6.12; platform_system == 'Darwin' and python_version >= '3.10' and python_version < '3.15'",
+  "PyYAML>=6.0.2,<7",
+]
+office = [
+  "openpyxl>=3.1",
+  "python-docx>=1.1",
+]
+core = []
+crypto = [
+  "cryptography>=43,<47",
+]
+security-rules = [
+  "yara-python>=4.5,<5",
+]
+definitions = [
+  "cryptography>=43,<47",
+  "certifi>=2025.1",
+  "yara-python>=4.5,<5",
+]
+exports = [
+  "openpyxl>=3.1,<4",
+  "python-docx>=1.1,<2",
+  "reportlab>=4,<5",
+  "yara-python>=4.5,<5",
+]
+network = [
+  "psutil>=6,<8",
+  "requests>=2.32,<3",
+  "certifi>=2025.1",
+]
+forensics = [
+  "psutil>=6,<8",
+  "cryptography>=43,<47",
+]
+release = [
+  "build>=1.2,<2",
+  "twine>=5,<7",
+  "packaging>=24,<27",
+]
+licensing-server = [
+  "stripe>=15.4,<16",
+  "gunicorn>=23,<24",
+]
+all = [
+  "tomli>=2.0,<3; python_version < '3.11'",
+  "PySide6>=6.10.1,<6.12; platform_system == 'Darwin' and python_version >= '3.10' and python_version < '3.15'",
+  "openpyxl>=3.1",
+  "python-docx>=1.1",
+  "cryptography>=43,<47",
+  "psutil>=6,<8",
+  "requests>=2.32,<3",
+  "reportlab>=4,<5",
+  "PyYAML>=6.0.2,<7",
+  "yara-python>=4.5,<5",
+]
+build = [
+  "build>=1.2",
+  "twine>=5.0",
+  "pyinstaller>=6.15",
+]
+desktop = [
+  "PySide6>=6.10.1,<6.12; platform_system == 'Darwin' and python_version >= '3.10' and python_version < '3.15'",
+  "PyYAML>=6.0.2,<7",
+  "openpyxl>=3.1",
+  "python-docx>=1.1",
+  "cryptography>=43,<47",
+  "certifi>=2025.1",
+  "yara-python>=4.5,<5",
+]
+test = [
+  "pytest>=8.4",
+  "pytest-timeout>=2.4",
 ]
 
 [project.scripts]
-macos-security-audit-agent = "mac_audit_agent.cli:main"
+msaa = "mac_audit_agent.bootstrap:main"
+msaa-doctor = "mac_audit_agent.runtime.doctor:doctor_main"
+msaa-cli = "mac_audit_agent.cli:main"
+msaa-integrity = "mac_audit_agent.integrity.__main__:main"
+msaa-stripe-licensing = "mac_audit_agent.licensing.stripe_service:main"
+macos-security-audit-agent = "mac_audit_agent.bootstrap:main"
+
+[project.gui-scripts]
+macos-security-audit-agent-gui = "mac_audit_agent.bootstrap:main"
 
 [project.urls]
 Homepage = "https://github.com/fuzzlove/macOS-Security-Audit-Agent"
@@ -54,7 +148,7 @@ Repository = "https://github.com/fuzzlove/macOS-Security-Audit-Agent"
 Issues = "https://github.com/fuzzlove/macOS-Security-Audit-Agent/issues"
 
 [tool.setuptools]
-include-package-data = true
+include-package-data = false
 
 [tool.setuptools.packages.find]
 include = ["mac_audit_agent*"]
@@ -65,7 +159,26 @@ mac_audit_agent = [
   "assets/*.png",
   "assets/*.json",
   "assets/*.icns",
+  "assets/licensing/*.json",
+  "assets/ransomware/*.json",
+  "assets/vulnerability/*.json",
+  "integrity/integrity_manifest.json",
+  "integrity/integrity_manifest.signature.json",
+  "integrity/trust_policy.json",
+  "integrity/trust/*.pem",
+  "help/resources/**/*.md",
+  "anti_typosquatting/*.json",
+  "config/*.json",
+]
+
+[tool.setuptools.exclude-package-data]
+mac_audit_agent = [
+  "integrity/developer_identities.json",
+  "integrity/development_manifest.json",
+  "integrity/release_manifest.json",
+  "integrity/trusted_developer_machines.json",
+  "integrity/yubikey_signatures/*",
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["mac_audit_agent/tests"]
+testpaths = ["mac_audit_agent/tests", "tests"]

@@ -8,13 +8,16 @@ from pathlib import Path
 from typing import Any, Literal
 
 from mac_audit_agent.cve_radar import CveRadarEngine
+from mac_audit_agent.integrity.wrapper_adapter import IntegrityWrapperAdapter
 from mac_audit_agent.launch_agent import LaunchAgentManager
 from mac_audit_agent.notification_manager import NotificationManager
 from mac_audit_agent.rules import rule_registry_summary
-from mac_audit_agent.source_integrity import verify_source_integrity
+from mac_audit_agent.runtime.app_paths import application_integrity_root
+from mac_audit_agent.runtime.db_path_resolver import get_active_monitor_db_path
 from mac_audit_agent.storage import AuditDatabase
 from mac_audit_agent.system_monitor_readiness import SystemMonitorReadiness
 from mac_audit_agent.version import APP_VERSION, current_git_commit
+from mac_audit_agent.protection.status import resolve_active_protection_status
 
 
 OperationalHealthState = Literal["healthy", "degraded", "broken", "critical", "unknown"]
@@ -69,6 +72,17 @@ INTEGRITY_SUMMARY_BY_STATUS = {
     "failed": "Integrity verifier failed with an exact error.",
     "modified": "Trusted integrity manifest mismatch detected.",
 }
+
+
+def _safe_exception_message(exc: BaseException) -> str:
+    message = str(exc).strip()
+    if isinstance(exc, OSError):
+        path = getattr(exc, "filename", None) or getattr(exc, "filename2", None)
+        reason = getattr(exc, "strerror", "") or message or exc.__class__.__name__
+        if path:
+            return f"{exc.__class__.__name__}: {reason}: {path}"
+        return f"{exc.__class__.__name__}: {reason}"
+    return f"{exc.__class__.__name__}: {message or exc.__class__.__name__}"
 
 
 @dataclass(frozen=True)
@@ -235,23 +249,34 @@ class OperationalHealthEngine:
         details: dict[str, Any] = {}
         generated_at = datetime.now(timezone.utc).isoformat()
 
-        checks.append(self._app_health())
-        checks.append(self._source_integrity_health())
-        checks.append(self._sqlite_health())
-        checks.append(self._rule_registry_health())
-        checks.append(self._monitor_health())
-        checks.append(self._notifier_health())
-        checks.append(self._launchagent_health())
-        checks.append(self._launchdaemon_health())
-        checks.append(self._detector_health())
-        checks.append(self._forecast_health())
-        checks.append(self._report_export_health())
+        checks.append(self._run_check("App", self._app_health))
+        checks.append(self._run_check("Source Integrity", self._source_integrity_health))
+        checks.append(self._run_check("Active Protection", self._active_protection_health, requires_admin=True))
+        checks.append(self._run_check("SQLite", self._sqlite_health))
+        checks.append(self._run_check("Rule Registry", self._rule_registry_health))
+        checks.append(self._run_check("System Monitor", self._monitor_health, requires_admin=True))
+        checks.append(self._run_check("Notifier", self._notifier_health))
+        checks.append(self._run_check("User LaunchAgent", self._launchagent_health))
+        checks.append(self._run_check("System LaunchDaemon", self._launchdaemon_health, requires_admin=True))
+        checks.append(self._run_check("Detector", self._detector_health))
+        checks.append(self._run_check("Apple Exposure Assessment", self._forecast_health))
+        checks.append(self._run_check("Report Export", self._report_export_health))
 
         score = self._score(checks)
-        details["rule_registry"] = rule_registry_summary()
+        try:
+            details["rule_registry"] = rule_registry_summary()
+        except Exception as exc:
+            details["rule_registry"] = {"error": _safe_exception_message(exc)}
         details["database_path"] = str(self.db.path)
+        try:
+            details["active_protection"] = resolve_active_protection_status().to_dict()
+        except Exception as exc:
+            details["active_protection"] = {"status": "unknown", "error": _safe_exception_message(exc)}
         details["reports_dir"] = str(self.reports_dir)
-        details["source_integrity"] = verify_source_integrity(self.db)
+        try:
+            details["source_integrity"] = IntegrityWrapperAdapter(application_integrity_root()).get_integrity_status_for_operational_health().to_dict()
+        except Exception as exc:
+            details["source_integrity"] = {"status": "failed", "error": _safe_exception_message(exc)}
         analysis = analyze_operational_health(checks)
         components = self._component_breakdown(checks, generated_at)
         security_degraded_mode = any(issue.risk_of_tampering for issue in analysis.issues)
@@ -271,6 +296,43 @@ class OperationalHealthEngine:
         self._log_health_state_change(report)
         return report
 
+    def _run_check(self, component: str, callback, *, requires_admin: bool = False) -> HealthCheck:
+        try:
+            return callback()
+        except PermissionError as exc:
+            return HealthCheck(
+                component,
+                "degraded",
+                f"{component} could not inspect a protected system path.",
+                _safe_exception_message(exc),
+                "Grant Full Disk Access or administrator permissions if this protected path must be inspected; otherwise treat it as a macOS privacy boundary.",
+                "permission_issue",
+                False,
+                requires_admin,
+            )
+        except OSError as exc:
+            return HealthCheck(
+                component,
+                "degraded",
+                f"{component} hit an operating-system access boundary.",
+                _safe_exception_message(exc),
+                "Review the path in the evidence and rerun with the required permissions only if that location is in scope.",
+                "permission_issue",
+                False,
+                requires_admin,
+            )
+        except Exception as exc:
+            return HealthCheck(
+                component,
+                "broken",
+                f"{component} health check failed.",
+                _safe_exception_message(exc),
+                "Open the logs and repair the failing component.",
+                "runtime_failure",
+                False,
+                requires_admin,
+            )
+
     def _app_health(self) -> HealthCheck:
         git_commit = current_git_commit()
         status = "healthy" if APP_VERSION and git_commit else "degraded"
@@ -282,9 +344,28 @@ class OperationalHealthEngine:
             next_step="Review the release checklist before publishing.",
         )
 
+    def _active_protection_health(self) -> HealthCheck:
+        status = resolve_active_protection_status()
+        if status.status == "installed_running":
+            return HealthCheck("Active Protection", "healthy", "Protected system monitoring and user alerts are running.", json.dumps({"daemon": status.system_daemon, "notifier": status.user_notifier, "db": status.active_db}, sort_keys=True), "Continue monitoring heartbeat freshness.", "runtime_failure", False, True)
+        return HealthCheck("Active Protection", "broken" if status.status in {"failed", "partially_installed"} else "degraded", status.recommended_primary_action, json.dumps({"missing": status.missing_components, "failed": status.failed_components, "first_failure_stage": status.first_failure_stage}, sort_keys=True), status.recommended_command, "missing_component" if status.missing_components else "runtime_failure", True, True)
+
     def _source_integrity_health(self) -> HealthCheck:
         try:
-            integrity = verify_source_integrity(self.db)
+            resolved = IntegrityWrapperAdapter(application_integrity_root()).get_integrity_status_for_operational_health()
+            integrity = resolved.to_dict()
+            integrity["overall_status"] = "verified" if resolved.status == "verified" else "modified" if resolved.result_code in {"HASH_MISMATCH", "FILE_MISSING", "UNEXPECTED_FILE"} else "failed"
+            integrity["changed_files"] = resolved.source_modified_files
+            integrity["added_files"] = resolved.extra_files
+            integrity["exact_mismatch_reason"] = resolved.reason
+            integrity["file_count"] = resolved.authority.get("checked_files", 0)
+            integrity["matched_count"] = max(0, int(integrity["file_count"]) - len(resolved.source_modified_files) - len(resolved.missing_files))
+            integrity["skipped_count"] = len(resolved.authority.get("excluded_files", []))
+            integrity["recommended_actions"] = [resolved.recommended_action] if resolved.recommended_action else []
+            integrity["current_git_commit"] = resolved.git_commit
+            integrity["current_build_id"] = resolved.build_id
+            integrity["manifest_git_commit"] = resolved.git_commit
+            integrity["manifest_build_id"] = resolved.build_id
         except Exception as exc:
             return HealthCheck(
                 "Source Integrity",
@@ -400,8 +481,30 @@ class OperationalHealthEngine:
                 "Deployment audit completed.",
                 "Audit or repair deployment if the monitor is not healthy.",
             )
+        except PermissionError as exc:
+            return HealthCheck(
+                "System Monitor",
+                "degraded",
+                "System Monitor deployment audit could not inspect a protected system path.",
+                _safe_exception_message(exc),
+                "Grant Full Disk Access or administrator permissions if this protected path must be inspected; otherwise treat it as a macOS privacy boundary.",
+                "permission_issue",
+                False,
+                True,
+            )
+        except OSError as exc:
+            return HealthCheck(
+                "System Monitor",
+                "degraded",
+                "System Monitor deployment audit hit an operating-system access boundary.",
+                _safe_exception_message(exc),
+                "Review the path in the evidence and rerun with the required permissions only if that location is in scope.",
+                "permission_issue",
+                False,
+                True,
+            )
         except Exception as exc:
-            return HealthCheck("System Monitor", "broken", "Deployment audit failed.", str(exc), "Open the deployment audit and repair mismatches.")
+            return HealthCheck("System Monitor", "broken", "Deployment audit failed.", _safe_exception_message(exc), "Open the deployment audit and repair mismatches.")
 
     def _notifier_health(self) -> HealthCheck:
         status = self.notification_manager.status()
@@ -433,10 +536,27 @@ class OperationalHealthEngine:
         return HealthCheck("System LaunchDaemon", "healthy", "System daemon is installed and loaded.", status.plist_path, "No action required.")
 
     def _detector_health(self) -> HealthCheck:
-        status = self.db.get_background_monitor_status()
+        # Detector telemetry belongs to the active monitor's event database.
+        # In system mode the UI database contains settings but no daemon run
+        # timestamps, which previously made a healthy hardware detector appear
+        # degraded.
+        active_path = get_active_monitor_db_path(Path(self.db.path))
+        active_db = self.db if active_path == Path(self.db.path) else AuditDatabase(active_path)
+        try:
+            status = active_db.get_background_monitor_status()
+        finally:
+            if active_db is not self.db:
+                active_db.close()
+        detector_errors = str(status.detector_errors or "").strip()
+        has_detector_errors = bool(detector_errors)
+        if detector_errors:
+            try:
+                has_detector_errors = bool(json.loads(detector_errors))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                has_detector_errors = True
         if not status.detector_last_run_timestamp:
             return HealthCheck("Detector", "degraded", "Detector has not reported a run timestamp yet.", status.detector_last_zero_reason or status.detector_errors or "none", "Run the monitor and verify event flow.", "runtime_failure")
-        if status.detector_errors:
+        if has_detector_errors:
             return HealthCheck("Detector", "repair recommended", "Detector reported errors.", status.detector_errors, "Review detector errors and restart if needed.", "runtime_failure")
         return HealthCheck("Detector", "healthy", "Detector ran and reported events.", status.detector_last_run_timestamp, "No action required.")
 

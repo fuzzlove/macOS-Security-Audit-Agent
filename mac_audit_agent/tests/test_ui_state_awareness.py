@@ -7,7 +7,8 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QApplication, QPushButton, QDialog, QMessageBox
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QPushButton, QDialog, QMessageBox, QTabWidget, QWidget
 
 from mac_audit_agent.models import BackgroundMonitorEvent, CommandExecutionResult
 from mac_audit_agent.ui.operational_health_panel import OperationalHealthPanel
@@ -33,7 +34,8 @@ def test_selection_only_finding_actions_hidden_until_selection(tmp_path: Path) -
     app = QApplication.instance() or QApplication([])
     window = MainWindow(tmp_path / "audit.sqlite")
 
-    assert not window.selected_finding_hint_label.isHidden()
+    assert window.details_panel.isHidden()
+    assert window.selected_finding_hint_label.isHidden()
     assert window.review_actions_frame.isHidden()
     assert window.remediation_actions_frame.isHidden()
 
@@ -60,8 +62,88 @@ def test_command_preview_explains_collection_vs_remediation_scope(tmp_path: Path
     assert "audit and evidence-collection command previews only" in preview_text
     assert "not list every possible remediation command" in preview_text
 
-    side_panel_text = window.selected_command_panel.toPlainText() + "\n" + window.remediation_panel.toPlainText()
-    assert "Select a finding" in side_panel_text or "No remediation item selected" in side_panel_text
+    assert window.details_panel.isHidden()
+
+    window.close()
+    app.processEvents()
+
+
+def test_command_preview_catalog_is_filterable_and_copy_actions_follow_selection(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(tmp_path / "audit.sqlite")
+    page = window._build_preview_page()
+
+    assert window.command_preview_table.rowCount() == len(window.registry)
+    assert window.command_preview_copy_button.isEnabled()
+    window.command_preview_search.setText("DNS")
+    assert 0 < window.command_preview_table.rowCount() < len(window.registry)
+    assert "Showing" in window.command_preview_summary.text()
+    assert "Recent Scan Activity" == page.findChild(QTabWidget, "auditCommandPreviewDetailsTabs").tabText(1)
+
+    window.close()
+    app.processEvents()
+
+
+def test_framework_coverage_starts_with_complete_beginner_sheet(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(tmp_path / "audit.sqlite")
+    page = window._build_framework_coverage_page()
+    tabs = page.findChild(QTabWidget, "frameworkCoverageTabs")
+
+    assert tabs is not None
+    assert tabs.tabText(0) == "Coverage Sheet — Start Here"
+    assert window.framework_beginner_table.rowCount() == 12
+    assert "Recommended next step" in window.framework_beginner_detail.toPlainText()
+
+    window.framework_beginner_status.setCurrentIndex(3)
+    assert window.framework_beginner_table.rowCount() == 1
+    assert window.framework_beginner_table.item(0, 0).text() == "Governance, policy, workforce, and suppliers"
+
+    window.framework_beginner_status.setCurrentIndex(0)
+    window.framework_beginner_search.setText("suspected RCE")
+    assert window.framework_beginner_table.rowCount() == 1
+    assert window.framework_beginner_table.item(0, 0).text() == "Host IDS and exploitation evidence"
+
+    window.close()
+    app.processEvents()
+
+
+def test_operational_posture_cards_have_responsive_action_affordance(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(tmp_path / "audit.sqlite")
+    container = window._build_dashboard_operations_command_center()
+
+    assert len(window.dashboard_operational_cards) == 14
+    for card in window.dashboard_operational_cards.values():
+        assert card["widget"].property("interactiveCard") is True
+        assert card["widget"].minimumHeight() >= 150
+        assert card["state"].wordWrap()
+        assert card["state"].property("textRole") == "operationalState"
+        assert "Open" in card["action"].text()
+    assert container.findChildren(QWidget)
+
+    window.close()
+    app.processEvents()
+
+
+def test_context_column_releases_space_and_reveals_only_applicable_sections(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(tmp_path / "audit.sqlite")
+
+    window._set_context_panel_state(visible=True, remediation=False)
+    assert not window.details_panel.isHidden()
+    assert not window.details_heading.isHidden()
+    assert window.remediation_heading.isHidden()
+    assert window.remediation_panel.isHidden()
+
+    window._set_context_panel_state(visible=True, remediation=True)
+    assert not window.details_panel.isHidden()
+    assert not window.remediation_heading.isHidden()
+    assert not window.remediation_panel.isHidden()
+
+    window._set_context_panel_state(visible=False)
+    assert window.details_panel.isHidden()
+    assert window.main_splitter.sizes()[1] == 0
 
     window.close()
     app.processEvents()
@@ -414,8 +496,16 @@ def test_operational_health_panel_explains_degraded_safe_issue() -> None:
     assert "Why this is happening" in panel.why_label.text()
     assert not panel.repair_button.isHidden()
     assert panel.component_table.rowCount() == 1
+    component_payload=panel.component_table.item(0,0).data(Qt.UserRole)
+    assert component_payload["component"]=="User Notifier"
+    assert component_payload["status"]=="degraded"
+    assert panel.component_table.contextMenuPolicy()==Qt.CustomContextMenu
     assert panel.issue_table.rowCount() == 1
     assert panel.security_banner.isHidden()
+    assert not panel.copy_action_button.isHidden()
+    panel.copy_action_button.click()
+    assert QApplication.clipboard().text() == "Repair Notifier"
+    assert panel.copy_action_button.text() == "Copied"
 
     panel.close()
     app.processEvents()

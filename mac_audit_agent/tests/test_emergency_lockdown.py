@@ -23,6 +23,7 @@ from mac_audit_agent.emergency_lockdown import (
     get_lockdown_status,
     lockdown_mode_capability,
     load_policy,
+    open_lockdown_mode_switch,
     run_lockdown_test_workflow,
     save_policy,
 )
@@ -344,3 +345,20 @@ def test_capability_marks_settings_deep_link_as_assisted_only() -> None:
         assert capability.automatic_activation_supported is False
         assert capability.assisted_activation_supported is True
         assert "user confirmation/restart" in capability.reason
+
+
+def test_open_lockdown_mode_switch_uses_specific_deep_link_and_requires_user_action() -> None:
+    commands: list[list[str]] = []
+
+    result = open_lockdown_mode_switch(_runner(commands))
+
+    assert result["opened"] is True
+    assert commands == [[
+        "/usr/bin/open",
+        "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?LockdownMode",
+    ]]
+    assert result["operation"] == "open_lockdown_mode_switch"
+    assert result["automatic_activation_attempted"] is False
+    assert result["user_action_required"] is True
+    assert result["requires_restart"] is True
+    assert "Flip the Lockdown Mode switch" in result["instruction"]

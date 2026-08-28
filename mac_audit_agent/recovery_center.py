@@ -112,6 +112,7 @@ class SystemRecoveryCenter:
             home / "Library" / "Application Support" / "MacAuditAgent" / "snapshots",
             home / "Library" / "Logs" / "MacAuditAgent",
             home / ".mac_audit_agent",
+            Path("/Library/Caches/com.apple.amsengagement.classicdatavault"),
             Path(self.db.path).resolve(),
         ]
         for path in getattr(self.config, "recovery_cleanup_exclusions", []) or []:
@@ -136,25 +137,45 @@ class SystemRecoveryCenter:
             resolved = self._safe_resolve(root)
             if candidate == resolved or resolved in candidate.parents:
                 return True
+        if self._is_system_apple_cache(candidate):
+            return True
         return False
 
+    def _is_system_apple_cache(self, path: Path) -> bool:
+        try:
+            relative = path.relative_to(Path("/Library/Caches"))
+        except ValueError:
+            return False
+        first_part = relative.parts[0] if relative.parts else ""
+        return first_part.startswith("com.apple.")
+
     def _dir_size(self, path: Path, *, deadline: float | None = None) -> int:
-        if not path.exists():
+        try:
+            if self._is_protected(path) or not path.exists():
+                return 0
+            is_file = path.is_file()
+        except OSError:
             return 0
-        if path.is_file():
+        if is_file:
             try:
                 return path.stat().st_size
             except OSError:
                 return 0
         total = 0
-        for root, _dirs, files in os.walk(path):
+        def _ignore_walk_error(_exc: OSError) -> None:
+            return None
+
+        for root, dirs, files in os.walk(path, onerror=_ignore_walk_error):
             if deadline is not None and datetime.now(timezone.utc).timestamp() >= deadline:
                 break
+            dirs[:] = [name for name in dirs if not self._is_protected(Path(root) / name)]
             for name in files:
                 if deadline is not None and datetime.now(timezone.utc).timestamp() >= deadline:
                     break
                 child = Path(root) / name
                 try:
+                    if self._is_protected(child):
+                        continue
                     total += child.stat().st_size
                 except OSError:
                     continue
@@ -300,7 +321,12 @@ class SystemRecoveryCenter:
         path = self._normalize_path(spec["path"])
         if self._is_protected(path):
             return []
-        if not path.exists():
+        try:
+            exists = path.exists()
+            is_file = path.is_file()
+        except OSError:
+            return []
+        if not exists:
             return []
         candidates: list[CleanupCandidate] = []
         baseline_map = self._baseline_map()
@@ -308,7 +334,7 @@ class SystemRecoveryCenter:
         kind = str(spec.get("kind", "cleanup"))
         risk = str(spec.get("risk", "low"))
         max_age_days = int(self.config.cleanup_crash_log_age_days if kind == "crash logs" else 30)
-        if path.is_file():
+        if is_file:
             current = self._dir_size(path, deadline=deadline)
             if current:
                 key = self._baseline_key(category, path)
@@ -632,20 +658,20 @@ class SystemRecoveryCenter:
             "preview": preview.to_dict(),
         }
 
-    def build_context(self, current_scan_result: ScanResult | None = None, current_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    def build_context(self, current_scan_result: ScanResult | None = None, current_payload: dict[str, Any] | None = None, *, include_preview: bool = True) -> dict[str, Any]:
         assessment = self.incident_awareness_check(current_scan_result, current_payload)
-        preview = self.build_cleanup_preview(current_scan_result, current_payload)
+        preview = self.build_cleanup_preview(current_scan_result, current_payload) if include_preview else None
         snapshot_history = self.db.list_system_recovery_snapshots(limit=20)
         cleanup_history = self.db.list_system_cleanup_actions(limit=20)
         return {
             "assessment": assessment.to_dict(),
-            "preview": preview.to_dict(),
+            "preview": preview.to_dict() if preview else {"status": "not_scanned", "reason": "Cleanup preview runs only on explicit request."},
             "snapshot_history": snapshot_history,
             "cleanup_history": cleanup_history,
-            "recovery_score": preview.recovery_score,
-            "total_recoverable_bytes": preview.total_recoverable_bytes,
-            "opportunities": preview.opportunities,
-            "protected_paths": preview.protected_paths,
+            "recovery_score": preview.recovery_score if preview else 0,
+            "total_recoverable_bytes": preview.total_recoverable_bytes if preview else 0,
+            "opportunities": preview.opportunities if preview else 0,
+            "protected_paths": preview.protected_paths if preview else [],
             "cache_age": "unknown",
             "generated_at": utc_now_iso(),
         }

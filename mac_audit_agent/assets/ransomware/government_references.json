@@ -1,0 +1,155 @@
+{
+  "metadata": {
+    "schema_version": "1.0",
+    "version": "1.0.0",
+    "updated": "2026-07-16T00:00:00Z",
+    "verified": true,
+    "verification_scope": "Official HTTPS resources from CISA, FBI, IC3, and NIST."
+  },
+  "references": [
+    {
+      "reference_id": "cisa-stopransomware",
+      "source_name": "#StopRansomware",
+      "organization": "CISA",
+      "category": "Prevention, Detection, Response, Recovery",
+      "description": "Whole-of-government ransomware resources, alerts, prevention guidance, and response information.",
+      "url": "https://www.cisa.gov/stopransomware",
+      "frameworks": ["CISA CPG", "NIST CSF 2.0", "MITRE ATT&CK"],
+      "related_detection_types": ["probable_ransomware_behavior", "encryption_burst", "recovery_tamper", "defense_tamper"],
+      "last_verified": "2026-07-16",
+      "priority": "critical"
+    },
+    {
+      "reference_id": "cisa-stopransomware-guide",
+      "source_name": "#StopRansomware Guide",
+      "organization": "CISA",
+      "category": "Prevention, Response, Recovery",
+      "description": "Official preparation, prevention, mitigation, response, containment, evidence-preservation, and recovery checklist.",
+      "url": "https://www.cisa.gov/stopransomware/ransomware-guide",
+      "frameworks": ["CISA CPG", "NIST CSF 2.0", "MITRE ATT&CK"],
+      "related_detection_types": ["probable_ransomware_behavior", "encryption_burst", "mass_deletion", "recovery_tamper", "supported_exfiltration"],
+      "last_verified": "2026-07-16",
+      "priority": "critical"
+    },
+    {
+      "reference_id": "cisa-advisories",
+      "source_name": "Cybersecurity Advisories",
+      "organization": "CISA",
+      "category": "Detection, Vulnerability Management",
+      "description": "Joint advisories describing active ransomware campaigns, tactics, indicators, and mitigations.",
+      "url": "https://www.cisa.gov/news-events/cybersecurity-advisories",
+      "frameworks": ["MITRE ATT&CK", "CISA CPG"],
+      "related_detection_types": ["probable_ransomware_behavior", "supported_exfiltration", "defense_tamper"],
+      "last_verified": "2026-07-16",
+      "priority": "high"
+    },
+    {
+      "reference_id": "cisa-kev",
+      "source_name": "Known Exploited Vulnerabilities Catalog",
+      "organization": "CISA",
+      "category": "Vulnerability Management",
+      "description": "Authoritative catalog of vulnerabilities known to be exploited in the wild for risk-based remediation prioritization.",
+      "url": "https://www.cisa.gov/known-exploited-vulnerabilities-catalog",
+      "frameworks": ["CISA CPG", "NIST CSF 2.0"],
+      "related_detection_types": ["defense_tamper", "probable_ransomware_behavior"],
+      "last_verified": "2026-07-16",
+      "priority": "high"
+    },
+    {
+      "reference_id": "cisa-cpg",
+      "source_name": "Cross-Sector Cybersecurity Performance Goals",
+      "organization": "CISA",
+      "category": "Prevention, Governance",
+      "description": "Prioritized voluntary cybersecurity practices aligned to NIST CSF functions.",
+      "url": "https://www.cisa.gov/cybersecurity-performance-goals",
+      "frameworks": ["CISA CPG", "NIST CSF 2.0"],
+      "related_detection_types": ["probable_ransomware_behavior", "recovery_tamper", "defense_tamper"],
+      "last_verified": "2026-07-16",
+      "priority": "high"
+    },
+    {
+      "reference_id": "fbi-ransomware",
+      "source_name": "Ransomware Resources",
+      "organization": "FBI",
+      "category": "Incident Reporting, Investigation",
+      "description": "FBI ransomware prevention, response, reporting, and law-enforcement coordination guidance.",
+      "url": "https://www.fbi.gov/how-we-can-help-you/scams-and-safety/common-frauds-and-scams/ransomware",
+      "frameworks": ["Incident Response", "Law Enforcement Coordination"],
+      "related_detection_types": ["probable_ransomware_behavior", "encryption_burst", "supported_exfiltration"],
+      "last_verified": "2026-07-16",
+      "priority": "critical"
+    },
+    {
+      "reference_id": "fbi-cyber",
+      "source_name": "FBI Cyber Investigations",
+      "organization": "FBI",
+      "category": "Law Enforcement Coordination, Investigation",
+      "description": "Information about FBI cyber investigations and coordination with victims.",
+      "url": "https://www.fbi.gov/investigate/cyber",
+      "frameworks": ["Incident Response"],
+      "related_detection_types": ["probable_ransomware_behavior", "supported_exfiltration"],
+      "last_verified": "2026-07-16",
+      "priority": "high"
+    },
+    {
+      "reference_id": "fbi-ic3-ransomware",
+      "source_name": "IC3 Ransomware Reporting",
+      "organization": "FBI Internet Crime Complaint Center",
+      "category": "Incident Reporting",
+      "description": "Official ransomware reporting guidance and information to preserve for a complaint.",
+      "url": "https://www.ic3.gov/CrimeInfo/Ransomware",
+      "frameworks": ["Incident Reporting"],
+      "related_detection_types": ["probable_ransomware_behavior", "encryption_burst", "supported_exfiltration"],
+      "last_verified": "2026-07-16",
+      "priority": "critical"
+    },
+    {
+      "reference_id": "nist-csf",
+      "source_name": "Cybersecurity Framework 2.0",
+      "organization": "NIST",
+      "category": "Governance, Security Controls",
+      "description": "Risk-management outcomes organized across Govern, Identify, Protect, Detect, Respond, and Recover.",
+      "url": "https://www.nist.gov/cyberframework",
+      "frameworks": ["NIST CSF 2.0"],
+      "related_detection_types": ["probable_ransomware_behavior", "encryption_burst", "recovery_tamper", "defense_tamper"],
+      "last_verified": "2026-07-16",
+      "priority": "high"
+    },
+    {
+      "reference_id": "nist-800-61r3",
+      "source_name": "SP 800-61 Rev. 3 Incident Response Recommendations",
+      "organization": "NIST",
+      "category": "Incident Response",
+      "description": "Current incident-response recommendations integrated with CSF 2.0 cybersecurity risk management.",
+      "url": "https://csrc.nist.gov/pubs/sp/800/61/r3/final",
+      "frameworks": ["NIST CSF 2.0", "NIST SP 800-61 Rev. 3"],
+      "related_detection_types": ["probable_ransomware_behavior", "encryption_burst", "supported_exfiltration", "defense_tamper"],
+      "last_verified": "2026-07-16",
+      "priority": "critical"
+    },
+    {
+      "reference_id": "nist-800-53r5",
+      "source_name": "SP 800-53 Rev. 5 Security and Privacy Controls",
+      "organization": "NIST",
+      "category": "Security Controls, Governance",
+      "description": "Control catalog supporting incident response, contingency planning, audit, access control, and system integrity.",
+      "url": "https://csrc.nist.gov/pubs/sp/800/53/r5/upd1/final",
+      "frameworks": ["NIST SP 800-53 Rev. 5"],
+      "related_detection_types": ["probable_ransomware_behavior", "recovery_tamper", "defense_tamper"],
+      "last_verified": "2026-07-16",
+      "priority": "high"
+    },
+    {
+      "reference_id": "nist-ir-8374r1",
+      "source_name": "IR 8374 Rev. 1 Ransomware Risk Management",
+      "organization": "NIST",
+      "category": "Governance, Prevention, Detection, Response, Recovery",
+      "description": "CSF 2.0 Community Profile for governing, identifying, protecting against, detecting, responding to, and recovering from ransomware.",
+      "url": "https://csrc.nist.gov/pubs/ir/8374/r1/final",
+      "frameworks": ["NIST CSF 2.0"],
+      "related_detection_types": ["probable_ransomware_behavior", "encryption_burst", "mass_deletion", "recovery_tamper", "defense_tamper", "supported_exfiltration"],
+      "last_verified": "2026-07-16",
+      "priority": "critical"
+    }
+  ]
+}

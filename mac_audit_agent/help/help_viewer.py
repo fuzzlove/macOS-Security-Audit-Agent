@@ -9,17 +9,21 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QApplication,
     QSplitter,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
+import json
+import logging
 
 from mac_audit_agent.build_identity import detect_build_identity
 from mac_audit_agent.help.glossary import GLOSSARY
 from mac_audit_agent.help.help_registry import HelpTopic, get_help_topic, get_related_topics, list_help_topics, search_help_topics
+from mac_audit_agent.help.diagnostic_registry import DOCUMENTATION_BUNDLE_VERSION, resolve_help_topic, validate_diagnostic_registry
 
-MISSING_TOPIC_MESSAGE = "Help topic unavailable. This is a documentation bug."
+MISSING_TOPIC_MESSAGE = "Documentation for this diagnostic could not be loaded."
 
 
 class HelpViewer(QDialog):
@@ -62,11 +66,25 @@ class HelpViewer(QDialog):
         self.content_view = QTextBrowser()
         self.content_view.setOpenExternalLinks(False)
         self.content_view.anchorClicked.connect(lambda url: self.open_topic(url.toString()))
+        fallback_actions = QHBoxLayout()
+        self.copy_diagnostic_button = QPushButton("Copy Diagnostic Details")
+        self.copy_diagnostic_button.setToolTip("Copy sanitized help-resolution details to the clipboard.")
+        self.copy_diagnostic_button.clicked.connect(lambda: QApplication.clipboard().setText(self.content_view.toPlainText()))
+        self.view_logs_button = QPushButton("View Application Logs")
+        self.view_logs_button.setToolTip("Open the supported MSAA logs view when it is available.")
+        self.view_logs_button.setEnabled(False)
+        self.integrity_button = QPushButton("Run Documentation Integrity Check")
+        self.integrity_button.setToolTip("Validate registered diagnostic topics and packaged documentation resources.")
+        self.integrity_button.clicked.connect(self._show_integrity_result)
+        for button in (self.copy_diagnostic_button, self.view_logs_button, self.integrity_button):
+            button.hide()
+            fallback_actions.addWidget(button)
         close_button = QPushButton("Close")
         close_button.clicked.connect(self.close)
         right_layout.addWidget(self.title_label)
         right_layout.addWidget(self.summary_label)
         right_layout.addWidget(self.content_view, 1)
+        right_layout.addLayout(fallback_actions)
         right_layout.addWidget(close_button, alignment=Qt.AlignRight)
 
         splitter.addWidget(left)
@@ -102,18 +120,45 @@ class HelpViewer(QDialog):
             self.summary_label.setText(f"No help results found for: {query}")
             self.content_view.setPlainText(f"No help results found for: {query}")
 
-    def open_topic(self, topic_id: str) -> None:
-        topic = get_help_topic(topic_id)
-        self.current_topic_id = topic_id
+    def open_topic(self, topic_id) -> None:
+        resolution = resolve_help_topic(topic_id)
+        topic = resolution.topic
+        if topic is None and resolution.reason == "topic_not_registered":
+            topic = get_help_topic(topic_id)
+        self.current_topic_id = str(topic_id)
         if topic is None:
-            self.title_label.setText("Help Topic Unavailable")
+            requested = str(topic_id).strip() or "(empty)"
+            self.title_label.setText("Documentation Could Not Be Loaded")
             self.summary_label.setText(MISSING_TOPIC_MESSAGE)
-            self.content_view.setPlainText(MISSING_TOPIC_MESSAGE)
+            try:
+                identity = detect_build_identity()
+                app_version, build_id = identity.app_version, identity.build_id or "not configured"
+            except Exception:
+                app_version, build_id = "unknown", "unknown"
+            event = resolution.failure_event(application_version=app_version, build_id=build_id)
+            details = [MISSING_TOPIC_MESSAGE, "", f"Requested topic identifier: {requested}",
+                f"Normalized topic: {resolution.normalized_topic or '(empty)'}", f"Error code: {resolution.normalized_topic if resolution.normalized_topic.startswith('AR') else 'not available'}",
+                f"Originating module: {resolution.module}", f"Application version: {app_version}", f"Build identifier: {build_id}",
+                f"Documentation bundle version: {DOCUMENTATION_BUNDLE_VERSION}", f"Expected resource: {resolution.expected_resource or 'not registered'}",
+                f"Reason: {resolution.reason or 'topic_not_registered'}"]
+            self.content_view.setPlainText("\n".join(details))
+            for button in (self.copy_diagnostic_button, self.view_logs_button, self.integrity_button):
+                button.show()
+            logging.getLogger("msaa.help").error("help_topic_resolution_failed %s", json.dumps(event, sort_keys=True))
             return
+        for button in (self.copy_diagnostic_button, self.view_logs_button, self.integrity_button):
+            button.hide()
         self.title_label.setText(topic.title)
         self.summary_label.setText(topic.summary)
-        self.content_view.setHtml(self._topic_html(topic))
+        if topic.resource_content:
+            self.content_view.setMarkdown(topic.resource_content)
+        else:
+            self.content_view.setHtml(self._topic_html(topic))
         self._select_topic_item(topic.topic_id)
+
+    def _show_integrity_result(self) -> None:
+        failures = validate_diagnostic_registry()
+        self.content_view.setPlainText("Documentation integrity check passed." if not failures else json.dumps({"failures":failures}, indent=2))
 
     def _select_topic_item(self, topic_id: str) -> None:
         self.topic_list.blockSignals(True)

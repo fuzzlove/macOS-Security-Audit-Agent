@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QApplication
 from mac_audit_agent.intrusion_correlation import IntrusionCorrelationEngine
 from mac_audit_agent.models import BackgroundMonitorEvent
 from mac_audit_agent.storage import AuditDatabase
-from mac_audit_agent.themes import DEFAULT_THEME_NAME, theme_for_name, theme_stylesheet
+from mac_audit_agent.themes import DEFAULT_THEME_NAME, blend_colors, contrast_ratio, readable_text_color, theme_for_name, theme_stylesheet
 from mac_audit_agent.themes import theme_names
 from mac_audit_agent.ui.main_window import MainWindow
 
@@ -169,7 +169,7 @@ def test_theme_registry_and_stylesheet() -> None:
     assert theme_for_name("does-not-exist").name == DEFAULT_THEME_NAME
     stylesheet = theme_stylesheet(theme_for_name("High Contrast"), accessibility_override=True)
     assert "#FFFFFF" in stylesheet
-    assert "#FF4D5A" in stylesheet
+    assert theme_for_name("High Contrast").critical in stylesheet
 
 
 def test_all_skins_have_visible_scrollbar_styles() -> None:
@@ -178,7 +178,28 @@ def test_all_skins_have_visible_scrollbar_styles() -> None:
         assert "QScrollBar:vertical" in stylesheet
         assert "width: 18px" in stylesheet
         assert "QScrollBar::handle:vertical" in stylesheet
-        assert "#FFD166" in stylesheet
+        assert theme_for_name(name).accent in stylesheet
+
+
+def test_all_theme_action_and_selection_text_meets_contrast_floor() -> None:
+    for name in theme_names():
+        theme = theme_for_name(name)
+        assert contrast_ratio(theme.foreground, theme.background) >= 4.5
+        for surface in (theme.button_primary, theme.accent, theme.high, theme.critical):
+            assert contrast_ratio(readable_text_color(surface), surface) >= 4.5
+        stylesheet = theme_stylesheet(theme)
+        assert "QTableWidget::item:selected" in stylesheet
+        assert "QTabBar::tab:selected" in stylesheet
+
+
+def test_theme_interaction_colors_are_derived_from_each_palette() -> None:
+    for name in theme_names():
+        theme = theme_for_name(name)
+        expected_hover = blend_colors(theme.background, theme.accent, 0.24 if theme.is_light else 0.30)
+        stylesheet = theme_stylesheet(theme)
+        assert expected_hover in stylesheet
+        assert 'QFrame[interactiveCard="true"]:hover' in stylesheet
+        assert 'QLabel[textRole="operationalState"]' in stylesheet
 
 
 def test_theme_switching_persists(tmp_path: Path) -> None:
@@ -200,9 +221,9 @@ def test_main_navigation_includes_new_pages(tmp_path: Path) -> None:
     app = QApplication.instance() or QApplication([])
     window = MainWindow(tmp_path / "audit.sqlite")
     items = [window.sidebar.item(index).text() for index in range(window.sidebar.count())]
-    assert "Intrusion Detection" in items
+    assert "Host IDS" in items
     assert "Flight Recorder" in items
-    assert "Skins" in items
+    assert "Appearance" in items
     assert hasattr(window, "operational_health_panel")
     assert hasattr(window, "intrusion_detection_panel")
     assert hasattr(window, "flight_recorder_panel")

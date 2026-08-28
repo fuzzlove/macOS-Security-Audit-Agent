@@ -16,9 +16,13 @@ from mac_audit_agent.evidence_graph import EvidenceGraphBuilder
 from mac_audit_agent.explanations import ensure_finding_explanations
 from mac_audit_agent.frameworks import framework_summary_for_findings, mappings_for_finding
 from mac_audit_agent.models import BaselineComparison, Finding, ScanResult, ScanSummary
+from mac_audit_agent.mitre_coverage import MITRECoverageMatrix
 from mac_audit_agent.nmap_wrapper import NMAP_CREDIT_TEXT, NMAP_URL
 from mac_audit_agent.privacy import redact_structure, redact_text
+from mac_audit_agent.professional_report import ReportTable, write_professional_report
+from mac_audit_agent.remediation.recommendation_engine import enrich_finding_with_recommendation, ensure_recommended_fixes
 from mac_audit_agent.security_timeline import SecurityTimelineBuilder
+from mac_audit_agent.security_control_database import SecurityControlDatabase
 from mac_audit_agent.storage import json_safe
 from mac_audit_agent.ui.severity_styles import SEVERITY_STYLES, get_severity_style, make_severity_badge, normalize_severity, severity_sort_rank
 
@@ -28,6 +32,29 @@ SEVERITY_COLOR_MAP = {
 }
 SCORE_WEIGHTS = {"critical": 25, "high": 15, "medium": 7, "low": 2, "info": 0}
 LOGGER = logging.getLogger(__name__)
+
+
+def security_assurance_for_findings(findings: list[object]) -> dict:
+    """Return canonical control mappings and qualified ATT&CK coverage.
+
+    Observed finding mappings are retained separately from coverage so a report
+    cannot accidentally turn a framework label into a detection claim.
+    """
+    normalized = [finding_to_dict(finding) for finding in findings]
+    controls = SecurityControlDatabase()
+    resolved = [controls.resolve_finding(finding) for finding in normalized]
+    observed: set[str] = set()
+    for finding in normalized:
+        raw = finding.get("mitre_attack", finding.get("mitre", []))
+        values = raw if isinstance(raw, (list, tuple, set)) else [raw]
+        observed.update(str(value).split()[0] for value in values if value)
+        for mapping in mappings_for_finding(finding):
+            if mapping.framework == "MITRE_ATTACK_MACOS":
+                observed.add(mapping.id)
+    return {
+        "control_mappings": resolved,
+        "mitre_attack_coverage": MITRECoverageMatrix().to_dict(observed_techniques=observed),
+    }
 
 
 def _production_forecast_cards(apple_security_forecast: dict) -> list[dict]:
@@ -65,11 +92,11 @@ def get_reports_dir() -> Path:
 
 def finding_to_dict(finding) -> dict:
     if isinstance(finding, dict):
-        return ensure_finding_explanations(finding)
+        return enrich_finding_with_recommendation(ensure_finding_explanations(finding))
     if hasattr(finding, "to_dict"):
-        return ensure_finding_explanations(finding.to_dict())
+        return enrich_finding_with_recommendation(ensure_finding_explanations(finding.to_dict()))
     if hasattr(finding, "__dict__"):
-        return ensure_finding_explanations(dict(finding.__dict__))
+        return enrich_finding_with_recommendation(ensure_finding_explanations(dict(finding.__dict__)))
     return {}
 
 
@@ -357,7 +384,7 @@ def _professional_report_css() -> str:
     :root {{ --bg: #F8FAFC; --card: #FFFFFF; --ink: #101828; --muted: #667085; --line: #D0D5DD; --nav: #0F172A; }}
     * {{ box-sizing: border-box; }}
     html {{ scroll-behavior: smooth; }}
-    body {{ margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); line-height: 1.45; }}
+    body {{ margin: 0; font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: var(--bg); color: var(--ink); line-height: 1.45; }}
     a {{ color: #175CD3; }}
     .layout {{ display: grid; grid-template-columns: 260px minmax(0, 1fr); max-width: 1440px; margin: 0 auto; }}
     .toc {{ position: sticky; top: 0; height: 100vh; overflow: auto; background: var(--nav); color: #EAECF0; padding: 20px; }}
@@ -489,6 +516,28 @@ def _render_professional_html_report(
     if not isinstance(user_notifier_integrity, dict):
         user_notifier_integrity = {}
     framework_summary = framework_summary_for_findings(findings)
+    security_control_assurance = security_assurance_for_findings(list(findings))
+    continuous_assurance = artifacts.get("continuous_security_assurance", {})
+    if not isinstance(continuous_assurance, dict):
+        continuous_assurance = {}
+    zero_trust_identity = artifacts.get("zero_trust_device_identity", {})
+    if not isinstance(zero_trust_identity, dict):
+        zero_trust_identity = {}
+    security_posture_graph = artifacts.get("security_posture_graph", {})
+    if not isinstance(security_posture_graph, dict):
+        security_posture_graph = {}
+    threat_exposure = artifacts.get("threat_exposure_management", {})
+    if not isinstance(threat_exposure, dict): threat_exposure = {}
+    control_validation = artifacts.get("security_control_validation", {})
+    if not isinstance(control_validation, dict): control_validation = {}
+    supply_trust_graph = artifacts.get("supply_chain_trust_graph", {})
+    if not isinstance(supply_trust_graph, dict): supply_trust_graph = {}
+    software_attestation = artifacts.get("software_attestation", {})
+    if not isinstance(software_attestation, dict): software_attestation = {}
+    security_regression = artifacts.get("security_regression_detection", {})
+    if not isinstance(security_regression, dict): security_regression = {}
+    cyber_resilience = artifacts.get("cyber_resilience_score", {})
+    if not isinstance(cyber_resilience, dict): cyber_resilience = {}
     logo_markup = report_logo_markup()
 
     nav_items = [
@@ -502,6 +551,15 @@ def _render_professional_html_report(
         ("Apple Exposure", "apple-exposure"),
         ("Integrity Verification", "integrity-verification"),
         ("Framework Mapping", "framework-summary"),
+        ("Continuous Assurance", "continuous-assurance"),
+        ("Zero Trust Identity", "zero-trust-identity"),
+        ("Security Posture Graph", "security-posture-graph"),
+        ("Threat Exposure", "threat-exposure-management"),
+        ("Control Validation", "security-control-validation"),
+        ("Supply Chain Trust", "supply-chain-trust-graph"),
+        ("Software Attestation", "software-attestation"),
+        ("Security Regression", "security-regression-detection"),
+        ("Cyber Resilience", "cyber-resilience-score"),
         ("Limitations", "limitations"),
         ("Appendices", "appendices"),
     ]
@@ -591,6 +649,17 @@ def _render_professional_html_report(
         evidence_preview = _truncate_lines(evidence)
         command_or_source = get_command_or_source(finding)
         command_or_source_markup = f"<p><strong>Command / Source:</strong> {safe_html(command_or_source)}</p>" if command_or_source else ""
+        recommended_fix = finding.get("recommended_fix", {}) if isinstance(finding.get("recommended_fix"), dict) else {}
+        source_mappings = recommended_fix.get("source_mappings", []) if isinstance(recommended_fix, dict) else []
+        source_mapping_text = "; ".join(
+            f"{item.get('source_type', '')}:{item.get('source_id', '')} ({item.get('mapping_confidence', '')})"
+            for item in source_mappings
+            if isinstance(item, dict)
+        )
+        false_positive_checks = recommended_fix.get("false_positive_checks", []) if isinstance(recommended_fix, dict) else []
+        further_steps = recommended_fix.get("further_examination_steps", []) if isinstance(recommended_fix, dict) else []
+        evidence_checklist = recommended_fix.get("evidence_to_collect", []) if isinstance(recommended_fix, dict) else []
+        limitations = recommended_fix.get("limitations", []) if isinstance(recommended_fix, dict) else []
         appendix_evidence_rows.append([f"finding-{finding_key}", finding.get("title", ""), evidence])
         findings_markup.append(
             f"""
@@ -606,6 +675,14 @@ def _render_professional_html_report(
                 <p><strong>Why it matters:</strong> {_e(finding.get('why_this_matters') or finding.get('impact') or 'This may affect local security posture.')}</p>
                 <p><strong>False-positive notes:</strong> {_e(finding.get('false_positive_notes') or ', '.join(str(item) for item in finding.get('false_positive_hints', [])) or 'None recorded.')}</p>
                 <p><strong>Suggested fix:</strong> {_e(finding.get('recommended_next_steps') or finding.get('remediation_suggestion') or finding.get('suggested_fix') or 'Review and validate this item.')}</p>
+                <h3>Recommended Fix</h3>
+                <p><strong>Immediate action:</strong> {_e(recommended_fix.get('immediate_action') or finding.get('recommended_next_steps') or 'Manual review required.')}</p>
+                <p><strong>Recommended fix:</strong> {_e(recommended_fix.get('recommended_fix') or finding.get('remediation_suggestion') or 'Manual review required.')}</p>
+                <p><strong>Examine further:</strong> {_e('; '.join(str(item) for item in further_steps) or 'Review local evidence and source context.')}</p>
+                <p><strong>Evidence to collect:</strong> {_e('; '.join(str(item) for item in evidence_checklist) or 'MSAA finding JSON and report excerpt.')}</p>
+                <p><strong>False-positive review:</strong> {_e('; '.join(str(item) for item in false_positive_checks) or 'Confirm ownership, expected behavior, and business need before suppression.')}</p>
+                <p><strong>Standards/source mappings:</strong> {_e(source_mapping_text or 'MSAA local recommendation; authoritative mapping not available.')}</p>
+                <p><strong>Recommendation limitations:</strong> {_e('; '.join(str(item) for item in limitations) or 'No unsupported compliance, endorsement, or attribution claim is made.')}</p>
                 <p><strong>Validation steps:</strong> {_e('; '.join(str(item) for item in finding.get('verification_steps', finding.get('recommended_verification_steps', []))) or finding.get('validation_step') or 'Confirm the finding after remediation.')}</p>
                 <p><strong>{_e(_framework_compact_line(finding))}</strong></p>
                 <p><strong>Framework mappings:</strong> {_e(_framework_mapping_summary_text(finding))}</p>
@@ -737,6 +814,79 @@ def _render_professional_html_report(
     ]:
         for name, count in (values or {}).items():
             framework_rows.append([section, name, count])
+    mitre_coverage = security_control_assurance["mitre_attack_coverage"]
+    mitre_coverage_rows = [
+        [
+            item.get("technique_id", ""), item.get("technique_name", ""), item.get("tactic", ""),
+            item.get("status", ""), ", ".join(item.get("evidence_sources", [])),
+            "; ".join(item.get("limitations", [])),
+        ]
+        for item in mitre_coverage.get("techniques", [])
+    ]
+    assurance_snapshot = continuous_assurance.get("snapshot", continuous_assurance)
+    assurance_changes = continuous_assurance.get("changes", [])
+    assurance_summary_rows = [
+        ["Security Score", assurance_snapshot.get("security_score", "not collected")],
+        ["Trust Score", assurance_snapshot.get("trust_score", "not collected")],
+        ["Trust Decision", assurance_snapshot.get("trust_decision", "not collected")],
+        ["Configuration Score", assurance_snapshot.get("configuration_score", "not collected")],
+        ["Software Score", assurance_snapshot.get("software_score", "not collected")],
+        ["Threat Score", assurance_snapshot.get("threat_score", "not collected")],
+        ["Recovery Score", assurance_snapshot.get("recovery_score", "not collected")],
+        ["Evidence Coverage", assurance_snapshot.get("evidence_coverage_percent", "not collected")],
+    ]
+    assurance_change_rows = [
+        [item.get("timestamp", ""), item.get("affected_component", ""), item.get("change_type", ""),
+         item.get("severity", ""), item.get("risk_score_change", ""), item.get("description", ""),
+         ", ".join(str(value) for value in item.get("evidence_reference", []))]
+        for item in assurance_changes if isinstance(item, dict)
+    ]
+    device_attestation = zero_trust_identity.get("attestation", zero_trust_identity)
+    device_policy_rows = [
+        [item.get("policy_id", ""), item.get("matched", False), item.get("recommended_action", ""),
+         item.get("reason", ""), item.get("authorization_required", True)]
+        for item in device_attestation.get("policy_results", []) if isinstance(item, dict)
+    ]
+    device_identity_rows = [
+        ["Device ID", device_attestation.get("device", {}).get("device_id", "not collected")],
+        ["Trust State", device_attestation.get("trust_state", "not collected")],
+        ["Trust Score", device_attestation.get("trust_score", "not collected")],
+        ["Last Verification", device_attestation.get("timestamp", "not collected")],
+        ["Identity Status", device_attestation.get("identity_status", "not collected")],
+        ["Configuration", device_attestation.get("configuration_status", "not collected")],
+        ["Software", device_attestation.get("software_status", "not collected")],
+        ["Threat Exposure", device_attestation.get("threat_exposure", "not collected")],
+        ["Evidence Coverage", device_attestation.get("evidence_coverage_percent", "not collected")],
+        ["Qualification", device_attestation.get("qualification", "No device attestation was attached.")],
+    ]
+    posture_graph_paths = security_posture_graph.get("risk_paths", [])
+    posture_graph_summary_rows = [
+        ["Graph ID", security_posture_graph.get("graph_id", "not collected")],
+        ["Generated", security_posture_graph.get("generated_at", "not collected")],
+        ["Entities", security_posture_graph.get("evidence_graph", {}).get("node_count", "not collected")],
+        ["Relationships", len(security_posture_graph.get("relationships", []))],
+        ["Qualified Risk Paths", len(posture_graph_paths)],
+        ["Posture Score Before", security_posture_graph.get("posture_score_before", "not collected")],
+        ["Posture Score After", security_posture_graph.get("posture_score_after", "not collected")],
+        ["Qualification", security_posture_graph.get("qualification", "No posture graph analysis was attached.")],
+    ]
+    posture_graph_path_rows = [
+        [item.get("path_id", ""), " → ".join(str(value) for value in item.get("event_ids", [])),
+         item.get("confidence", ""), item.get("risk_level", ""),
+         ", ".join(str(value) for value in item.get("mitre_mapping", [])),
+         item.get("analyst_interpretation", ""), "; ".join(str(value) for value in item.get("limitations", []))]
+        for item in posture_graph_paths if isinstance(item, dict)
+    ]
+    exposure_assessment = threat_exposure.get("assessment", threat_exposure)
+    exposure_rows = [[index, item.get("affected_component", ""), item.get("risk_category", ""), item.get("cve_id", ""), item.get("exploit_status", ""), item.get("exposure_score", ""), item.get("severity", ""), ", ".join(str(value) for value in item.get("evidence_reference", [])), item.get("risk_explanation", ""), item.get("recommendation", "")] for index, item in enumerate(exposure_assessment.get("exposures", []), 1) if isinstance(item, dict)]
+    exposure_summary_rows = [["Assessment ID", exposure_assessment.get("assessment_id", "not collected")], ["Overall Exposure Score", exposure_assessment.get("overall_exposure_score", "not collected")], ["Critical Exposures", sum(item.get("severity") == "critical" for item in exposure_assessment.get("exposures", []) if isinstance(item, dict))], ["Known Exploited Vulnerabilities", sum(item.get("exploit_status") == "known_exploited_in_wild" for item in exposure_assessment.get("exposures", []) if isinstance(item, dict))], ["Qualification", exposure_assessment.get("qualification", "No threat exposure assessment was attached.")]]
+    validation_assessment = control_validation.get("assessment", control_validation)
+    validation_summary_rows = [["Profile", validation_assessment.get("profile_id", "not collected")], ["Compliance Score", validation_assessment.get("compliance_score", "not collected")], ["Posture Status", validation_assessment.get("posture_status", "not collected")], ["Passed", validation_assessment.get("passed_controls", 0)], ["Failed", validation_assessment.get("failed_controls", 0)], ["Not Assessed", validation_assessment.get("not_assessed_controls", 0)], ["Excepted", validation_assessment.get("excepted_controls", 0)], ["Qualification", validation_assessment.get("qualification", "No control assessment was attached.")]]
+    validation_rows = [[item.get("control_id", ""), item.get("result", ""), item.get("expected_state", ""), item.get("actual_state", ""), item.get("severity", ""), ", ".join(str(value) for value in item.get("framework", [])), ", ".join(str(value) for value in item.get("evidence_reference", [])), "; ".join(str(value) for value in item.get("uncertainty", [])), item.get("remediation", "")] for item in validation_assessment.get("results", []) if isinstance(item, dict)]
+    trust_graph=supply_trust_graph.get("graph",supply_trust_graph);trust_rows=[[x.get("software_id",""),x.get("trust_score",""),x.get("trust_state",""),"; ".join(x.get("reasons",[])),", ".join(x.get("evidence_reference",[])),"; ".join(x.get("unknowns",[]))] for x in trust_graph.get("software_trust",[]) if isinstance(x,dict)];trust_summary=[["Graph ID",trust_graph.get("graph_id","not collected")],["SBOM Status",trust_graph.get("sbom_status","not collected")],["Entities",len(trust_graph.get("entities",[]))],["Relationships",len(trust_graph.get("relationships",[]))],["Risk Relationships",len(trust_graph.get("risk_relationships",[]))],["Qualification",trust_graph.get("qualification","No trust graph attached.")]]
+    attestation=software_attestation.get("assessment",software_attestation);attestation_rows=[[x.get("application",{}).get("name",""),x.get("application",{}).get("version",""),x.get("identity_status",""),x.get("integrity_status",""),x.get("provenance_status",""),x.get("trust_score",""),x.get("trust_state",""),"; ".join(x.get("change_types",[])),", ".join(x.get("evidence_reference",[]))] for x in attestation.get("results",[]) if isinstance(x,dict)];attestation_summary=[["Assessment ID",attestation.get("assessment_id","not collected")],["Profile",attestation.get("profile","not collected")],["Verified",sum(x.get("trust_state")=="verified" for x in attestation.get("results",[]) if isinstance(x,dict))],["Failed",sum(x.get("trust_state")=="failed" for x in attestation.get("results",[]) if isinstance(x,dict))],["Integrity Hash",attestation.get("integrity_hash","not collected")]]
+    regression=security_regression.get("assessment",security_regression);regression_rows=[[x.get("affected_component",""),x.get("category",""),json.dumps(x.get("previous_state"),sort_keys=True,default=str),json.dumps(x.get("current_state"),sort_keys=True,default=str),x.get("security_impact",""),x.get("severity",""),x.get("risk_score_change",""),x.get("changed_by",""),x.get("responsible_process",""),x.get("authorized_change",""),", ".join(x.get("evidence_reference",[])),x.get("recommended_action","")] for x in regression.get("regressions",[]) if isinstance(x,dict)];regression_summary=[["Assessment ID",regression.get("assessment_id","not collected")],["Baseline",regression.get("baseline_id","not collected")],["Previous Score",regression.get("previous_score","not collected")],["Current Score",regression.get("current_score","not collected")],["Risk Increases",sum(x.get("security_impact")=="security_regression" for x in regression.get("regressions",[]) if isinstance(x,dict))],["Improvements",sum(x.get("security_impact")=="security_improvement" for x in regression.get("regressions",[]) if isinstance(x,dict))],["Qualification",regression.get("qualification","No regression assessment attached.")]]
+    resilience=cyber_resilience.get("assessment",cyber_resilience);resilience_summary=[["Score ID",resilience.get("score_id","not collected")],["Overall Score",resilience.get("overall_score","not measured")],["Evidence Coverage",resilience.get("evidence_coverage_percent","not measured")],["Calculation Version",resilience.get("calculation_version","unknown")],["Qualification",resilience.get("qualification","No resilience assessment attached.")]];resilience_rows=[[name.replace("_"," ").title(),score] for name,score in resilience.get("category_scores",{}).items()];resilience_control_rows=[[x.get("control_id",""),x.get("category",""),x.get("name",""),x.get("status",""),f"{x.get('score_credit','')}/{x.get('weight','')}",", ".join(x.get("evidence_reference",[])),x.get("explanation",""),x.get("recommendation","")] for x in resilience.get("results",[]) if isinstance(x,dict)]
     raw_log_rows = (
         [
             [
@@ -768,6 +918,14 @@ def _render_professional_html_report(
             empty="No alert storms recorded.",
         )
     appendix_sections = []
+    system_integrity = artifacts.get("system_integrity", {}) if isinstance(artifacts.get("system_integrity", {}), dict) else {}
+    if system_integrity:
+        appendix_sections.append(
+            "<details><summary>System Integrity</summary>"
+            + _compact_table(["Field", "Value"], [["Finding Count", system_integrity.get("finding_count", len(system_integrity.get("findings", [])))], ["Checks Run", ", ".join(str(item) for item in system_integrity.get("checks_run", []))], ["Generated At", system_integrity.get("generated_at", "")]])
+            + _compact_table(["Title", "Severity", "Category", "Evidence", "Why It Matters", "Recommendation"], [[item.get("title", ""), item.get("severity", ""), item.get("category", ""), item.get("evidence", ""), item.get("why_it_matters", item.get("description", "")), item.get("recommendation", "")] for item in system_integrity.get("findings", []) if isinstance(item, dict)], empty="No system integrity findings recorded.")
+            + "</details>"
+        )
     appendix_sections.append("<details open><summary>Detailed Evidence References</summary>" + _compact_table(["Reference", "Finding", "Full Evidence"], appendix_evidence_rows) + "</details>")
     appendix_sections.append("<details><summary>Raw Logs</summary>" + _compact_table(["Collector", "Command/Source", "Timestamp", "Exit", "stderr", "stdout"], raw_log_rows, empty="No raw logs recorded or raw logs excluded by report mode.") + "</details>")
     appendix_sections.append(
@@ -970,9 +1128,75 @@ def _render_professional_html_report(
         <h2>Framework Summary</h2>
         <p>Findings are mapped to and aligned with frameworks for analyst context. This is not a compliance, certification, or authorization claim.</p>
         {_compact_table(['Framework', 'Mapping', 'Findings'], framework_rows, empty='No framework mappings recorded.')}
+        <h3>MITRE ATT&amp;CK Detection Coverage</h3>
+        <p>{_e(mitre_coverage.get('qualification', ''))}</p>
+        {_compact_table(['Technique', 'Name', 'Tactic', 'Status', 'Evidence Sources', 'Limitations'], mitre_coverage_rows, empty='No ATT&CK coverage assessments recorded.')}
         <h3>Unmapped Findings</h3>
         {_compact_table(['Category', 'Finding'], [[item.get('category', ''), item.get('title', '')] for item in framework_summary.get('unmapped_findings', [])], empty='No unmapped findings.')}
         <a class="back-top" href="#top">Back to top</a>
+      </section>
+
+      <section id="continuous-assurance">
+        <h2>Continuous Security Assurance</h2>
+        <p>Posture scores are evidence-based decision support, not certification. Missing evidence receives no trust credit and does not by itself prove a security regression.</p>
+        {_compact_table(['Field', 'Value'], assurance_summary_rows, empty='No continuous assurance snapshot was attached to this report.')}
+        <h3>Recent Changes and Correlations</h3>
+        {_compact_table(['Timestamp', 'Component', 'Change', 'Severity', 'Score Impact', 'Explanation', 'Evidence'], assurance_change_rows, empty='No continuous assurance changes were attached to this report.')}
+        {"<p>Baseline drift reports what changed since the trusted baseline. Changes are review signals only and are not labeled malicious.</p>" if artifacts.get('baseline_drift') else ""}
+        <a class="back-top" href="#top">Back to top</a>
+      </section>
+
+      <section id="zero-trust-identity">
+        <h2>Zero Trust Device Identity</h2>
+        <p>Never trust, always verify. This is evidence-based decision support and does not grant, deny, or revoke endpoint access.</p>
+        {_compact_table(['Field', 'Value'], device_identity_rows, empty='No Zero Trust device attestation was attached to this report.')}
+        <h3>Policy Results</h3>
+        {_compact_table(['Policy', 'Matched', 'Recommended Action', 'Reason', 'Authorization Required'], device_policy_rows, empty='No Zero Trust policy results were attached to this report.')}
+        <h3>Reasons</h3>
+        {_compact_table(['Reason'], [[item] for item in device_attestation.get('reasons', [])], empty='No attestation reasons were attached to this report.')}
+        <a class="back-top" href="#top">Back to top</a>
+      </section>
+
+      <section id="security-posture-graph">
+        <h2>Security Posture Graph</h2>
+        <p>Observed evidence relationships are separated from analyst interpretation. Connected events are not automatically labeled malicious or compromised.</p>
+        {_compact_table(['Field', 'Value'], posture_graph_summary_rows, empty='No Security Posture Graph was attached to this report.')}
+        <h3>Qualified Risk Paths</h3>
+        {_compact_table(['Path', 'Event Sequence', 'Confidence', 'Risk', 'MITRE ATT&CK', 'Interpretation', 'Limitations'], posture_graph_path_rows, empty='No qualified multi-event risk paths were produced.')}
+        <h3>Score Explanation</h3>
+        {_compact_table(['Explanation'], [[item] for item in security_posture_graph.get('score_explanation', [])], empty='No graph score adjustment was recorded.')}
+        <a class="back-top" href="#top">Back to top</a>
+      </section>
+
+      <section id="threat-exposure-management">
+        <h2>Threat Exposure Management</h2>
+        <p>Priorities combine applicability, exploit intelligence, asset importance, reachability, trust, privilege, software provenance, and graph context. CVSS is not used alone.</p>
+        {_compact_table(['Field', 'Value'], exposure_summary_rows, empty='No Threat Exposure assessment was attached to this report.')}
+        {_compact_table(['Priority', 'Component', 'Category', 'CVE', 'Exploit Status', 'Score', 'Severity', 'Evidence', 'Explanation', 'Recommendation'], exposure_rows, empty='No evidence-backed exposures were identified.')}
+        <a class="back-top" href="#top">Back to top</a>
+      </section>
+      <section id="security-control-validation">
+        <h2>Security Control Validation</h2>
+        <p>Only fresh, sourced evidence can pass a control. Failed, excepted, and not-assessed controls receive no pass credit.</p>
+        {_compact_table(['Field','Value'],validation_summary_rows,empty='No control assessment was attached.')}
+        {_compact_table(['Control','Result','Expected','Actual','Severity','Framework','Evidence','Uncertainty','Remediation'],validation_rows,empty='No control results were attached.')}
+        <a class="back-top" href="#top">Back to top</a>
+      </section>
+      <section id="supply-chain-trust-graph">
+        <h2>Supply Chain Trust Graph</h2><p>Provenance, developer, certificate, source, dependency, vulnerability, and intelligence relationships require evidence. Unsigned software is not automatically malicious.</p>
+        {_compact_table(['Field','Value'],trust_summary,empty='No supply-chain trust graph attached.')}{_compact_table(['Software','Trust Score','State','Reasons','Evidence','Unknowns'],trust_rows,empty='No software trust assessments attached.')}<a class="back-top" href="#top">Back to top</a>
+      </section>
+      <section id="software-attestation">
+        <h2>Software Attestation</h2><p>Identity, SHA-256 integrity, provenance, notarization, behavior, and exposure context are assessed independently. A failed attestation does not by itself prove compromise.</p>
+        {_compact_table(['Field','Value'],attestation_summary,empty='No software attestation attached.')}{_compact_table(['Application','Version','Identity','Integrity','Provenance','Trust Score','State','Changes','Evidence'],attestation_rows,empty='No software attestation results attached.')}<a class="back-top" href="#top">Back to top</a>
+      </section>
+      <section id="security-regression-detection">
+        <h2>Security Regression Detection</h2><p>Historical changes are classified as improvements, neutral changes, or regressions using evidence, attribution, authorization, policy, and risk context. Changes are not assumed malicious.</p>
+        {_compact_table(['Field','Value'],regression_summary,empty='No security regression assessment attached.')}{_compact_table(['Component','Category','Previous','Current','Impact','Severity','Risk Δ','Changed By','Process','Authorized','Evidence','Recommendation'],regression_rows,empty='No evidence-backed changes were identified.')}<a class="back-top" href="#top">Back to top</a>
+      </section>
+      <section id="cyber-resilience-score">
+        <h2>Cyber Resilience Score</h2><p>This score measures evidenced detection, response, containment, recovery, identity, supply-chain, vulnerability, and configuration readiness. It is distinct from the MSAA weakness score and does not guarantee incident outcomes.</p>
+        {_compact_table(['Field','Value'],resilience_summary,empty='No cyber resilience assessment attached.')}{_compact_table(['Category','Score'],resilience_rows,empty='No category scores attached.')}{_compact_table(['Control','Category','Capability','Status','Credit','Evidence','Explanation','Recommendation'],resilience_control_rows,empty='No measured resilience controls attached.')}<a class="back-top" href="#top">Back to top</a>
       </section>
 
       <section id="limitations">
@@ -1024,6 +1248,7 @@ def export_json_report(
     comparison: BaselineComparison | None = None,
     dashboard: dict | None = None,
 ) -> Path:
+    assurance = security_assurance_for_findings(list(findings))
     payload = {
         "summary": summary.to_dict(),
         "security_score": summary.security_score,
@@ -1031,6 +1256,7 @@ def export_json_report(
         "dashboard": dashboard or {},
         "findings": [finding_to_dict(finding) for finding in findings],
         "comparison": comparison.to_dict() if comparison else {},
+        "security_control_assurance": assurance,
     }
     output_path = output_path or default_json_report_path()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1112,6 +1338,20 @@ def export_monitor_events_html(events: list[dict], output_path: Path) -> Path:
     return output_path
 
 
+def export_monitor_events_professional(events: list[dict], output_path: Path) -> Path:
+    fields = ("timestamp", "event_type", "severity", "source", "rule_id", "trigger_source", "confidence", "previous_state", "current_state", "evidence")
+    rows = tuple(
+        tuple(item.get(field, item.get("trigger_rule_id", "") if field == "rule_id" else "") for field in fields)
+        for item in events
+    )
+    return write_professional_report(
+        output_path,
+        title="MSAA Background Monitor Events",
+        tables=(ReportTable("Events", tuple(field.replace("_", " ").title() for field in fields), rows),),
+        qualification="Point-in-time local monitoring evidence. Missing events do not prove that activity did not occur.",
+    )
+
+
 def export_scan_result_json(
     scan_result: ScanResult,
     output_path: Path | None = None,
@@ -1127,6 +1367,7 @@ def export_scan_result_json(
     output_path = output_path or default_json_report_path()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = json_safe(scan_result.to_dict())
+    payload["findings"] = ensure_recommended_fixes(normalize_findings(payload.get("findings", [])))
     ports = payload.get("collected_artifacts", {}).get("ports", {"listening": [], "active_connections": [], "suspicious_review_needed": [], "errors": []})
     processes = payload.get("collected_artifacts", {}).get("processes", {"all": [], "suspicious": [], "errors": []})
     localhost_scan = payload.get("collected_artifacts", {}).get("localhost_scan", {})
@@ -1146,6 +1387,16 @@ def export_scan_result_json(
     system_integrity = payload.get("collected_artifacts", {}).get("system_integrity", {})
     evidence_graph = payload.get("collected_artifacts", {}).get("evidence_graph", {})
     ioc_matches = payload.get("collected_artifacts", {}).get("ioc_matches", {})
+    continuous_security_assurance = payload.get("collected_artifacts", {}).get("continuous_security_assurance", {})
+    zero_trust_device_identity = payload.get("collected_artifacts", {}).get("zero_trust_device_identity", {})
+    security_posture_graph = payload.get("collected_artifacts", {}).get("security_posture_graph", {})
+    threat_exposure_management = payload.get("collected_artifacts", {}).get("threat_exposure_management", {})
+    security_control_validation = payload.get("collected_artifacts", {}).get("security_control_validation", {})
+    supply_chain_trust_graph = payload.get("collected_artifacts", {}).get("supply_chain_trust_graph", {})
+    software_attestation = payload.get("collected_artifacts", {}).get("software_attestation", {})
+    security_regression_detection = payload.get("collected_artifacts", {}).get("security_regression_detection", {})
+    cyber_resilience_score = payload.get("collected_artifacts", {}).get("cyber_resilience_score", {})
+    data_governance = payload.get("collected_artifacts", {}).get("data_governance", {})
     if apple_security_forecast:
         production_cards = _production_forecast_cards(apple_security_forecast)
         apple_security_forecast = dict(apple_security_forecast)
@@ -1176,6 +1427,7 @@ def export_scan_result_json(
     if not evidence_graph:
         evidence_graph = EvidenceGraphBuilder().build_from_scan_result(scan_result, monitor_events=background_monitor_events or []).to_dict()
     framework_summary = framework_summary_for_findings([finding_to_dict(finding) for finding in scan_result.findings])
+    security_control_assurance = security_assurance_for_findings(list(scan_result.findings))
     score, score_label = score_from_findings(scan_result.findings)
     payload["security_score"] = score
     payload["score_label"] = score_label
@@ -1191,6 +1443,17 @@ def export_scan_result_json(
     payload["evidence_graph"] = evidence_graph
     payload["ioc_matches"] = ioc_matches
     payload["intrusion_correlation"] = intrusion_correlation
+    payload["continuous_security_assurance"] = continuous_security_assurance
+    payload["zero_trust_device_identity"] = zero_trust_device_identity
+    payload["security_posture_graph"] = security_posture_graph
+    payload["threat_exposure_management"] = threat_exposure_management
+    payload["security_control_validation"] = security_control_validation
+    payload["supply_chain_trust_graph"] = supply_chain_trust_graph
+    payload["software_attestation"] = software_attestation
+    payload["security_regression_detection"] = security_regression_detection
+    payload["cyber_resilience_score"] = cyber_resilience_score
+    payload["data_governance"] = data_governance
+    payload["security_control_assurance"] = security_control_assurance
     payload["physical_devices"] = physical_devices
     payload["network_intelligence"] = network_intelligence
     payload["report_summary"] = {
@@ -1225,7 +1488,18 @@ def export_scan_result_json(
         "evidence_graph": evidence_graph,
         "ioc_matches": ioc_matches,
         "intrusion_correlation": intrusion_correlation,
+        "continuous_security_assurance": continuous_security_assurance,
+        "zero_trust_device_identity": zero_trust_device_identity,
+        "security_posture_graph": security_posture_graph,
+        "threat_exposure_management": threat_exposure_management,
+        "security_control_validation": security_control_validation,
+        "supply_chain_trust_graph": supply_chain_trust_graph,
+        "software_attestation": software_attestation,
+        "security_regression_detection": security_regression_detection,
+        "cyber_resilience_score": cyber_resilience_score,
+        "data_governance": data_governance,
         "framework_summary": framework_summary,
+        "security_control_assurance": security_control_assurance,
         "execution_evidence": execution_evidence,
         "investigation_priorities": investigation_priorities,
         "alert_storm_summaries": [
@@ -1314,7 +1588,7 @@ def export_html_report(
     comparison = comparison or BaselineComparison()
     output_path = output_path or default_html_report_path()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    normalized_findings = normalize_findings(findings)
+    normalized_findings = ensure_recommended_fixes(normalize_findings(findings))
     document = _render_professional_html_report(
         metadata={
             "hostname": "Not collected",
@@ -1349,7 +1623,7 @@ def export_scan_result_html(
 ) -> Path:
     output_path = output_path or default_html_report_path()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    findings = normalize_findings(scan_result.findings)
+    findings = ensure_recommended_fixes(normalize_findings(scan_result.findings))
     background_monitor_events = background_monitor_events or []
     artifacts = json_safe(scan_result.to_dict()["collected_artifacts"])
     ports = artifacts.get("ports", {"listening": [], "active_connections": [], "suspicious_review_needed": [], "errors": []})
@@ -1638,6 +1912,16 @@ def export_scan_result_html(
         f"<tr><td>{html.escape(str(item.get('category', '')))}</td><td>{html.escape(str(item.get('title', '')))}</td></tr>"
         for item in framework_summary.get("unmapped_findings", [])
     ) or '<tr><td colspan="2">No unmapped findings.</td></tr>'
+    mitre_coverage = security_control_assurance["mitre_attack_coverage"]
+    mitre_coverage_rows = "".join(
+        f"<tr><td>{html.escape(str(item.get('technique_id', '')))}</td>"
+        f"<td>{html.escape(str(item.get('technique_name', '')))}</td>"
+        f"<td>{html.escape(str(item.get('tactic', '')))}</td>"
+        f"<td>{html.escape(str(item.get('status', '')))}</td>"
+        f"<td>{html.escape(', '.join(str(value) for value in item.get('evidence_sources', [])))}</td>"
+        f"<td>{html.escape('; '.join(str(value) for value in item.get('limitations', [])))}</td></tr>"
+        for item in mitre_coverage.get("techniques", [])
+    ) or '<tr><td colspan="6">No ATT&amp;CK coverage assessments recorded.</td></tr>'
     investigation_priority_summary_rows = "".join(
         f"<tr><td>{html.escape(str(label))}</td><td>{html.escape(str(value))}</td></tr>"
         for label, value in [
@@ -2232,6 +2516,12 @@ def export_scan_result_html(
     <table>
       <thead><tr><th>Category</th><th>Finding</th></tr></thead>
       <tbody>{unmapped_rows}</tbody>
+    </table>
+    <h3>MITRE ATT&amp;CK Detection Coverage</h3>
+    <p>{html.escape(str(mitre_coverage.get('qualification', '')))}</p>
+    <table>
+      <thead><tr><th>Technique</th><th>Name</th><th>Tactic</th><th>Status</th><th>Evidence Sources</th><th>Limitations</th></tr></thead>
+      <tbody>{mitre_coverage_rows}</tbody>
     </table>
   </div>
   <div class="card">

@@ -7,6 +7,7 @@ from typing import Any
 from mac_audit_agent.assessment import SecurityAssessment
 from mac_audit_agent.exporters.export_models import ExportAssessmentData, ExportOptions, build_export_assessment_data
 from mac_audit_agent.ui.severity_styles import get_severity_style, normalize_severity
+from mac_audit_agent.runtime.optional_dependencies import missing_office_dependency
 
 
 def _require_openpyxl():
@@ -16,7 +17,7 @@ def _require_openpyxl():
         from openpyxl.utils import get_column_letter
         from openpyxl.worksheet.datavalidation import DataValidation
     except ImportError as exc:
-        raise RuntimeError("Excel export requires openpyxl. Install project dependencies including openpyxl to create .xlsx reports.") from exc
+        raise missing_office_dependency("openpyxl") from exc
     return Workbook, Alignment, Font, PatternFill, get_column_letter, DataValidation
 
 
@@ -121,6 +122,13 @@ def _build_workbook(data: ExportAssessmentData):
     remediation_rows = _rows_from_dicts(data.remediation_items, remediation_columns)
     remediation_ws = _write_sheet(wb, "Remediation Plan", remediation_columns, remediation_rows)
     _add_status_dropdown(remediation_ws, remediation_columns, len(remediation_rows))
+    recommended_fix_columns = ["finding_id", "severity", "title", "immediate_action", "recommended_fix_detail", "examine_further", "evidence_to_collect", "validation_step", "source_mappings_text"]
+    _write_sheet(wb, "Recommended Fixes", recommended_fix_columns, _rows_from_dicts(data.findings, recommended_fix_columns))
+    _write_sheet(wb, "CVE NVD Enrichment", ["finding_id", "title", "cve", "recommended_fix_detail", "source_mappings_text"], _rows_from_dicts(data.findings, ["finding_id", "title", "cve", "recommended_fix_detail", "source_mappings_text"]))
+    _write_sheet(wb, "CISA KEV", ["finding_id", "title", "cisa_kev", "immediate_action", "source_mappings_text"], _rows_from_dicts(data.findings, ["finding_id", "title", "cisa_kev", "immediate_action", "source_mappings_text"]))
+    _write_sheet(wb, "MITRE Mapping", ["finding_id", "title", "mitre_attack", "examine_further", "source_mappings_text"], _rows_from_dicts(data.findings, ["finding_id", "title", "mitre_attack", "examine_further", "source_mappings_text"]))
+    _write_sheet(wb, "Apple Evidence Checklist", ["finding_id", "title", "apple_evidence_checklist", "evidence_to_collect"], _rows_from_dicts(data.findings, ["finding_id", "title", "apple_evidence_checklist", "evidence_to_collect"]), severity_column="")
+    _write_sheet(wb, "False Positive Review", ["finding_id", "title", "false_positive_review", "false_positive_notes", "status"], _rows_from_dicts(data.findings, ["finding_id", "title", "false_positive_review", "false_positive_notes", "status"]), severity_column="status")
     _write_sheet(wb, "Apple Exposure", ["advisory", "severity", "affected_component", "current_version", "recommended_action", "update_guidance_title", "update_guidance_summary", "verification_steps", "evidence_preservation_notes", "official_references", "kev_status", "database_checked", "last_successful_update", "freshness_status", "suggested_fix"], _rows_from_dicts(data.apple_exposure, ["advisory", "severity", "affected_component", "current_version", "recommended_action", "update_guidance_title", "update_guidance_summary", "verification_steps", "evidence_preservation_notes", "official_references", "kev_status", "database_checked", "last_successful_update", "freshness_status", "suggested_fix"]))
     _write_sheet(wb, "Network Activity", ["event_id", "severity", "source", "local_address", "local_port", "remote_address", "remote_port", "process", "pid", "signed_status", "evidence", "suggested_fix"], _rows_from_dicts(data.network_activity, ["event_id", "severity", "source", "local_address", "local_port", "remote_address", "remote_port", "process", "pid", "signed_status", "evidence", "suggested_fix"]))
     _write_sheet(wb, "Admin Persistence", ["finding_id", "severity", "type", "path_user", "owner", "permissions", "signed_status", "first_seen", "baseline_status", "evidence", "suggested_fix"], _rows_from_dicts(data.admin_persistence, ["finding_id", "severity", "type", "path_user", "owner", "permissions", "signed_status", "first_seen", "baseline_status", "evidence", "suggested_fix"]))
@@ -141,6 +149,9 @@ def _build_workbook(data: ExportAssessmentData):
     poam_columns = ["poam_id", "framework", "requirement_id", "weakness", "risk_level", "source_finding_id", "recommended_fix", "validation_step", "owner", "target_completion_date", "status", "evidence_needed", "notes"]
     poam_ws = _write_sheet(wb, "POA&M", poam_columns, _rows_from_dicts(data.cmmc_poam, poam_columns), severity_column="risk_level")
     _add_status_dropdown(poam_ws, poam_columns, len(data.cmmc_poam))
+    remediation_poam_columns = ["finding_id", "severity", "poam_weakness", "poam_affected_asset", "poam_recommended_fix", "poam_validation_method", "status"]
+    remediation_poam_ws = _write_sheet(wb, "Remediation POA&M", remediation_poam_columns, _rows_from_dicts(data.findings, remediation_poam_columns), severity_column="severity")
+    _add_status_dropdown(remediation_poam_ws, remediation_poam_columns, len(data.findings))
     source_columns = ["source_id", "framework", "title", "version", "retrieved_at", "source_url", "normative"]
     _write_sheet(wb, "Source Versions", source_columns, _rows_from_dicts(data.cmmc_source_versions, source_columns), severity_column="")
     manual_columns = ["requirement_id", "evidence_needed", "suggested_document_name", "owner", "status", "notes"]

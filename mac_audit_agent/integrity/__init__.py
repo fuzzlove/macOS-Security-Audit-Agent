@@ -29,6 +29,7 @@ from mac_audit_agent.integrity.verifier import (
     IntegrityVerificationResult,
     verify_integrity_manifest,
 )
+from mac_audit_agent.integrity.doctor import build_integrity_doctor_status
 
 __all__ = [
     "DEFAULT_EXCLUDED_PATTERNS",
@@ -40,6 +41,7 @@ __all__ = [
     "IntegrityState",
     "IntegrityVerificationResult",
     "TrustedManifest",
+    "build_integrity_doctor_status",
     "calculate_sha256",
     "collect_integrity_files",
     "create_integrity_manifest",

@@ -1,0 +1,29 @@
+schema_version: "1.0"
+default_operational_mode: ADVISORY
+invalid_authorization_fallback: ADVISORY
+allowed_modes: [ADVISORY, SIMULATION, LAB_EXECUTION, AUTHORIZED_OPERATIONAL]
+authorization:
+  require_current_approved_context: true
+  require_target_action_effect_jurisdiction_match: true
+  assertions_do_not_grant_authority: [license, nda, developer_mode, administrator_role, debug_mode, user_assertion, government_affiliation, emergency]
+human_approval:
+  consequential_actions: [production_change, privileged_access, credential_use, persistence, lateral_movement, data_extraction, security_control_modification, monitoring_impairment, service_interruption, destructive_action, cross_border_effect]
+data_handling:
+  restricted_categories: [credentials, private_keys, authentication_tokens, classified_documents, controlled_information, unnecessary_personal_information]
+  external_ai_default: prohibited
+  redact_audit_events: true
+validation:
+  unknown_value: "Not verified"
+  missing_source: "Source unavailable"
+  missing_framework_version: "Framework version not configured"
+  require_independent_validation_for_consequential_use: true
+framework_versions:
+  # Administrators must set versions reviewed for their engagement; blanks fail safely.
+  nist_ai_rmf: ""
+  nist_csf: ""
+  mitre_attack: ""
+  cisa_secure_by_design_retrieved: ""
+eula:
+  current_version: "DRAFT-1.0"
+  require_reacceptance_on_version_change: true
+  require_acceptance_each_application_launch: true

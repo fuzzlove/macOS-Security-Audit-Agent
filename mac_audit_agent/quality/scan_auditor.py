@@ -27,6 +27,7 @@ def run_scan_audit(context: AuditContext) -> list[FunctionalCheck]:
     checks.append(_artifact_check(context, "scan.admin_persistence", "admin/persistence scan", ["launch_snapshots", "users"], "Admin/persistence artifacts should be present or explicitly unavailable."))
     checks.append(_artifact_check(context, "scan.physical_devices", "physical devices scan", ["physical_devices", "hardware"], "Physical device inventory should be present or explicitly unavailable."))
     checks.append(_apple_exposure_check(context))
+    checks.append(_apple_exposure_update_guidance_check())
     checks.append(_visibility_check(context))
     checks.append(_baseline_check(context))
     checks.append(_assessment_check(context))
@@ -95,6 +96,27 @@ def _apple_exposure_check(context: AuditContext) -> FunctionalCheck:
     if any(values.values()):
         return check.passed("Apple Exposure freshness metadata found.", values)
     return check.warn("Apple Exposure freshness metadata not found.", "Run Apple Exposure Assessment and persist last_check_attempt_at and last_successful_update_at separately.", values)
+
+
+def _apple_exposure_update_guidance_check() -> FunctionalCheck:
+    check = FunctionalCheck("apple_exposure.update_guidance", "Scans", "Apple Exposure update guidance", "Update guidance handles structured Apple Exposure payloads without crashing.", "high", "smoke")
+    try:
+        from mac_audit_agent.apple_exposure_guidance import build_apple_exposure_update_guide
+
+        samples = [
+            {"title": "macOS CVE", "cves": ["CVE-2025-1111"], "nvd": {"cvss": "high"}, "fixed_version": "15.1"},
+            {"title": "No CVE Apple advisory", "references": ["https://support.apple.com/en-us/100100"]},
+            {"title": "List fields", "cves": [], "references": ["", None, []], "products": ["macOS"]},
+            {"title": "Nested dict fields", "nvd": {"cvss": "high"}, "kev": {"known": False}},
+            {},
+        ]
+        guides = [build_apple_exposure_update_guide(sample, {"macos_version": "15.0"}, {"generated_at": "pre_uat"}) for sample in samples]
+        blank = [guide.title for guide in guides if not guide.to_text().strip() or not guide.recommended_actions or not guide.limitations]
+        if blank:
+            return check.failed("Apple Exposure update guidance returned blank or incomplete guidance.", "Ensure guidance includes recommended actions and source limitations.", {"blank": blank})
+        return check.passed("Apple Exposure update guidance handles CVE, no-CVE, list, nested dict, and empty payloads.", {"sample_count": len(guides)})
+    except Exception as exc:
+        return check.failed(str(exc), "Fix Apple Exposure update guidance crash before UAT.", {"exception": type(exc).__name__})
 
 
 def _visibility_check(context: AuditContext) -> FunctionalCheck:

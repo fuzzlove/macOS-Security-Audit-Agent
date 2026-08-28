@@ -8,9 +8,25 @@ include Thankyou.md
 include logo.png
 include logo2.png
 include *.spec
-recursive-include mac_audit_agent/assets *.png *.icns
-recursive-include icon.iconset *.png
-recursive-include docs *.md
+recursive-include mac_audit_agent/assets *.png *.json *.icns
+recursive-include mac_audit_agent/help/resources *.md
+recursive-include mac_audit_agent/anti_typosquatting *.json
+include mac_audit_agent/integrity/integrity_manifest.json
+include mac_audit_agent/integrity/integrity_manifest.signature.json
+include mac_audit_agent/integrity/trust_policy.json
+recursive-include mac_audit_agent/integrity/trust *.pem
+recursive-include native/ClickFixGuard *.swift *.plist *.sh *.json *.sig
+recursive-include packaging/clickfix *.template
+include scripts/install_clickfix_guard.py
+recursive-include docs clickfix_guard_*.md
+include docs/PRODUCT_LICENSING.md
+include docs/STRIPE_LICENSING.md
+include config/stripe-licensing.example.env
+prune mac_audit_agent/tests
+prune tests
+prune reports
+prune icon.iconset
 global-exclude __pycache__/*
 global-exclude *.py[cod]
+global-exclude test_*.py
 global-exclude .DS_Store

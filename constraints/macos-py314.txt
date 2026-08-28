@@ -1,0 +1,16 @@
+# Reproducible tested profile for standard GIL-enabled CPython 3.14 on macOS.
+# Keep the four Qt-for-Python distributions exactly aligned.
+PySide6==6.11.1
+shiboken6==6.11.1
+PySide6-Essentials==6.11.1
+PySide6-Addons==6.11.1
+PyInstaller==6.21.0
+pyinstaller-hooks-contrib==2026.6
+altgraph==0.17.5
+setuptools==83.0.0
+wheel==0.47.0
+packaging==26.2
+python-docx==1.2.0
+openpyxl==3.1.5
+build==1.5.0
+twine==6.2.0

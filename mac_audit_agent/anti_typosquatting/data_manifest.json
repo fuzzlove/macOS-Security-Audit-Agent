@@ -1,0 +1,11 @@
+{
+  "schema_version": "1.0",
+  "profile": "MSAA-audited-subset-1",
+  "coverage_claim": "Audited confusable and keyboard subset; not comprehensive worldwide linguistic coverage",
+  "generated_at": "2026-07-12T00:00:00Z",
+  "sources": [
+    {"name": "Unicode UTS #39 confusables", "url": "https://www.unicode.org/Public/security/latest/confusables.txt", "bundled": false},
+    {"name": "Unicode CLDR keyboards", "url": "https://github.com/unicode-org/cldr", "bundled": false}
+  ],
+  "bundled_data": {"confusables_version": "MSAA-audited-subset-2026-07", "cldr_profile_version": "generic-keyboard-subset-2026-07"}
+}

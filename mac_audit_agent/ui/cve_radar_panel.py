@@ -3,17 +3,21 @@ from __future__ import annotations
 import json
 import html
 import logging
+import traceback
+from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
+    QApplication,
     QDialog,
     QDialogButtonBox,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QFileDialog,
     QListWidget,
     QListWidgetItem,
     QPushButton,
@@ -25,6 +29,7 @@ from PySide6.QtWidgets import (
 
 from mac_audit_agent.ui.action_state import ActionState, apply_action_state
 from mac_audit_agent.apple_exposure_guidance import build_apple_exposure_update_guide
+from mac_audit_agent.apple_exposure_guidance_validation import validate_apple_exposure_payload
 
 
 LOGGER = logging.getLogger(__name__)
@@ -188,6 +193,40 @@ class CveRadarUpdateGuidanceDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+
+class CveRadarUpdateGuidanceErrorDialog(QDialog):
+    def __init__(self, body: str, diagnostics: dict[str, Any], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.diagnostics = diagnostics
+        self.body = body
+        self.setWindowTitle("Update Guidance Error")
+        layout = QVBoxLayout(self)
+        viewer = QTextEdit()
+        viewer.setReadOnly(True)
+        viewer.setPlainText(body)
+        layout.addWidget(viewer)
+        action_row = QHBoxLayout()
+        self.copy_button = make_forecast_button("Copy Error Details", "Copy diagnostic context for support or bug reports.", "secondary", min_width=160)
+        self.export_button = make_forecast_button("Export Diagnostic Context", "Export diagnostic context to a local JSON file.", "secondary", min_width=190)
+        action_row.addWidget(self.copy_button)
+        action_row.addWidget(self.export_button)
+        layout.addLayout(action_row)
+        self.copy_button.clicked.connect(self.copy_error_details)
+        self.export_button.clicked.connect(self.export_diagnostic_context)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def copy_error_details(self) -> None:
+        QApplication.clipboard().setText(json.dumps(self.diagnostics, indent=2, sort_keys=True))
+
+    def export_diagnostic_context(self) -> None:
+        default = str(Path.home() / "Desktop" / "msaa_apple_exposure_guidance_error.json")
+        output_path, _ = QFileDialog.getSaveFileName(self, "Export Diagnostic Context", default, "JSON Files (*.json)")
+        if not output_path:
+            return
+        Path(output_path).write_text(json.dumps(self.diagnostics, indent=2, sort_keys=True), encoding="utf-8")
 
 
 class CveRadarSnoozeDialog(QDialog):
@@ -787,6 +826,7 @@ class CveRadarPanel(QFrame):
     def _open_card_update_guidance(self, card: dict[str, Any] | None) -> None:
         try:
             inventory = self._radar_payload.get("inventory", {}) if isinstance(self._radar_payload.get("inventory", {}), dict) else {}
+            validation = validate_apple_exposure_payload(card)
             guide = build_apple_exposure_update_guide(card, inventory, self._radar_payload)
             body = guide.to_text()
             diagnostics = {
@@ -800,6 +840,7 @@ class CveRadarPanel(QFrame):
                 "guide_generated": bool(body.strip()),
                 "missing_fields": guide.missing_fields,
                 "fallback_used": guide.fallback_used,
+                "validation": validation.to_dict(),
             }
             LOGGER.info("Apple Exposure update guidance opened %s", diagnostics)
             dialog = CveRadarUpdateGuidanceDialog(
@@ -813,11 +854,36 @@ class CveRadarPanel(QFrame):
             dialog.exec()
         except Exception as exc:
             LOGGER.exception("Apple Exposure update guidance failed: %s", exc)
-            dialog = CveRadarDetailsDialog(
-                "Update Guidance Error",
-                f"Update guidance could not be opened.\n\nError: {exc}\n\nRefresh Apple Exposure Assessment or view diagnostics.",
-                self,
+            title = str(card.get("title", "Unknown Apple Exposure item")) if isinstance(card, dict) else "Unknown Apple Exposure item"
+            cves = []
+            if isinstance(card, dict):
+                raw_cves = card.get("cve_ids") or card.get("cves") or card.get("cve_id") or card.get("cve") or []
+                cves = raw_cves if isinstance(raw_cves, list) else [raw_cves]
+            diagnostics = {
+                "message": "Update guidance could not be generated for this item.",
+                "title": title,
+                "cves": [str(item) for item in cves if str(item).strip()],
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+                "safe_remediation_fallback": "Check Apple Software Update and review the finding details.",
+                "card": card if isinstance(card, dict) else repr(card),
+            }
+            body = "\n".join(
+                [
+                    "Update guidance could not be generated for this item.",
+                    "",
+                    f"Finding/card: {title}",
+                    f"CVE: {', '.join(diagnostics['cves']) if diagnostics['cves'] else 'none recorded'}",
+                    f"Error type: {type(exc).__name__}",
+                    "",
+                    "Safe fallback:",
+                    "Check Apple Software Update and review the finding details.",
+                    "",
+                    "Use Copy Error Details or Export Diagnostic Context to preserve troubleshooting data.",
+                ]
             )
+            dialog = CveRadarUpdateGuidanceErrorDialog(body, diagnostics, self)
             dialog.exec()
 
     def open_software_update(self) -> None:

@@ -1,0 +1,1 @@
+{"bundle_format":1,"classifier_version":"clickfix-static-1.0.0","development_trust_root":true,"rule_groups":["command_grammar","credential_access","download_execute","interpreter","obfuscation","persistence","security_impairment"],"rules_are_compiled":true}

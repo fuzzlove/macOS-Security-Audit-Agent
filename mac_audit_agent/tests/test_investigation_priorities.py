@@ -192,4 +192,3 @@ def test_investigation_priority_report_counts_are_stable(tmp_path: Path) -> None
     assert len(report.top_3) == min(3, len(scan.findings))
     assert len(report.top_10) == len(scan.findings)
     assert "investigative value" in report.summary
-

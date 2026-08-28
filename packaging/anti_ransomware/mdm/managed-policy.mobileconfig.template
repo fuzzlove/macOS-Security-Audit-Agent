@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>PayloadType</key><string>Configuration</string><key>PayloadVersion</key><integer>1</integer>
+<key>PayloadIdentifier</key><string>ORG_IDENTIFIER.msaa.managed-policy</string><key>PayloadUUID</key><string>REPLACE_WITH_UUID</string>
+<key>PayloadDisplayName</key><string>MSAA Managed Anti-Ransomware Policy Template — Review and Sign Before Deployment</string>
+<key>PayloadContent</key><array><dict><key>PayloadType</key><string>ORG_IDENTIFIER.msaa.policy</string><key>PayloadVersion</key><integer>1</integer><key>PayloadIdentifier</key><string>ORG_IDENTIFIER.msaa.policy.payload</string><key>PayloadUUID</key><string>REPLACE_WITH_POLICY_UUID</string><key>ProtectionMode</key><string>OBSERVE</string><key>RansomPaymentPolicy</key><string>PROHIBITED</string><key>ManagementDestinations</key><array><string>REPLACE_WITH_ORGANIZATION_APPROVED_DESTINATION</string></array></dict></array>
+</dict></plist>

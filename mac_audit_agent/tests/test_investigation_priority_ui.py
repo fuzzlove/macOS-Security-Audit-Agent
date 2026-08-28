@@ -44,8 +44,8 @@ def test_investigation_priorities_tab_exists_and_renders_rows(tmp_path: Path) ->
     app = QApplication.instance() or QApplication([])
     window = MainWindow(tmp_path / "audit.sqlite")
     tabs = [window.results_tabs.tabText(index) for index in range(window.results_tabs.count())]
-    assert "Investigation Priorities" in tabs
-    assert window.investigation_priority_panel.title_label.text() == "Investigation Priorities"
+    assert "Investigation Priority" in tabs
+    assert window.investigation_priority_panel.title_label.text() == "Investigation Priority"
     assert "No findings to prioritize" in window.investigation_priority_panel.details_view.toPlainText()
 
     window.current_scan_result = _scan_result()
@@ -56,4 +56,3 @@ def test_investigation_priorities_tab_exists_and_renders_rows(tmp_path: Path) ->
 
     window.close()
     app.processEvents()
-

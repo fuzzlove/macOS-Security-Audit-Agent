@@ -17,7 +17,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from mac_audit_agent.ui.button_factory import create_toolbar_button
+from mac_audit_agent.ui.responsive_actions import ResponsiveActionRow
 from mac_audit_agent.ui.severity_styles import apply_severity_to_table_item
+from mac_audit_agent.ui.rdap_lookup_widget import RDAPLookupWidget
 
 
 def _table(headers: list[str]) -> QTableWidget:
@@ -51,20 +54,18 @@ class NetworkIntelligencePanel(QFrame):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
-        toolbar = QHBoxLayout()
-        self.refresh_button = QPushButton("Refresh Network Intelligence")
-        self.nmap_button = QPushButton("Nmap Local Scan")
-        self.discovery_button = QPushButton("Local Network Discovery")
-        self.settings_button = QPushButton("Network Settings")
+        toolbar = ResponsiveActionRow()
+        self.refresh_button = create_toolbar_button("Refresh Network Intelligence")
+        self.nmap_button = create_toolbar_button("Nmap Local Scan")
+        self.discovery_button = create_toolbar_button("Local Network Discovery")
+        self.settings_button = create_toolbar_button("Network Settings")
         self.refresh_button.clicked.connect(self.refresh_requested.emit)
         self.nmap_button.clicked.connect(self.nmap_requested.emit)
         self.discovery_button.clicked.connect(self.local_discovery_requested.emit)
         self.settings_button.clicked.connect(self.settings_requested.emit)
         for button in [self.refresh_button, self.nmap_button, self.discovery_button, self.settings_button]:
-            button.setMinimumHeight(34)
-            toolbar.addWidget(button)
-        toolbar.addStretch(1)
-        layout.addLayout(toolbar)
+            toolbar.add_button(button)
+        layout.addWidget(toolbar)
 
         self.disabled_label = QLabel("")
         self.disabled_label.setWordWrap(True)
@@ -89,6 +90,9 @@ class NetworkIntelligencePanel(QFrame):
         layout.addWidget(QLabel("Live Connections"))
         self.connections_table = _table(["Severity", "Process", "PID", "Local Address", "Remote Address", "Port", "State", "Risk"])
         layout.addWidget(self.connections_table)
+        self.rdap = RDAPLookupWidget(self)
+        layout.addWidget(self.rdap)
+        self.connections_table.itemSelectionChanged.connect(self._rdap_from_connection)
 
         layout.addWidget(QLabel("Listening Ports"))
         self.listeners_table = _table(["Severity", "Process", "PID", "Address", "Port", "Service", "Visibility Status", "Risk"])
@@ -156,6 +160,13 @@ class NetworkIntelligencePanel(QFrame):
             for item in rows
         ] or [["info", "No live connections collected", "", "", "", "", "", "Run Refresh Network Intelligence."]]
         self._populate(self.connections_table, values, severity_column=0)
+
+    def _rdap_from_connection(self) -> None:
+        row = self.connections_table.currentRow()
+        if row >= 0:
+            item = self.connections_table.item(row, 4)
+            if item is not None:
+                self.rdap.set_address(item.text())
 
     def _populate_listeners(self, rows: list[dict[str, Any]]) -> None:
         values = [

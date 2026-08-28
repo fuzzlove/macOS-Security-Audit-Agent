@@ -1,0 +1,23 @@
+import Foundation
+import CryptoKit
+
+public struct ExportManifest:Codable { public let schemaVersion,msaaVersion,evaluatorVersion,policyID,policyVersion,policySignatureStatus,exportedAt,evidenceTimeRange,hostIdentifier,signerType,simulationStatus:String; public let knownEvidenceGaps:[String]; public let files:[String:String]; public let checkpointDigest:String }
+public struct BundleInputs { public let controls:[ControlDefinition];public let evaluations:[EvaluationResult];public let evidence:[EvidenceObservation];public let collectors:[CollectorHealth];public let validations:[[String:String]];public let exceptions:[ControlException];public let policyID,policyVersion,policySignatureStatus,hostIdentifier:String }
+public enum EvidenceBundle {
+    private static func json<T:Encodable>(_ value:T)throws->Data{try Canonical.data(value)}
+    public static func export(_ input:BundleInputs,to destination:URL,signer:EvidenceSigner,now:Date=Date())throws {
+        guard let root=SafePath.normalizedExport(destination) else{throw AssuranceError.unsafePath}; try FileManager.default.createDirectory(at:root,withIntermediateDirectories:false,attributes:[.posixPermissions:0o700])
+        var files:[String:Data]=[:]; files["control-definitions.json"]=try json(input.controls);files["evaluations.json"]=try json(input.evaluations);files["collector-health.json"]=try json(input.collectors);files["validation-results.json"]=try json(input.validations);files["exceptions.json"]=try json(input.exceptions);files["framework-mappings.json"]=try json(input.controls.flatMap{$0.sourceMappings});files["evidence-events.jsonl"]=try input.evidence.map{try json($0)+Data([10])}.reduce(into:Data()){$0.append($1)};files["README.txt"]=Data("MSAA native evidence bundle. Verify with msaa-verify. Mappings do not constitute certification.\n".utf8)
+        let checkpoint=input.evidence.last?.recordDigest ?? Canonical.zeroDigest; files["checkpoints.json"]=try json([["sequence":String(input.evidence.last?.sequenceNumber ?? 0),"recordDigest":checkpoint]])
+        let digests=files.mapValues { Canonical.sha256($0) }; let simulation=input.evidence.contains{$0.simulationStatus != .production} ? "contains-simulated":"production-only"
+        let manifest=ExportManifest(schemaVersion:"1.0",msaaVersion:"0.1.0",evaluatorVersion:Evaluator.version,policyID:input.policyID,policyVersion:input.policyVersion,policySignatureStatus:input.policySignatureStatus,exportedAt:Canonical.timestamp(now),evidenceTimeRange:"\(input.evidence.first.map{Canonical.timestamp($0.observedAt)} ?? "none")/\(input.evidence.last.map{Canonical.timestamp($0.observedAt)} ?? "none")",hostIdentifier:input.hostIdentifier,signerType:signer.signerType,simulationStatus:simulation,knownEvidenceGaps:input.collectors.filter{$0.currentState != .healthy}.map{$0.collectorID},files:digests,checkpointDigest:checkpoint)
+        let manifestData=try json(manifest); let signature=try signer.sign(Data(Canonical.sha256(manifestData).utf8)); files["manifest.json"]=manifestData; files["signature-metadata.json"]=try json(signature);files["public-verification-key"]=Data(signature.publicKey.utf8)
+        for (name,data) in files { try data.write(to:root.appendingPathComponent(name),options:.atomic) }
+    }
+    public static func verify(_ root:URL,now:Date=Date())throws->ChainVerification {
+        let decoder=JSONDecoder(); let manifestData=try Data(contentsOf:root.appendingPathComponent("manifest.json")); let manifest=try decoder.decode(ExportManifest.self,from:manifestData); guard manifest.schemaVersion=="1.0" else{throw AssuranceError.chainIntegrity}
+        for (name,digest) in manifest.files { guard Canonical.sha256(try Data(contentsOf:root.appendingPathComponent(name)))==digest else{throw AssuranceError.chainIntegrity} }
+        let metadata=try decoder.decode(SignatureMetadata.self,from:Data(contentsOf:root.appendingPathComponent("signature-metadata.json")));guard SignatureVerifier.verify(Data(Canonical.sha256(manifestData).utf8),metadata:metadata) else{throw AssuranceError.chainIntegrity}
+        decoder.dateDecodingStrategy = .custom{ d in let c=try d.singleValueContainer();let s=try c.decode(String.self);guard let date=ISO8601DateFormatter.msaa.date(from:s)else{throw AssuranceError.malformedEvidence};return date};let rows=try Data(contentsOf:root.appendingPathComponent("evidence-events.jsonl")).split(separator:10).map{try decoder.decode(EvidenceObservation.self,from:Data($0))};let result=EvidenceChain.verify(rows,now:now);guard result.valid,rows.last?.recordDigest ?? Canonical.zeroDigest == manifest.checkpointDigest else{throw AssuranceError.chainIntegrity};return result
+    }
+}

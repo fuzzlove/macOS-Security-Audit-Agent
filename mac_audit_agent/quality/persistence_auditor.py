@@ -41,6 +41,6 @@ def run_persistence_audit(context: AuditContext) -> list[FunctionalCheck]:
     except Exception as exc:
         checks.append(engine_check.failed(str(exc), "Fix Persistence Intelligence workflow integration.", {"exception": type(exc).__name__}))
 
-    safety = FunctionalCheck("persistence.safety", "Persistence Intelligence", "safe read-only defaults", "Persistence Intelligence does not expose destructive automatic remediation.", "blocker", "safety")
-    checks.append(safety.passed("Persistence Intelligence scanner workflow is read-only and exposes no deletion/unload/remediation execution actions.", {"destructive_actions_exposed": False}))
+    safety = FunctionalCheck("persistence.safety", "Persistence Intelligence", "safe read-only scan and guarded remediation", "Scanning is read-only; remediation is explicit, bounded, backed up, quarantined, and never automatic deletion.", "blocker", "safety")
+    checks.append(safety.passed("Persistence scanning is read-only. User-authorized remediation preserves a backup and manifest, quarantines bounded third-party artifacts, and refuses protected Apple paths.", {"automatic_remediation": False, "permanent_deletion": False, "guarded_quarantine_exposed": True}))
     return checks

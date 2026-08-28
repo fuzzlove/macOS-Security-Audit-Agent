@@ -24,7 +24,9 @@
   - full-page preferred render size: 240x240
   - full-page maximum QR label: 320x320
   - fixed label size policy to preserve a square QR region
-- Loaded/scaled bundled production QR art with `Qt.KeepAspectRatio`
+- Loads the bundled 370x370 production QR without an initial resize, then renders it at 296x296: exactly 37 modules at 8 pixels per module
+- Uses nearest-neighbor rendering and fixed QR bounds so Qt layouts cannot apply fractional resampling
+- Shows a clear unavailable message instead of a decorative pseudo-QR if the production asset is missing or corrupt
 - Added an internal `QScrollArea` with vertical scrollbar as needed and no horizontal scrollbar
 - Set the support card to `QSizePolicy.Expanding, QSizePolicy.MinimumExpanding`
 - Set full-page support card minimum height to 420px
@@ -35,7 +37,7 @@
 ## Current Layout Contract
 
 - QR code remains square and centered.
-- QR code is never intentionally cropped; pixmap scaling uses `Qt.KeepAspectRatio`.
+- QR code is never cropped or fractionally resampled; its 37-module grid and four-module quiet zone remain intact.
 - Text labels wrap instead of truncating or requiring horizontal scrolling.
 - The support card can grow vertically when space exists.
 - When vertical space is unusually constrained, the internal scroll area exposes the full QR and text content instead of clipping children.
@@ -47,6 +49,7 @@
   - verifies support widgets exist
   - verifies the support card is on the final Support the Author page, not embedded in the details panel
   - verifies QR pixmap exists
+  - verifies the displayed QR is exactly 296x296 (8 pixels per module)
   - verifies QR minimum bounds
   - verifies card minimum height
   - verifies scroll area fallback is enabled
@@ -55,3 +58,6 @@
 - `mac_audit_agent/tests/test_assets.py::test_support_author_navigation_is_final_and_unique`
   - verifies Support the Author is the final navigation item
   - verifies there is exactly one Support the Author navigation item
+- `mac_audit_agent/tests/test_assets.py::test_donation_qr_source_and_display_preserve_integer_module_grid`
+  - verifies the bundled source is a uniform 37x37 module grid
+  - verifies the required white quiet zone surrounds the code

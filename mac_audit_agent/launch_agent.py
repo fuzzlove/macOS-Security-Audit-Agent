@@ -1,24 +1,30 @@
 from __future__ import annotations
 
+import grp
 import hashlib
 import json
 import os
 import plistlib
 import pwd
-import grp
 import re
 import shutil
 import stat
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
-from pathlib import Path
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from mac_audit_agent.models import BackgroundMonitorStatus
-from mac_audit_agent.version import APP_VERSION, DATABASE_SCHEMA_VERSION, RUNTIME_MANIFEST_SCHEMA_VERSION, current_git_commit
-
+from mac_audit_agent.runtime.topology import resolve_runtime_topology
+from mac_audit_agent.version import (
+    APP_VERSION,
+    DATABASE_SCHEMA_VERSION,
+    RUNTIME_MANIFEST_SCHEMA_VERSION,
+    current_git_commit,
+)
 
 LAUNCH_AGENT_LABEL = "com.mac-audit-agent.monitor"
 LAUNCHCTL_BIN = "/bin/launchctl"
@@ -29,6 +35,8 @@ MAC_AUDIT_AGENT_ENV_RUNTIME_ROOT = "MAC_AUDIT_AGENT_RUNTIME_ROOT"
 MAC_AUDIT_AGENT_ENV_LOG_ROOT = "MAC_AUDIT_AGENT_LOG_ROOT"
 MAC_AUDIT_AGENT_ENV_DB_PATH = "MAC_AUDIT_AGENT_DB_PATH"
 MAC_AUDIT_AGENT_ENV_ROLE = "MAC_AUDIT_AGENT_MONITOR_ROLE"
+MAC_AUDIT_AGENT_ENV_GUI_UID = "MSAA_GUI_UID"
+MAC_AUDIT_AGENT_ENV_GUI_HOME = "MSAA_GUI_HOME"
 MONITOR_ROLE_LEGACY = "legacy"
 MONITOR_ROLE_USER = "user-notifier"
 MONITOR_ROLE_SYSTEM = "system-daemon"
@@ -36,6 +44,94 @@ SYSTEM_RUNTIME_ROOT = Path("/Library/Application Support/MacAuditAgent/runtime")
 SYSTEM_LOG_ROOT = Path("/Library/Logs/MacAuditAgent")
 SYSTEM_DB_PATH = Path("/Library/Application Support/MacAuditAgent/mac_audit_agent.sqlite3")
 SYSTEM_LAUNCH_DAEMON_PATH = Path("/Library/LaunchDaemons") / f"{LAUNCH_AGENT_LABEL}.plist"
+LAUNCHD_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+SYSTEM_SERVICE_PERMISSION_ERROR = (
+    "MON006_ADMIN_AUTHORIZATION_REQUIRED: managing the system LaunchDaemon requires "
+    "administrator authorization. Run the approved headless protection-service repair; "
+    "do not run the MSAA GUI with sudo."
+)
+
+
+def is_system_service_safe_executable(executable: str | os.PathLike[str] | None) -> bool:
+    """Return whether launchd can safely use *executable* for a root service.
+
+    User homes, mounted volumes, temporary locations, and virtual environments are
+    deliberately excluded.  A system daemon must not depend on a developer checkout:
+    macOS privacy controls can deny root launchd jobs access to Documents/Desktop and
+    a moved or deleted checkout would also break protection after installation.
+    """
+    if not executable:
+        return False
+    lexical = Path(executable).expanduser()
+    lexical_parts = {part.lower() for part in lexical.parts}
+    lexical_text = str(lexical)
+    forbidden_roots = ("/Users/", "/Volumes/", "/tmp/", "/private/tmp/", "/var/folders/")
+    if "venv" in lexical_parts or ".venv" in lexical_parts:
+        return False
+    if any(lexical_text == root.rstrip("/") or lexical_text.startswith(root) for root in forbidden_roots):
+        return False
+    try:
+        path = lexical.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    text = str(path)
+    parts = {part.lower() for part in path.parts}
+    if "venv" in parts or ".venv" in parts:
+        return False
+    return not any(text == root.rstrip("/") or text.startswith(root) for root in forbidden_roots)
+
+
+def compatible_python_executable(mode: str = "daemon") -> str:
+    if getattr(sys, "frozen", False):
+        return sys.executable
+    try:
+        from mac_audit_agent.runtime.python_selector import select_best_python_for_mode
+        selected = select_best_python_for_mode(mode, project_root())
+        if (
+            selected.suitable
+            and selected.selected_executable
+            and (mode != "daemon" or is_system_service_safe_executable(selected.selected_executable))
+        ):
+            return selected.selected_executable
+    except Exception:
+        pass
+    candidates = [
+        os.environ.get("MSAA_PYTHON"),
+        sys.executable,
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/python3",
+        "/usr/bin/python3",
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = Path(candidate)
+        if not path.exists():
+            continue
+        if mode == "daemon" and not is_system_service_safe_executable(path):
+            continue
+        try:
+            result = subprocess.run(
+                [
+                    str(path),
+                    "-c",
+                    "import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 15) and sys.implementation.name == 'cpython' and getattr(sys, '_is_gil_enabled', lambda: True)() else 1)",
+                ],
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            continue
+        if result.returncode == 0:
+            return str(path)
+    # Never silently fall back to the invoking project venv for a daemon. The
+    # caller must surface a missing-runtime error instead of installing a plist
+    # that launchd cannot execute after the interactive installer exits.
+    if mode == "daemon":
+        return ""
+    return sys.executable if Path(sys.executable).exists() else "python3"
 
 
 def project_root() -> Path:
@@ -52,6 +148,9 @@ def launch_scope(default: str | None = None) -> str:
 
 
 def user_home_dir() -> Path:
+    gui_home = os.environ.get(MAC_AUDIT_AGENT_ENV_GUI_HOME, "").strip()
+    if os.getuid() == 0 and gui_home:
+        return Path(gui_home).expanduser()
     try:
         return Path(pwd.getpwuid(user_launchctl_uid()).pw_dir).expanduser()
     except (KeyError, OSError):
@@ -457,6 +556,9 @@ def default_launch_agent_paths(scope: str | None = None) -> LaunchAgentPaths:
 def user_launchctl_uid() -> int:
     if os.getuid() != 0:
         return os.getuid()
+    gui_uid = os.environ.get(MAC_AUDIT_AGENT_ENV_GUI_UID, "").strip()
+    if gui_uid.isdigit() and int(gui_uid) > 0:
+        return int(gui_uid)
     sudo_uid = os.environ.get("SUDO_UID", "").strip()
     if sudo_uid.isdigit() and int(sudo_uid) > 0:
         return int(sudo_uid)
@@ -494,19 +596,20 @@ def build_launch_agent_plist(
     auto_restart: bool = True,
     stdout_path: Path | None = None,
     stderr_path: Path | None = None,
+    frozen: bool | None = None,
 ) -> dict:
     scope = launch_scope(scope)
     launch_mode = (mode or "").strip().lower()
     paths = default_launch_agent_paths(scope)
     root = runtime_root(scope)
-    monitor_path = runtime_monitor_script_path(scope)
-    program_arguments = [
-        python_executable or "/usr/bin/python3",
-        str(monitor_path),
-        "--run",
-    ]
-    if launch_mode in {MONITOR_ROLE_USER, MONITOR_ROLE_SYSTEM}:
-        program_arguments.extend(["--mode", launch_mode])
+    executable = python_executable or compatible_python_executable()
+    topology = resolve_runtime_topology(
+        db_path,
+        selected_mode="system" if scope == "system" else "user",
+        executable=executable,
+        frozen=frozen,
+    )
+    program_arguments = list(topology.monitor_program_arguments)
     payload = {
         "Label": LAUNCH_AGENT_LABEL,
         "ProgramArguments": program_arguments,
@@ -514,7 +617,7 @@ def build_launch_agent_plist(
         "KeepAlive": bool(keep_alive and auto_restart),
         "WorkingDirectory": str(root),
         "EnvironmentVariables": {
-            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "PATH": LAUNCHD_PATH,
             MAC_AUDIT_AGENT_ENV_SCOPE: scope,
             MAC_AUDIT_AGENT_ENV_RUNTIME_ROOT: str(root),
             MAC_AUDIT_AGENT_ENV_LOG_ROOT: str(monitor_log_root(scope)),
@@ -525,6 +628,13 @@ def build_launch_agent_plist(
     }
     if launch_mode in {MONITOR_ROLE_USER, MONITOR_ROLE_SYSTEM}:
         payload["EnvironmentVariables"][MAC_AUDIT_AGENT_ENV_ROLE] = launch_mode
+    if scope == "system":
+        # The root daemon needs the explicitly selected desktop user's home to
+        # scope development filesystem observation. It must not infer /var/root.
+        for name in (MAC_AUDIT_AGENT_ENV_GUI_HOME, MAC_AUDIT_AGENT_ENV_GUI_UID):
+            value = os.environ.get(name, "").strip()
+            if value:
+                payload["EnvironmentVariables"][name] = value
     if scope == "user":
         payload["ProcessType"] = "Interactive"
     return payload
@@ -538,11 +648,29 @@ PID_RE = re.compile(r"\bpid = (\d+)\b")
 
 
 class LaunchAgentManager:
-    def __init__(self, db_path: Path, runner=None, scope: str = "user") -> None:
+    def __init__(self, db_path: Path, runner=None, scope: str = "user", *, process_executable: str | None = None, frozen: bool | None = None) -> None:
         self.db_path = db_path
         self.scope = launch_scope(scope)
         self.paths = default_launch_agent_paths(self.scope)
         self.runner = runner or subprocess.run
+        self.process_executable = process_executable
+        self.frozen = bool(getattr(sys, "frozen", False)) if frozen is None else bool(frozen)
+
+    def _require_system_authorization(self) -> None:
+        # Injected runners are used by non-mutating unit tests. Real launchctl and
+        # filesystem operations must never be attempted from the unprivileged GUI.
+        if self.scope == "system" and self.runner is subprocess.run and os.geteuid() != 0:
+            raise PermissionError(SYSTEM_SERVICE_PERMISSION_ERROR)
+
+    def _require_registration_license(self) -> None:
+        # Dependency-injected runners are isolated tests. Every production
+        # filesystem/bootstrap path uses subprocess.run and must pass the gate.
+        if self.runner is subprocess.run:
+            from mac_audit_agent.licensing.registration import (
+                require_service_registration_license,
+            )
+
+            require_service_registration_license(user_home_dir())
 
     def _runtime_root(self) -> Path:
         return runtime_root(self.scope)
@@ -581,6 +709,7 @@ class LaunchAgentManager:
     ) -> Path:
         if self.scope == "system" and os.geteuid() != 0:
             raise RuntimeError("System LaunchDaemon installation requires root privileges.")
+        self._require_registration_license()
         stdout_path = log_path if log_path else None
         stderr_path = None
         if log_path:
@@ -597,6 +726,8 @@ class LaunchAgentManager:
             auto_restart=auto_restart,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
+            python_executable=self.process_executable,
+            frozen=self.frozen,
         )
         if payload.get("Label") != LAUNCH_AGENT_LABEL:
             raise RuntimeError(f"Invalid LaunchAgent Label: expected {LAUNCH_AGENT_LABEL}, got {payload.get('Label')}")
@@ -605,16 +736,27 @@ class LaunchAgentManager:
             log_path.parent.mkdir(parents=True, exist_ok=True)
         self._install_runtime_files()
         self._ensure_db_path(effective_db_path)
-        self.paths.plist_path.write_bytes(plistlib.dumps(payload))
-        os.chmod(self.paths.plist_path, 0o644)
+        plist_bytes = plistlib.dumps(payload)
+        temporary = self.paths.plist_path.with_suffix(".plist.tmp")
+        backup = self.paths.plist_path.with_suffix(f".plist.backup-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}")
+        temporary.write_bytes(plist_bytes)
+        os.chmod(temporary, 0o644)
         current_user = pwd.getpwuid(user_launchctl_uid() if self.scope == "user" else os.getuid())
         target_group = "wheel" if self.scope == "system" else "staff"
         target_uid = 0 if self.scope == "system" else current_user.pw_uid
         target_gid = grp.getgrnam(target_group).gr_gid
+        os.chown(temporary, target_uid, target_gid)
+        self._run([PLUTIL_BIN, "-lint", str(temporary)])
+        if self.paths.plist_path.exists():
+            shutil.copy2(self.paths.plist_path, backup)
+        os.replace(temporary, self.paths.plist_path)
+        os.chmod(self.paths.plist_path, 0o644)
         os.chown(self.paths.plist_path, target_uid, target_gid)
-        self._run([PLUTIL_BIN, "-lint", str(self.paths.plist_path)])
+        # Both launch scopes are verified against a trusted runtime manifest.
+        # Write it only after the plist and runtime package are in their final
+        # locations so their recorded hashes bind the installed artifacts.
+        self._write_protected_monitor_manifest(db_path=effective_db_path)
         if self.scope == "system":
-            self._write_protected_monitor_manifest(db_path=effective_db_path)
             self.lock_down_protected_files()
         return self.paths.plist_path
 
@@ -640,6 +782,7 @@ class LaunchAgentManager:
         return self.install_system_monitor(poll_interval_seconds=poll_interval_seconds, **install_options)
 
     def uninstall(self) -> None:
+        self._require_system_authorization()
         if self.paths.plist_path.exists():
             self.paths.plist_path.unlink()
         manifest_path = protected_monitor_manifest_path(self.scope)
@@ -719,6 +862,8 @@ class LaunchAgentManager:
         return protected_monitor_manifest_path(self.scope)
 
     def repair(self, poll_interval_seconds: int = 15, **install_options: Any) -> tuple[Path, list[str]]:
+        self._require_system_authorization()
+        self._require_registration_license()
         notes: list[str] = []
         for command in self._bootout_commands():
             try:
@@ -726,11 +871,10 @@ class LaunchAgentManager:
                 notes.append(f"ok: {_format_command(command)}")
             except Exception as exc:
                 notes.append(str(exc))
-        for candidate in [
-            self.paths.plist_path,
-            Path("/Library/LaunchAgents") / f"{LAUNCH_AGENT_LABEL}.plist",
-            Path("/Library/LaunchDaemons") / f"{LAUNCH_AGENT_LABEL}.plist",
-        ]:
+        # Repair is scoped to one launchd domain. Removing the definition in
+        # the other domain silently changes deployment mode and can leave a
+        # still-loaded service behind as a wrong-domain conflict.
+        for candidate in [self.paths.plist_path]:
             try:
                 if candidate.exists():
                     candidate.unlink()
@@ -744,6 +888,8 @@ class LaunchAgentManager:
         return plist_path, notes
 
     def force_reinstall(self, poll_interval_seconds: int = 15, **install_options: Any) -> tuple[Path, list[str]]:
+        self._require_system_authorization()
+        self._require_registration_license()
         notes: list[str] = []
         for command in self._bootout_commands():
             try:
@@ -765,6 +911,17 @@ class LaunchAgentManager:
         return plist_path, notes
 
     def start(self) -> None:
+        self._require_registration_license()
+        if self.scope == "user":
+            from mac_audit_agent.platform.macos.launchd_service import (
+                LaunchdServiceManager,
+            )
+            manager = LaunchdServiceManager(runner=self.runner, user_home=user_home_dir(), sleep=(lambda _: None) if self.runner is not subprocess.run else time.sleep)
+            result = manager.start_user_agent(self.paths.plist_path)
+            if not result.success:
+                raise RuntimeError(f"{result.error_code}: {result.message or result.state}")
+            return
+        self._require_system_authorization()
         self._bootstrap_preflight()
         for command in self._bootout_commands():
             self._run(
@@ -782,6 +939,15 @@ class LaunchAgentManager:
         self._run([LAUNCHCTL_BIN, "kickstart", "-k", f"{self._launchctl_target()}/{LAUNCH_AGENT_LABEL}"])
 
     def stop(self) -> None:
+        if self.scope == "user":
+            from mac_audit_agent.platform.macos.launchd_service import (
+                LaunchdServiceManager,
+            )
+            result = LaunchdServiceManager(runner=self.runner, user_home=user_home_dir(), sleep=(lambda _: None) if self.runner is not subprocess.run else time.sleep).stop()
+            if not result.success:
+                raise RuntimeError(f"{result.error_code}: {result.message or result.state}")
+            return
+        self._require_system_authorization()
         self._run([LAUNCHCTL_BIN, "bootout", self._launchctl_target(), str(self.paths.plist_path)], tolerate=self._bootout_tolerate())
 
     def revert_to_user_mode(self, poll_interval_seconds: int = 15) -> Path:
@@ -797,7 +963,26 @@ class LaunchAgentManager:
         running = False
         last_error = ""
         process_pid = None
-        if installed:
+        if self.scope == "user":
+            try:
+                from mac_audit_agent.platform.macos.launchd_service import (
+                    LaunchdServiceManager,
+                )
+                report = LaunchdServiceManager(runner=self.runner, user_home=user_home_dir()).detect()
+                loaded = bool(report.get("loaded_gui"))
+                last_error = "" if not report.get("error_code") else f"{report['error_code']}: {report.get('state', '')}"
+                current_domain = report.get("expected_domain", self._launchctl_target())
+                if loaded:
+                    command = [LAUNCHCTL_BIN, "print", f"{current_domain}/{LAUNCH_AGENT_LABEL}"]
+                    result = self._run(command, check=False)
+                    stdout = (result.stdout or "").lower()
+                    running = "state = running" in stdout or "state = waiting" in stdout
+                    pid_match = PID_RE.search(result.stdout or "")
+                    if pid_match: process_pid = int(pid_match.group(1))
+            except Exception as exc:
+                last_error = str(exc)
+                current_domain = self._launchctl_target()
+        elif installed:
             command = [LAUNCHCTL_BIN, "print", f"{self._launchctl_target()}/{LAUNCH_AGENT_LABEL}"]
             result = self._run(command, check=False)
             stdout = (result.stdout or "").lower()
@@ -820,7 +1005,7 @@ class LaunchAgentManager:
             db_path=str(self.db_path),
             process_pid=process_pid,
             last_error=last_error,
-            current_launchctl_domain=self._launchctl_target(),
+            current_launchctl_domain=locals().get("current_domain", self._launchctl_target()),
         )
 
     def show_logs(self) -> str:
@@ -830,10 +1015,14 @@ class LaunchAgentManager:
         self._run([PLUTIL_BIN, "-lint", str(self.paths.plist_path)])
         payload = plistlib.loads(self.paths.plist_path.read_bytes())
         program_arguments = list(payload.get("ProgramArguments", []))
-        expected_program_arguments = ["/usr/bin/python3", str(self._runtime_monitor_script_path()), "--run"]
         launch_role = str(payload.get("EnvironmentVariables", {}).get(MAC_AUDIT_AGENT_ENV_ROLE, "")).strip().lower()
-        if launch_role in {MONITOR_ROLE_USER, MONITOR_ROLE_SYSTEM}:
-            expected_program_arguments.extend(["--mode", launch_role])
+        topology = resolve_runtime_topology(
+            self._effective_db_path(),
+            selected_mode="system" if launch_role == MONITOR_ROLE_SYSTEM else "user",
+            executable=program_arguments[0] if program_arguments else compatible_python_executable(),
+            frozen=len(program_arguments) == 2 and program_arguments[-1].endswith("-service"),
+        )
+        expected_program_arguments = list(topology.monitor_program_arguments)
         if program_arguments != expected_program_arguments:
             raise RuntimeError(
                 "LaunchAgent preflight failed: ProgramArguments must be "
@@ -911,6 +1100,9 @@ class LaunchAgentManager:
             pass
 
     def _install_runtime_files(self) -> None:
+        if self.frozen:
+            self._runtime_root().mkdir(parents=True, exist_ok=True)
+            return
         source_root = project_root() / "mac_audit_agent"
         target_root = self._runtime_package_root()
         current_uid = user_launchctl_uid() if self.scope == "user" else os.getuid()

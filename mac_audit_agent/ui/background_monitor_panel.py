@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -43,6 +44,7 @@ from mac_audit_agent.emergency_lockdown import (
     enable_lockdown_with_user_policy,
     get_lockdown_status,
     load_policy,
+    open_lockdown_mode_switch as open_apple_lockdown_mode_switch,
     open_lockdown_settings_fallback,
     run_lockdown_test_workflow,
     save_policy,
@@ -72,8 +74,11 @@ from mac_audit_agent.monitor import (
     truncate_monitor_log_file,
 )
 from mac_audit_agent.ui.action_state import ActionState, apply_action_state
-from mac_audit_agent.notification_manager import NotificationManager
-from mac_audit_agent.reporting import export_monitor_events_html, export_monitor_events_json, get_reports_dir
+from mac_audit_agent.ui.responsive_actions import ResponsiveActionRow
+from mac_audit_agent.notification_manager import MANDATORY_VISIBLE_ALERT_EVENT_TYPES, NotificationManager
+from mac_audit_agent.reporting import export_monitor_events_html, export_monitor_events_json, export_monitor_events_professional, get_reports_dir
+from mac_audit_agent.professional_report import PROFESSIONAL_REPORT_FILTER, selected_report_path
+from mac_audit_agent.alert_queue import build_diagnostic_alert_event, queue_visible_alert_for_notifier, wait_for_visible_alert_trace
 from mac_audit_agent.models import BackgroundMonitorEvent, utc_now_iso
 from mac_audit_agent.monitor_settings import (
     CATEGORY_EVENT_TYPES,
@@ -144,6 +149,7 @@ EVENT_TYPES = [
     "monitor_test_event",
     "protected_monitor_tamper_detected",
 ]
+EVENT_TYPES.extend(sorted(MANDATORY_VISIBLE_ALERT_EVENT_TYPES - set(EVENT_TYPES)))
 
 
 class MonitorProtectionDialog(QDialog):
@@ -276,11 +282,17 @@ class MonitorModeDialog(QDialog):
 
 
 class BackgroundMonitorPanel(QWidget):
-    def __init__(self, db: AuditDatabase, launch_agent: LaunchAgentManager, parent: QWidget | None = None) -> None:
+    def __init__(self, db: AuditDatabase, launch_agent: LaunchAgentManager, parent: QWidget | None = None, *, audit_mode: bool = False) -> None:
         super().__init__(parent)
         self.db = db
         self.launch_agent = launch_agent
-        self.system_launch_agent = LaunchAgentManager(default_monitor_db_path("system"), scope="system")
+        self._audit_mode = audit_mode
+        if audit_mode:
+            from mac_audit_agent.ui.audit_fixtures import MockLaunchAgent
+
+            self.system_launch_agent = MockLaunchAgent(default_monitor_db_path("system"), scope="system")
+        else:
+            self.system_launch_agent = LaunchAgentManager(default_monitor_db_path("system"), scope="system")
         self.protected_launch_agent = self.system_launch_agent
         self.service = BackgroundMonitorService(self.db.path, record_startup=False)
         if self.service.db.path == self.db.path:
@@ -298,12 +310,24 @@ class BackgroundMonitorPanel(QWidget):
         self._active_db_cache: AuditDatabase | None = None
         self._active_db_cache_path = ""
         self.current_events: list = []
+        self._closing = False
         self._build_ui()
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh)
-        if not os.environ.get("PYTEST_CURRENT_TEST"):
-            self.refresh_timer.start(5000)
-        self.refresh()
+        self.refresh_timer.setInterval(30_000)
+        self._activated = False
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not self._audit_mode and not self._activated:
+            self._activated = True
+            self.refresh()
+        if not self._audit_mode and not os.environ.get("PYTEST_CURRENT_TEST") and not self.refresh_timer.isActive():
+            self.refresh_timer.start()
+
+    def hideEvent(self, event) -> None:
+        self.refresh_timer.stop()
+        super().hideEvent(event)
 
     def _fallback_log_path_text(self) -> str:
         return str(FALLBACK_MONITOR_LOG.expanduser().resolve())
@@ -358,10 +382,55 @@ class BackgroundMonitorPanel(QWidget):
         return tail or "none"
 
     def _system_mode_enabled(self) -> bool:
+        if self._shutdown_in_progress():
+            return False
         return self.db.get_background_monitor_state("monitor_mode", "user") in {"protected", "system"}
+
+    def _require_system_service_authorization(self, operation: str) -> bool:
+        if not self._system_mode_enabled() or os.geteuid() == 0:
+            return True
+        message = (
+            f"{operation} changes the system launchd domain and requires administrator authorization.\n\n"
+            "MSAA will not run the graphical application as root. Close MSAA, then run this approved "
+            "headless repair from the project directory:\n\n"
+            "sudo .venv/bin/python launcher.py --repair-protection-services "
+            "--developer-mode --allow-unsigned-development-runtime\n\n"
+            "After it completes, reopen MSAA normally. The repair replaces any daemon reference to the "
+            "project .venv with a system-accessible runtime."
+        )
+        self.db.set_background_monitor_state("last_error", f"MON006_ADMIN_AUTHORIZATION_REQUIRED: {message}")
+        QMessageBox.warning(self, "Administrator Authorization Required", message)
+        return False
+
+    def _shutdown_in_progress(self) -> bool:
+        if self._closing:
+            return True
+        coordinator = getattr(self.window(), "shutdown_coordinator", None)
+        return bool(coordinator is not None and getattr(coordinator, "shutting_down", False))
 
     def _detector_manager(self) -> LaunchAgentManager:
         return self.system_launch_agent if self._system_mode_enabled() else self.launch_agent
+
+    def _reconcile_live_monitor_domain(self) -> bool:
+        """Prefer an already-loaded system daemon over stale persisted user mode."""
+        if self._system_mode_enabled():
+            return False
+        try:
+            system_status = self.system_launch_agent.status()
+        except Exception:
+            return False
+        if not (system_status.loaded or system_status.running):
+            return False
+        self.db.set_background_monitor_state("monitor_mode", "system")
+        self.db.set_background_monitor_state("monitor_install_mode", "system")
+        self.db.set_background_monitor_state("installed", "1")
+        self.db.set_background_monitor_state("enabled", "1")
+        self.db.set_background_monitor_state("loaded", "1" if system_status.loaded else "0")
+        self.db.set_background_monitor_state("running", "1" if system_status.running else "0")
+        self.db.set_background_monitor_state("plist_path", str(system_status.plist_path))
+        self.db.set_background_monitor_state("current_launchctl_domain", "system")
+        self.db.set_background_monitor_state("last_error", "")
+        return True
 
     def _install_options(self, *, scope: str) -> dict[str, object]:
         settings = load_settings(self.db).installation
@@ -411,6 +480,46 @@ class BackgroundMonitorPanel(QWidget):
             "Fix: reinstall the monitor so it runs from ~/.mac_audit_agent/runtime instead of a protected Documents folder."
         )
 
+    @staticmethod
+    def _compact_settings_grid(source: QGridLayout, *, max_columns: int = 4) -> QGridLayout:
+        """Reflow the legacy wide settings matrix into two field pairs per row."""
+        rows: dict[int, list[tuple[int, int, object]]] = {}
+        while source.count():
+            row, column, _row_span, column_span = source.getItemPosition(0)
+            item = source.takeAt(0)
+            rows.setdefault(row, []).append((column, column_span, item))
+
+        compact = QGridLayout()
+        compact.setHorizontalSpacing(10)
+        compact.setVerticalSpacing(6)
+        output_row = 0
+        for row in sorted(rows):
+            entries = sorted(rows[row], key=lambda entry: entry[0])
+            if len(entries) == 1 and entries[0][1] > 1:
+                item = entries[0][2]
+                compact.addItem(item, output_row, 0, 1, max_columns)
+                output_row += 1
+                continue
+
+            output_column = 0
+            for _column, span, item in entries:
+                if output_column >= max_columns:
+                    output_row += 1
+                    output_column = 0
+                remaining = max_columns - output_column
+                target_span = min(span, remaining) if span > 1 else 1
+                compact.addItem(item, output_row, output_column, 1, target_span)
+                widget = item.widget()
+                if isinstance(widget, QLabel):
+                    widget.setWordWrap(True)
+                    widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+                output_column += target_span
+            output_row += 1
+
+        for column in range(max_columns):
+            compact.setColumnStretch(column, 2 if column % 2 == 0 else 1)
+        return compact
+
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
         self.developer_mode_enabled = False
@@ -422,7 +531,7 @@ class BackgroundMonitorPanel(QWidget):
         disclaimer.setWordWrap(True)
         layout.addWidget(disclaimer)
 
-        controls = QHBoxLayout()
+        controls = ResponsiveActionRow(spacing=8)
         self.install_button = QPushButton("Install System Monitor + User Notifier")
         self.repair_button = QPushButton("Repair Background Monitor")
         self.force_reinstall_button = QPushButton("Force Reinstall Monitor")
@@ -449,6 +558,19 @@ class BackgroundMonitorPanel(QWidget):
         self.audit_deployment_button = QPushButton("Audit System Monitor Deployment")
         self.verify_event_flow_button = QPushButton("Verify Event Flow")
         self.repair_deployment_button = QPushButton("Repair System Monitor Deployment")
+        deployment_help = {
+            self.install_button: ("Install system monitor and user notifier", "Install the administrator-approved system monitor and the per-user alert notifier using the canonical event source."),
+            self.audit_deployment_button: ("Audit system monitor deployment", "Verify installation, launchd state, heartbeat freshness, database alignment, permissions, and notifier delivery without changing the system."),
+            self.repair_deployment_button: ("Repair system monitor deployment", "With administrator approval, back up and replace stale service definitions, reload services, and verify a fresh heartbeat."),
+        }
+        for button, (name, description) in deployment_help.items():
+            button.setToolTip(description)
+            button.setAccessibleName(name)
+            button.setAccessibleDescription(description)
+        # Keep explicit calls visible to static accessibility auditing as well as runtime introspection.
+        self.install_button.setToolTip(deployment_help[self.install_button][1])
+        self.audit_deployment_button.setToolTip(deployment_help[self.audit_deployment_button][1])
+        self.repair_deployment_button.setToolTip(deployment_help[self.repair_deployment_button][1])
         for widget in [
             self.install_button,
             self.repair_button,
@@ -477,8 +599,8 @@ class BackgroundMonitorPanel(QWidget):
             self.verify_event_flow_button,
             self.repair_deployment_button,
         ]:
-            controls.addWidget(widget)
-        layout.addLayout(controls)
+            controls.add_button(widget)
+        layout.addWidget(controls)
 
         settings_layout = QGridLayout()
         local_edr_title = QLabel("Local EDR / Persistent Monitor")
@@ -729,34 +851,33 @@ class BackgroundMonitorPanel(QWidget):
         settings_layout.addWidget(QLabel("Log Path"), 29, 0)
         self.install_log_path_input = QLineEdit()
         settings_layout.addWidget(self.install_log_path_input, 29, 1, 1, 5)
-        layout.addLayout(settings_layout)
+        layout.addLayout(self._compact_settings_grid(settings_layout))
 
         layout.addWidget(QLabel("Settings Diagnostics"))
-        diagnostics_actions = QHBoxLayout()
+        diagnostics_actions = ResponsiveActionRow(spacing=8)
         self.save_monitor_settings_button = QPushButton("Save Settings")
         self.save_monitor_settings_button.clicked.connect(self.save_monitor_settings_only)
-        diagnostics_actions.addWidget(self.save_monitor_settings_button)
+        diagnostics_actions.add_button(self.save_monitor_settings_button)
         self.apply_settings_button = QPushButton("Apply Settings")
         self.apply_settings_button.clicked.connect(self.apply_monitor_settings_from_ui)
-        diagnostics_actions.addWidget(self.apply_settings_button)
+        diagnostics_actions.add_button(self.apply_settings_button)
         self.apply_restart_settings_button = QPushButton("Apply and Restart Monitor")
         self.apply_restart_settings_button.clicked.connect(self.apply_settings_and_restart_monitor)
-        diagnostics_actions.addWidget(self.apply_restart_settings_button)
+        diagnostics_actions.add_button(self.apply_restart_settings_button)
         self.reinstall_current_settings_button = QPushButton("Reinstall Monitor With Current Settings")
         self.reinstall_current_settings_button.clicked.connect(self.reinstall_monitor_with_current_settings)
-        diagnostics_actions.addWidget(self.reinstall_current_settings_button)
+        diagnostics_actions.add_button(self.reinstall_current_settings_button)
         self.repair_settings_mismatch_button = QPushButton("Repair Settings Sync")
         self.repair_settings_mismatch_button.clicked.connect(self.repair_settings_mismatch)
-        diagnostics_actions.addWidget(self.repair_settings_mismatch_button)
+        diagnostics_actions.add_button(self.repair_settings_mismatch_button)
         self.preview_alert_styles_button = QPushButton("Preview Alert Styles")
         self.preview_alert_styles_button.setToolTip("Render INFO, LOW, MEDIUM, HIGH, and CRITICAL bottom-right alerts through AlertOverlayManager.")
         self.preview_alert_styles_button.clicked.connect(self.preview_alert_styles)
-        diagnostics_actions.addWidget(self.preview_alert_styles_button)
-        self.reset_monitor_settings_button = QPushButton("Reset to Defaults")
+        diagnostics_actions.add_button(self.preview_alert_styles_button)
+        self.reset_monitor_settings_button = QPushButton("Restore Recommended Defaults")
         self.reset_monitor_settings_button.clicked.connect(self.reset_monitor_settings_to_defaults)
-        diagnostics_actions.addWidget(self.reset_monitor_settings_button)
-        diagnostics_actions.addStretch(1)
-        layout.addLayout(diagnostics_actions)
+        diagnostics_actions.add_button(self.reset_monitor_settings_button)
+        layout.addWidget(diagnostics_actions)
         self.settings_diagnostics_panel = QTextEdit()
         self.settings_diagnostics_panel.setReadOnly(True)
         layout.addWidget(self.settings_diagnostics_panel)
@@ -812,19 +933,33 @@ class BackgroundMonitorPanel(QWidget):
         self.lockdown_attempt_test_button = QPushButton("Simulate Critical Event - Attempt Activation")
         self.view_lockdown_trace_button = QPushButton("View Last Lockdown Trace")
         self.copy_lockdown_diagnostics_button = QPushButton("Copy Lockdown Diagnostics")
+        self.open_lockdown_mode_switch_button = QPushButton("Open Apple Lockdown Mode Switch")
+        self.open_lockdown_mode_switch_button.setObjectName("openLockdownModeSwitchButton")
+        self.open_lockdown_mode_switch_button.setProperty("role", "urgent")
         self.lockdown_dry_run_button.setToolTip("Dry-run only: shows what the policy would do for a critical event without changing Lockdown Mode.")
         self.lockdown_assist_test_button.setToolTip("Creates evidence, opens Lockdown Mode settings, and shows the required user-action alert.")
         self.lockdown_attempt_test_button.setToolTip("Attempts automatic activation only if supported; otherwise falls back to assisted activation.")
         self.view_lockdown_trace_button.setToolTip("Show the full last LockdownActivationTrace JSON.")
         self.copy_lockdown_diagnostics_button.setToolTip("Copy the latest Lockdown activation trace and failure classification.")
+        self.open_lockdown_mode_switch_button.setToolTip(
+            "Open System Settings at Apple's Lockdown Mode control; flip the switch and confirm Turn On & Restart."
+        )
         emergency_layout.addWidget(self.save_lockdown_policy_button, 8, 3)
         emergency_layout.addWidget(self.lockdown_test_center_title, 9, 0, 1, 4)
-        emergency_layout.addWidget(self.lockdown_dry_run_button, 10, 0)
-        emergency_layout.addWidget(self.lockdown_assist_test_button, 10, 1)
-        emergency_layout.addWidget(self.lockdown_attempt_test_button, 10, 2)
-        emergency_layout.addWidget(self.view_lockdown_trace_button, 10, 3)
-        emergency_layout.addWidget(self.copy_lockdown_diagnostics_button, 11, 3)
-        layout.addLayout(emergency_layout)
+        layout.addLayout(self._compact_settings_grid(emergency_layout, max_columns=2))
+
+        lockdown_actions = ResponsiveActionRow(spacing=8)
+        lockdown_actions.add_buttons(
+            [
+                self.lockdown_dry_run_button,
+                self.lockdown_assist_test_button,
+                self.lockdown_attempt_test_button,
+                self.view_lockdown_trace_button,
+                self.copy_lockdown_diagnostics_button,
+                self.open_lockdown_mode_switch_button,
+            ]
+        )
+        layout.addWidget(lockdown_actions)
 
         filters = QHBoxLayout()
         filters.addWidget(QLabel("Event Type"))
@@ -834,11 +969,12 @@ class BackgroundMonitorPanel(QWidget):
             self.filter_combo.addItem(event_type, event_type)
         filters.addWidget(self.filter_combo)
         self.export_json_button = QPushButton("Export Monitor Log JSON")
-        self.export_html_button = QPushButton("Export Monitor Log HTML")
-        filters.addWidget(self.export_json_button)
-        filters.addWidget(self.export_html_button)
+        self.export_html_button = QPushButton("Export Monitor Report")
         filters.addStretch(1)
         layout.addLayout(filters)
+        export_actions = ResponsiveActionRow(spacing=8)
+        export_actions.add_buttons([self.export_json_button, self.export_html_button])
+        layout.addWidget(export_actions)
 
         self.events_table = QTableWidget(0, 8)
         self.events_table.setHorizontalHeaderLabels(["Timestamp", "Type", "Severity", "Source", "Process", "Confidence", "Occurrences", "Evidence"])
@@ -847,7 +983,7 @@ class BackgroundMonitorPanel(QWidget):
         self.events_table.itemSelectionChanged.connect(self._update_selected_event_context_state)
         self.events_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.events_table)
-        event_context_row = QHBoxLayout()
+        event_context_row = ResponsiveActionRow(spacing=8)
         self.show_context_button = QPushButton("Show Context")
         self.show_context_button.setEnabled(False)
         self.show_context_button.clicked.connect(self.show_selected_event_context)
@@ -857,11 +993,10 @@ class BackgroundMonitorPanel(QWidget):
         self.show_alert_trace_button = QPushButton("Alert Pipeline Trace")
         self.show_alert_trace_button.setEnabled(False)
         self.show_alert_trace_button.clicked.connect(self.show_selected_alert_pipeline_trace)
-        event_context_row.addWidget(self.show_context_button)
-        event_context_row.addWidget(self.show_provenance_button)
-        event_context_row.addWidget(self.show_alert_trace_button)
-        event_context_row.addStretch(1)
-        layout.addLayout(event_context_row)
+        event_context_row.add_buttons(
+            [self.show_context_button, self.show_provenance_button, self.show_alert_trace_button]
+        )
+        layout.addWidget(event_context_row)
 
         layout.addWidget(QLabel("Show Monitor Health"))
         self.health_panel = QTextEdit()
@@ -919,6 +1054,7 @@ class BackgroundMonitorPanel(QWidget):
         self.lockdown_attempt_test_button.clicked.connect(self.simulate_lockdown_attempt_activation)
         self.view_lockdown_trace_button.clicked.connect(self.view_last_lockdown_trace)
         self.copy_lockdown_diagnostics_button.clicked.connect(self.copy_lockdown_diagnostics)
+        self.open_lockdown_mode_switch_button.clicked.connect(self.open_apple_lockdown_mode_switch)
         self.continuous_monitoring_checkbox.toggled.connect(self.toggle_continuous_monitoring)
         self.start_at_login_checkbox.toggled.connect(self.toggle_start_at_login)
         self.filter_combo.currentIndexChanged.connect(self.refresh_events)
@@ -1148,8 +1284,8 @@ class BackgroundMonitorPanel(QWidget):
     def reset_monitor_settings_to_defaults(self) -> None:
         if QMessageBox.question(
             self,
-            "Reset Monitor Settings",
-            "Reset Monitor Settings to defaults? This saves defaults to the settings file. Use Apply Settings to push defaults to the running daemon/notifier.",
+            "Restore Recommended Monitor Defaults",
+            "Restore recommended defaults for monitor, sensor, and alert controls? This does not change appearance, identity, assessment, report, or unrelated workspace preferences. Defaults are saved first; use Apply Settings to push them to the running daemon/notifier.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         ) != QMessageBox.Yes:
@@ -1540,6 +1676,7 @@ class BackgroundMonitorPanel(QWidget):
         ]
 
     def closeEvent(self, event) -> None:
+        self._closing = True
         if hasattr(self, "refresh_timer"):
             self.refresh_timer.stop()
         if self._active_db_cache is not None:
@@ -1654,6 +1791,23 @@ class BackgroundMonitorPanel(QWidget):
         }
         QApplication.clipboard().setText(json.dumps(diagnostics, indent=2, sort_keys=True))
         QMessageBox.information(self, "Lockdown Diagnostics", "Lockdown diagnostics copied to the clipboard.")
+
+    def open_apple_lockdown_mode_switch(self) -> None:
+        result = open_apple_lockdown_mode_switch()
+        if result.get("opened"):
+            QMessageBox.information(
+                self,
+                "Apple Lockdown Mode",
+                "System Settings is open at Apple Lockdown Mode. Flip the switch, then confirm Turn On & Restart. "
+                "Opening this page does not itself enable Lockdown Mode.",
+            )
+            return
+        QMessageBox.warning(
+            self,
+            "Unable to Open Apple Lockdown Mode",
+            "Open System Settings > Privacy & Security > Lockdown Mode manually.\n\n"
+            + str(result.get("stderr") or result.get("exception") or "System Settings rejected the shortcut."),
+        )
 
     def view_last_lockdown_trace(self) -> None:
         trace = self._latest_lockdown_trace()
@@ -2044,7 +2198,49 @@ class BackgroundMonitorPanel(QWidget):
 
     def install_system_monitor(self) -> None:
         if os.geteuid() != 0:
-            QMessageBox.warning(self, "System Monitor Requires Admin", "System Monitor Mode requires administrator/root approval.")
+            existing = self.system_launch_agent.status()
+            if existing.installed:
+                try:
+                    self.db.set_background_monitor_state("monitor_mode", "system")
+                    self.db.set_background_monitor_state("monitor_install_mode", "system")
+                    self.db.set_background_monitor_state("installed", "1")
+                    self.db.set_background_monitor_state("enabled", "1")
+                    self.db.set_background_monitor_state("plist_path", str(existing.plist_path))
+                    self.db.set_background_monitor_state("label", existing.label)
+                    self.db.set_background_monitor_state("current_launchctl_domain", existing.current_launchctl_domain)
+                    self.db.set_background_monitor_state("last_error", "")
+                    active_db = self._active_monitor_db()
+                    notifier_note = self._ensure_user_notifier_for_alert_settings(load_settings(self.db), active_db)
+                    QMessageBox.information(
+                        self,
+                        "System Monitor Ready",
+                        "The administrator bootstrap already installed the System Monitor. "
+                        "The GUI now runs as the logged-in user by design.\n\n"
+                        f"System daemon: {existing.plist_path}\n"
+                        f"Alerts: {notifier_note or 'User Alert Agent is not required by the current settings.'}",
+                    )
+                except Exception as exc:
+                    self.db.set_background_monitor_state("last_error", str(exc))
+                    QMessageBox.warning(self, "System Monitor Reconciliation Failed", str(exc))
+                self._refresh_monitor_mode_dialog()
+                self.refresh()
+                return
+            bootstrap_result = os.environ.get("MSAA_BOOTSTRAP_OVERALL_RESULT", "not reported")
+            QMessageBox.warning(
+                self,
+                "System Monitor Bootstrap Required",
+                "MSAA never keeps its Qt GUI running as root. A sudo launch performs the privileged service bootstrap, "
+                "then safely returns the GUI to the logged-in user. The system daemon is still missing, so the bootstrap "
+                "did not complete.\n\n"
+                f"Last bootstrap result: {bootstrap_result}\n\n"
+                "Install from a signed build, or run this headless command from the project directory:\n"
+                "sudo .venv/bin/python launcher.py --install-protection-services\n\n"
+                "Unsigned source checkout on an isolated development Mac only:\n"
+                "sudo .venv/bin/python launcher.py --install-protection-services "
+                "--developer-mode --allow-unsigned-development-runtime\n\n"
+                "The development exception stages a copy of the daemon runtime under /Library/Application Support, "
+                "locks the system copy to root:wheel, and records that the source was unsigned.",
+            )
             return
         try:
             plist_path = self.system_launch_agent.install_system_monitor(**self._install_options(scope="system"))
@@ -2079,6 +2275,8 @@ class BackgroundMonitorPanel(QWidget):
         self.refresh()
 
     def start_system_monitor(self) -> None:
+        if not self._require_system_service_authorization("Starting the System Monitor"):
+            return
         try:
             self.system_launch_agent.start()
             self.db.set_background_monitor_state("monitor_mode", "system")
@@ -2094,6 +2292,8 @@ class BackgroundMonitorPanel(QWidget):
         self.refresh()
 
     def stop_system_monitor(self) -> None:
+        if not self._require_system_service_authorization("Stopping the System Monitor"):
+            return
         try:
             self.system_launch_agent.stop()
             self.db.set_background_monitor_state("running", "0")
@@ -2107,6 +2307,8 @@ class BackgroundMonitorPanel(QWidget):
         self.refresh()
 
     def restart_system_monitor(self) -> None:
+        if not self._require_system_service_authorization("Restarting the System Monitor"):
+            return
         try:
             self.system_launch_agent.stop()
         except Exception:
@@ -2124,6 +2326,12 @@ class BackgroundMonitorPanel(QWidget):
         self.refresh()
 
     def repair_system_monitor(self) -> None:
+        try:
+            from mac_audit_agent.user_profiles import require_permission
+            require_permission("manage_system_daemon")
+        except PermissionError as exc:
+            QMessageBox.warning(self, "Profile Permission Required", str(exc))
+            return
         if os.geteuid() != 0:
             QMessageBox.warning(self, "System Monitor Requires Admin", "Repairing System Monitor requires administrator/root approval.")
             return
@@ -2241,20 +2449,26 @@ class BackgroundMonitorPanel(QWidget):
         self.refresh()
 
     def test_event_flow(self) -> None:
-        event = self._event_service().generate_test_event()
-        self._notification_service().process_pending_notifications()
-        QMessageBox.information(self, "Test Event Flow", f"Created test event: {event.event_type}")
+        monitor_db = self._active_monitor_db()
+        event = build_diagnostic_alert_event(
+            event_type="monitor_test_event",
+            source="system_monitor_panel",
+            evidence="System Monitor end-to-end User Alert Agent delivery test.",
+        )
+        queued = queue_visible_alert_for_notifier(monitor_db, event, force=True, reason="system_monitor_event_flow")
+        QMessageBox.information(
+            self,
+            "Test Event Flow",
+            f"Queued test event for the User Alert Agent: {queued['event_id']}",
+        )
         self.refresh()
 
     def refresh(self) -> None:
+        # stop() cannot retract a QTimer timeout already queued in Qt's event loop.
+        # Do not touch the shared connection after coordinated shutdown begins.
+        if self._shutdown_in_progress():
+            return
         monitor_db = self._active_monitor_db()
-        try:
-            pending_notifications = self._notification_service().process_pending_notifications()
-            if pending_notifications:
-                self.db.set_background_monitor_state("user_notifier_last_processed", utc_now_iso())
-                self.db.set_background_monitor_state("user_notifier_pending_count", str(len(pending_notifications)))
-        except Exception as exc:
-            self.db.set_background_monitor_state("last_error", f"Notifier processing failed: {exc}")
         notification_manager = self._notification_service().notifications
         daemon_db_path = str(default_monitor_db_path("system"))
         notifier_db_path = monitor_db.get_background_monitor_state("notifier_db_path", str(monitor_db.path))
@@ -2269,6 +2483,13 @@ class BackgroundMonitorPanel(QWidget):
         launch_status = active_launch_agent.status()
         system_status = self.system_launch_agent.status()
         user_status = self.launch_agent.status()
+        try:
+            notifier_live = canonical_user_notifier_status(db_path=monitor_db.path)
+        except (OSError, ValueError, RuntimeError) as exc:
+            notifier_live = None
+            notifier_live_error = f"status probe failed: {type(exc).__name__}"
+        else:
+            notifier_live_error = notifier_live.last_error
         system_mode = install_mode in {"protected", "system"}
         installed = launch_status.installed
         loaded = launch_status.loaded if installed else db_status.loaded
@@ -2327,6 +2548,8 @@ class BackgroundMonitorPanel(QWidget):
             f"Status: {status_text} | Installed: {'yes' if installed else 'no'} | Loaded: {'yes' if loaded else 'no'}\n"
             f"System LaunchDaemon plist: {system_status.plist_path} ({'installed' if system_status.installed else 'missing'})\n"
             f"User notifier plist: {user_status.plist_path} ({'installed' if user_status.installed else 'missing'})\n"
+            f"User notifier delivery: {notifier_live.install_status if notifier_live else 'unhealthy'}"
+            f"{f' ({notifier_live_error})' if notifier_live_error else ''}\n"
             f"Last heartbeat: {db_status.last_heartbeat or 'none'}\n"
             f"Last event: {db_status.last_event_timestamp or 'none'}\n"
             f"PID: {process_pid or 'none'}\n"
@@ -2446,6 +2669,10 @@ class BackgroundMonitorPanel(QWidget):
                     f"Current mode: {'System Monitor Mode' if install_mode == 'system' else ('Protected Mode' if install_mode == 'protected' else 'User Monitor Mode')}",
                     f"System LaunchDaemon plist: {system_status.plist_path} ({'installed' if system_status.installed else 'missing'})",
                     f"User notifier plist: {user_status.plist_path} ({'installed' if user_status.installed else 'missing'})",
+                    f"User notifier delivery status: {notifier_live.install_status if notifier_live else 'unhealthy'}",
+                    f"User notifier source DB readable: {'yes' if notifier_live and notifier_live.source_database_readable else 'no'}",
+                    f"User notifier source DB integrity: {notifier_live.source_database_integrity if notifier_live else 'unknown'}",
+                    f"User notifier delivery error: {notifier_live_error or 'none'}",
                     f"Current launchctl domain: {launch_status.current_launchctl_domain or db_status.current_launchctl_domain or 'unknown'}",
                     f"Log path: {self._fallback_log_path_text()}",
                     f"Fallback log path: {self._fallback_log_path_text()}",
@@ -2664,8 +2891,9 @@ class BackgroundMonitorPanel(QWidget):
                     if not self.system_launch_agent.status().installed:
                         raise RuntimeError("System monitor is not installed. Install the system daemon with administrator approval first.")
                     self.system_launch_agent.start()
-                    if self.launch_agent.status().installed:
-                        self.launch_agent.start()
+                    notifier = self._user_notifier_installer(self._active_monitor_db())
+                    if notifier.get_user_notifier_status().plist_exists:
+                        notifier.load_user_notifier()
                 else:
                     if not self.launch_agent.status().installed:
                         raise RuntimeError("System monitor is not installed. Use Install System Monitor + User Notifier first.")
@@ -2695,7 +2923,10 @@ class BackgroundMonitorPanel(QWidget):
             else:
                 if mode in {"protected", "system"}:
                     self.system_launch_agent.stop()
-                if self.launch_agent.status().installed:
+                    notifier = self._user_notifier_installer(self._active_monitor_db())
+                    if notifier.get_user_notifier_status().plist_exists:
+                        notifier.unload_user_notifier()
+                elif self.launch_agent.status().installed:
                     self.launch_agent.stop()
                 self.db.set_background_monitor_state("running", "0")
                 self.db.set_background_monitor_state("loaded", "0")
@@ -2748,6 +2979,8 @@ class BackgroundMonitorPanel(QWidget):
         self.refresh()
 
     def repair_system_monitor_deployment(self) -> None:
+        if not self._require_system_service_authorization("Repairing the System Monitor deployment"):
+            return
         try:
             report = self.system_readiness.audit_deployment()
         except Exception as exc:
@@ -2787,10 +3020,44 @@ class BackgroundMonitorPanel(QWidget):
         self.refresh()
 
     def repair_monitor(self) -> None:
+        if not self._require_system_service_authorization("Repairing the System Monitor"):
+            return
         try:
+            if isinstance(self.launch_agent, LaunchAgentManager) and not self._system_mode_enabled():
+                user_status = self.launch_agent.status()
+                system_status = self.system_launch_agent.status()
+                if system_status.loaded and system_status.running and not user_status.loaded:
+                    # The live daemon is authoritative here. Persisted user
+                    # mode is stale, and attempting another bootstrap with the
+                    # same label would manufacture a wrong-domain conflict.
+                    self.db.set_background_monitor_state("monitor_mode", "system")
+                    self.db.set_background_monitor_state("monitor_install_mode", "system")
+                    self.db.set_background_monitor_state("installed", "1")
+                    self.db.set_background_monitor_state("enabled", "1")
+                    self.db.set_background_monitor_state("loaded", "1")
+                    self.db.set_background_monitor_state("running", "1")
+                    self.db.set_background_monitor_state("plist_path", str(system_status.plist_path))
+                    self.db.set_background_monitor_state("current_launchctl_domain", "system")
+                    self.db.set_background_monitor_state("last_error", "")
+                    notifier_note = self._ensure_user_notifier_for_alert_settings(
+                        load_settings(self.db), self._active_monitor_db()
+                    )
+                    QMessageBox.information(
+                        self,
+                        "Monitor Domain Reconciled",
+                        "The running System Monitor was healthy, but the GUI was still set to user mode. "
+                        "MSAA reconciled the selected mode to the live system domain instead of creating a duplicate service.\n\n"
+                        f"System daemon: {system_status.plist_path}\n"
+                        f"User alerts: {notifier_note or 'not required by current settings'}",
+                    )
+                    self.refresh()
+                    return
             stopped = self.service.stop_orphan_processes()
             manager = self._detector_manager()
-            plist_path, notes = manager.repair(**self._install_options(scope=manager.scope))
+            try:
+                plist_path, notes = manager.repair(**self._install_options(scope=getattr(manager, "scope", "user")))
+            except TypeError:
+                plist_path, notes = manager.repair()
             if self._system_mode_enabled() and load_settings(self.db).installation.notifier:
                 self._system_user_notifier_manager().install_user_notifier(**self._install_options(scope="user"))
             wait_seconds = float(getattr(self, "_repair_monitor_wait_seconds", 10))
@@ -2819,8 +3086,6 @@ class BackgroundMonitorPanel(QWidget):
         self.refresh()
 
     def repair_alerts_notifier(self) -> None:
-        manager = self._notifier_manager()
-        notifier_service = self._notification_service()
         monitor_db = self._active_monitor_db()
 
         def fail(stage: str, exc: Exception | str) -> None:
@@ -2833,97 +3098,61 @@ class BackgroundMonitorPanel(QWidget):
             self.refresh()
 
         try:
-            stopped_orphans = self.service.stop_orphan_processes()
+            installer = self._user_notifier_installer(monitor_db)
+            status = installer.repair_user_notifier()
+            update_db_notifier_status(monitor_db, status)
+            if not status.loaded or not status.running:
+                raise RuntimeError(status.last_error or "User Alert Agent did not load and start.")
         except Exception as exc:
-            fail("kill orphan notifier processes", exc)
+            fail("repair canonical User Alert Agent", exc)
             return
+
+        event = build_diagnostic_alert_event(
+            event_type="monitor_test_event",
+            source="repair_alerts",
+            evidence="Repair Alerts / Notifier end-to-end delivery probe.",
+        )
         try:
-            manager.stop()
-        except Exception as exc:
-            fail("stop user notifier LaunchAgent", exc)
-            return
-        try:
-            manager.uninstall()
-        except Exception as exc:
-            fail("remove old notifier plist", exc)
-            return
-        try:
-            plist_path = manager.install_user_notifier(**self._install_options(scope="user"))
-        except Exception as exc:
-            fail("recreate notifier plist", exc)
-            return
-        try:
-            manager.start()
-        except Exception as exc:
-            fail("bootstrap/kickstart notifier", exc)
-            return
-        try:
-            status = manager.status()
-            pid_alive = is_pid_alive(status.process_pid)
-            if not pid_alive:
-                raise RuntimeError(status.last_error or f"Notifier PID not alive: {status.process_pid or 'none'}")
-            monitor_db.set_background_monitor_state("notifier_installed", "1")
-            monitor_db.set_background_monitor_state("notifier_loaded", "1" if status.loaded else "0")
-            monitor_db.set_background_monitor_state("notifier_pid_alive", "1" if pid_alive else "0")
-            monitor_db.set_background_monitor_state("notifier_db_path", str(notifier_service.db.path))
-            monitor_db.set_background_monitor_state("notifier_last_poll", utc_now_iso())
-            monitor_db.set_background_monitor_state("notifier_last_alert_displayed", monitor_db.get_background_monitor_state("notifier_last_alert_displayed", ""))
-            monitor_db.set_background_monitor_state("notifier_last_error", "")
-        except Exception as exc:
-            fail("verify notifier PID alive", exc)
-            return
-        try:
-            test_event = notifier_service.simulate_event(
-                "camera_activity_stopped",
-                "Repair Alerts / Notifier synthetic overlay test alert.",
-                severity="info",
-                confidence="high",
-                source="repair_alerts",
-                process_name="FaceTime",
-                pid=0,
-                notify_force=False,
+            queue_visible_alert_for_notifier(
+                monitor_db,
+                event,
+                force=True,
+                reason="repair_alerts_end_to_end_probe",
             )
-            notifier_service.process_pending_notifications()
-            monitor_db.set_background_monitor_state("notifier_last_event_seen", test_event.timestamp)
-            monitor_db.set_background_monitor_state("alert_queue_length", str(len(monitor_db.pending_background_monitor_events(limit=200))))
         except Exception as exc:
-            fail("generate test event", exc)
+            fail("queue diagnostic alert", exc)
             return
+
         try:
-            latest_events = monitor_db.latest_monitor_events(limit=10)
-            matched = next((event for event in latest_events if event.event_id == test_event.event_id), None)
-            if matched is None:
-                raise RuntimeError("synthetic test event not found in database")
-            if not matched.notification_sent:
-                raise RuntimeError("synthetic test event was not consumed by the notifier")
-            if not matched.visible_alert_shown:
-                raise RuntimeError("synthetic test event did not produce a visible alert")
-            if monitor_db.get_background_monitor_state("overlay_manager_alive", "0") != "1":
-                raise RuntimeError("overlay manager is not reported as alive")
-            if monitor_db.get_background_monitor_state("overlay_dispatch_result", "") not in {"SUCCESS", "skipped"}:
-                raise RuntimeError(
-                    f"overlay dispatch did not succeed: {monitor_db.get_background_monitor_state('overlay_dispatch_result', 'unknown')}"
-                )
+            delivery = wait_for_visible_alert_trace(monitor_db, event.event_id, timeout_seconds=5.0)
+            if not delivery.get("visible"):
+                trace = delivery.get("trace", {})
+                reason = trace.get("overlay_error") or trace.get("render_verification_status") or "delivery receipt timed out"
+                raise RuntimeError(f"User Alert Agent did not confirm a visible alert: {reason}")
         except Exception as exc:
-            fail("verify test event consumed and overlay displayed", exc)
+            fail("verify User Alert Agent delivery receipt", exc)
             return
+
         monitor_db.set_background_monitor_state("last_error", "")
+        monitor_db.set_background_monitor_state("notification_pipeline_broken", "0")
         QMessageBox.information(
             self,
             "Repair Alerts / Notifier",
             "\n".join(
                 [
                     "Repair Alerts / Notifier completed.",
-                    f"Stopped orphan processes: {stopped_orphans or 'none'}",
-                    f"Recreated notifier plist: {plist_path}",
-                    f"Notifier PID alive: {manager.status().process_pid or 'none'}",
-                    "Synthetic test alert was consumed and displayed.",
+                    f"Repaired notifier plist: {status.plist_path}",
+                    f"Notifier PID: {status.process_pid or 'not reported'}",
+                    f"Verified alert event: {event.event_id}",
+                    "The dedicated User Alert Agent confirmed visible delivery.",
                 ]
             ),
         )
         self.refresh()
 
     def force_reinstall_monitor(self) -> None:
+        if not self._require_system_service_authorization("Reinstalling the System Monitor"):
+            return
         try:
             stopped = self.service.stop_orphan_processes()
             manager = self._detector_manager()
@@ -2945,17 +3174,24 @@ class BackgroundMonitorPanel(QWidget):
         self.refresh()
 
     def restart_monitor(self) -> None:
+        self._reconcile_live_monitor_domain()
+        if not self._require_system_service_authorization("Restarting the System Monitor"):
+            return
         manager = self._detector_manager()
         try:
             manager.stop()
-            if self._system_mode_enabled() and self.launch_agent.status().installed:
-                self.launch_agent.stop()
+            if self._system_mode_enabled():
+                notifier = self._user_notifier_installer(self._active_monitor_db())
+                if notifier.get_user_notifier_status().plist_exists:
+                    notifier.unload_user_notifier()
         except Exception:
             pass
         try:
             manager.start()
-            if self._system_mode_enabled() and self.launch_agent.status().installed:
-                self.launch_agent.start()
+            if self._system_mode_enabled():
+                notifier = self._user_notifier_installer(self._active_monitor_db())
+                if notifier.get_user_notifier_status().plist_exists:
+                    notifier.load_user_notifier()
             time.sleep(5)
             self.refresh()
             launch_status = manager.status()
@@ -2979,11 +3215,15 @@ class BackgroundMonitorPanel(QWidget):
         self.refresh()
 
     def start_monitor(self) -> None:
+        if not self._require_system_service_authorization("Starting the System Monitor"):
+            return
         try:
             manager = self._detector_manager()
             manager.start()
-            if self._system_mode_enabled() and self.launch_agent.status().installed:
-                self.launch_agent.start()
+            if self._system_mode_enabled():
+                notifier = self._user_notifier_installer(self._active_monitor_db())
+                if notifier.get_user_notifier_status().plist_exists:
+                    notifier.load_user_notifier()
             self.db.set_background_monitor_state("running", "1")
             self.db.set_background_monitor_state("loaded", "1")
             self.db.set_background_monitor_state("current_launchctl_domain", manager.status().current_launchctl_domain)
@@ -2994,11 +3234,15 @@ class BackgroundMonitorPanel(QWidget):
         self.refresh()
 
     def stop_monitor(self) -> None:
+        if not self._require_system_service_authorization("Stopping the System Monitor"):
+            return
         try:
             manager = self._detector_manager()
             manager.stop()
-            if self._system_mode_enabled() and self.launch_agent.status().installed:
-                self.launch_agent.stop()
+            if self._system_mode_enabled():
+                notifier = self._user_notifier_installer(self._active_monitor_db())
+                if notifier.get_user_notifier_status().plist_exists:
+                    notifier.unload_user_notifier()
             self.db.set_background_monitor_state("running", "0")
             self.db.set_background_monitor_state("loaded", "0")
             self.db.set_background_monitor_state("last_error", "")
@@ -3008,6 +3252,8 @@ class BackgroundMonitorPanel(QWidget):
         self.refresh()
 
     def uninstall_monitor(self) -> None:
+        if not self._require_system_service_authorization("Uninstalling the System Monitor"):
+            return
         manager = self._detector_manager()
         try:
             manager.stop()
@@ -3071,29 +3317,21 @@ class BackgroundMonitorPanel(QWidget):
                     trigger_rule_name=event_type,
                     trigger_source="alert_test",
                 )
-                service.db.record_monitor_event(event, dedupe_window_seconds=0)
-                service.notifications.show_visible_security_alert(event, reason="preview_alert_styles", force=True)
-                event.visible_alert_shown = True
-                event.notification_sent = True
-                event.notification_decision = "sent"
-                event.notification_reason = "preview_alert_styles"
-                event.popup_allowed = True
-                event.alert_style = expected_style
-                service.db.update_monitor_event_notification(
-                    event.event_id,
-                    notification_sent=True,
-                    notification_error="",
-                    notification_returncode=0,
-                    notification_decision="sent",
-                    notification_reason="test_bottom_right_alert",
-                    cooldown_remaining_seconds=0,
-                    popup_allowed=True,
-                    visible_alert_shown=True,
-                    alert_style=expected_style,
-                    cooldown_suppressed=False,
-                    last_suppression_reason="",
+                event.metadata_json = json.dumps(
+                    {
+                        "test_event": True,
+                        "preview_alert": True,
+                        "force_delivery": True,
+                        "bypass_cooldown": True,
+                        "bypass_rate_limit": True,
+                        "queue_delay_bypassed": True,
+                        "requires_visible_render": True,
+                        "expected_style": expected_style,
+                    },
+                    sort_keys=True,
                 )
-            QMessageBox.information(self, "Preview Alert Styles", "Generated INFO, LOW, MEDIUM, HIGH, and CRITICAL bottom-right alert previews.")
+                queue_visible_alert_for_notifier(service.db, event, force=True, reason="preview_alert_styles")
+            QMessageBox.information(self, "Preview Alert Styles", "Queued INFO, LOW, MEDIUM, HIGH, and CRITICAL previews for the User Alert Agent.")
         except Exception as exc:
             QMessageBox.warning(self, "Preview Alert Styles Failed", str(exc))
         self.refresh()
@@ -3103,16 +3341,27 @@ class BackgroundMonitorPanel(QWidget):
 
     def test_critical_alert(self) -> None:
         try:
-            event = self._event_service().simulate_event(
-                "protected_monitor_tamper_detected",
-                "Critical alert test for the notifier repair workflow.",
+            service = self._event_service()
+            event = BackgroundMonitorEvent(
+                event_id=f"force-critical-alert-{utc_now_iso()}",
+                timestamp=utc_now_iso(),
+                event_type="protected_monitor_tamper_detected",
+                evidence="Critical alert test for the notifier repair workflow.",
                 severity="critical",
-                confidence="high",
+                source="alert_test",
                 process_name="alert_test",
                 pid=0,
-                notify_force=True,
+                confidence="high",
+                recommendation="Confirm that the bottom-right critical alert is visible.",
+                simulated=True,
+                rule_id="protected_monitor_tamper_detected",
+                rule_name="Protected Monitor Tamper Detected",
+                trigger_rule_id="protected_monitor_tamper_detected",
+                trigger_rule_name="Protected Monitor Tamper Detected",
+                trigger_source="alert_test",
             )
-            self._notification_service().process_pending_notifications()
+            event.metadata_json = json.dumps({"test_event": True, "force_delivery": True, "bypass_cooldown": True, "requires_visible_render": True}, sort_keys=True)
+            queue_visible_alert_for_notifier(service.db, event, force=True, reason="critical_alert_test")
             QMessageBox.information(self, "Critical Alert Test", f"Created event: {event.event_type}")
         except Exception as exc:
             QMessageBox.warning(self, "Critical Alert Test Failed", str(exc))
@@ -3120,38 +3369,42 @@ class BackgroundMonitorPanel(QWidget):
 
     def test_idle_activity_warning(self) -> None:
         try:
-            event = self._event_service().simulate_event(
-                "input_activity_resumed_after_idle",
-                "Activity was detected after a period of inactivity. If this system is under investigation, preserve logs and review the timeline before cleanup or shutdown.",
+            event = build_diagnostic_alert_event(
+                event_type="input_activity_resumed_after_idle",
                 severity="medium",
-                confidence="high",
-                process_name="hid_idle_time",
-                pid=0,
-                notify_force=True,
+                source="hid_idle_time",
+                evidence="Activity was detected after a period of inactivity. This is an authorized alert-delivery test.",
             )
-            self._notification_service().process_pending_notifications()
-            QMessageBox.information(self, "Idle Activity Warning", f"Created event: {event.event_type}")
+            queue_visible_alert_for_notifier(
+                self._active_monitor_db(),
+                event,
+                force=True,
+                reason="idle_activity_warning_test",
+            )
+            QMessageBox.information(self, "Idle Activity Warning", f"Queued event for the User Alert Agent: {event.event_type}")
         except Exception as exc:
             QMessageBox.warning(self, "Idle Activity Warning Failed", str(exc))
         self.refresh()
 
     def test_notification(self) -> None:
-        result = self._notification_service().test_notification()
+        monitor_db = self._active_monitor_db()
+        event = build_diagnostic_alert_event(
+            event_type="monitor_test_event",
+            source="notification_test",
+            evidence="System Monitor User Alert Agent notification test.",
+        )
+        queue_visible_alert_for_notifier(monitor_db, event, force=True, reason="notification_test")
+        result = wait_for_visible_alert_trace(monitor_db, event.event_id, timeout_seconds=5.0)
+        trace = result.get("trace", {})
         QMessageBox.information(
             self,
             "Test Notification",
             "\n".join(
                 [
-                    f"Overlay: {'PASS' if result.get('overlay', {}).get('success') else 'FAIL'}",
-                    f"Dialog: {'PASS' if result.get('dialog', {}).get('success') else 'FAIL'}",
-                    f"Notification Center: {'PASS' if result.get('notification_center', {}).get('success') else 'FAIL'}",
-                    f"Overall Status: {result.get('overall_status') or ('PASS' if result.get('success') else 'FAIL')}",
-                    f"Reason: {result.get('reason') or ('Security alerts remain operational.' if result.get('success') else 'All alert mechanisms failed.')}",
-                    f"Overlay error: {result.get('overlay', {}).get('error') or 'none'}",
-                    f"Dialog error: {result.get('dialog', {}).get('error') or 'none'}",
-                    f"Notification Center error: {result.get('notification_center', {}).get('error') or 'none'}",
-                    f"notification status: {result.get('notification_status') or 'none'}",
-                    f"permission note: {result.get('permission_note')}",
+                    f"User Alert Agent delivery: {'PASS' if result.get('visible') else 'FAIL'}",
+                    f"Event ID: {event.event_id}",
+                    f"Render status: {trace.get('render_verification_status', 'not confirmed')}",
+                    f"Failure reason: {trace.get('overlay_error', '') or 'none'}",
                 ]
             ),
         )
@@ -3408,14 +3661,15 @@ class BackgroundMonitorPanel(QWidget):
 
     def export_html(self) -> None:
         default_path = get_reports_dir() / "background_monitor.html"
-        path, _ = QFileDialog.getSaveFileName(self, "Export Monitor HTML", str(default_path), "HTML Files (*.html)")
+        path, selected = QFileDialog.getSaveFileName(self, "Export Monitor Report", str(default_path), PROFESSIONAL_REPORT_FILTER)
         if not path:
             return
         events = [item.to_dict() for item in self.db.recent_background_monitor_events(limit=5000, event_type=str(self.filter_combo.currentData() or "") or None)]
         try:
-            saved_path = export_monitor_events_html(events, Path(path))
+            destination = selected_report_path(path, selected)
+            saved_path = export_monitor_events_html(events, destination) if destination.suffix.lower() == ".html" else export_monitor_events_professional(events, destination)
         except OSError as exc:
             LOGGER.exception("Failed to export monitor HTML to %s", path)
             QMessageBox.critical(self, "Export Failed", f"Failed to export monitor HTML:\n{path}\n\n{exc}")
             return
-        QMessageBox.information(self, "Monitor HTML Exported", f"Saved monitor HTML to:\n{saved_path}")
+        QMessageBox.information(self, "Monitor Report Exported", f"Saved monitor report to:\n{saved_path}")

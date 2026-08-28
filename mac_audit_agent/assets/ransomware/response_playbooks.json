@@ -1,0 +1,93 @@
+{
+  "metadata": {
+    "schema_version": "1.0",
+    "version": "1.0.0",
+    "updated": "2026-07-16T00:00:00Z",
+    "verified": true,
+    "disclaimer": "Local decision support only. MSAA does not contact agencies, submit reports, negotiate, or pay ransom."
+  },
+  "playbooks": {
+    "default": {
+      "severity": "high",
+      "why_it_matters": "Ransomware-like activity can disrupt operations, destroy recovery options, and indicate a broader unresolved compromise.",
+      "immediate_actions": [
+        "Notify authorized security or incident-response personnel.",
+        "Preserve relevant logs, process identity, timestamps, and volatile evidence where feasible.",
+        "Review affected files, active connections, persistence, and nearby security events.",
+        "Verify known-good offline or immutable backups before restoration.",
+        "Do not automatically delete evidence or contact an external agency from MSAA."
+      ],
+      "reference_ids": ["cisa-stopransomware-guide", "nist-800-61r3", "nist-ir-8374r1"]
+    },
+    "encryption_burst": {
+      "severity": "critical",
+      "why_it_matters": "Rapid file modification with encryption characteristics may indicate active data encryption for impact.",
+      "immediate_actions": [
+        "Isolate the affected device from wired, wireless, and VPN networks using an authorized procedure.",
+        "Preserve evidence before powering down when isolation is possible.",
+        "Identify other affected systems and prioritize critical assets.",
+        "Do not pay a ransom; payment does not guarantee recovery and may encourage further attacks.",
+        "Begin recovery planning from verified known-good backups on a clean environment.",
+        "Consider reporting through approved organizational channels to CISA, the local FBI field office, or IC3."
+      ],
+      "reference_ids": ["cisa-stopransomware-guide", "fbi-ransomware", "fbi-ic3-ransomware", "nist-800-61r3"]
+    },
+    "rapid_file_encryption": {
+      "inherits": "encryption_burst"
+    },
+    "probable_ransomware_behavior": {
+      "inherits": "encryption_burst"
+    },
+    "recovery_tamper": {
+      "severity": "critical",
+      "why_it_matters": "Attempts to disable or destroy backups, snapshots, or recovery services can prevent restoration and increase operational impact.",
+      "immediate_actions": [
+        "Protect backup infrastructure and credentials from the suspected host.",
+        "Preserve evidence of snapshot, service, or backup-policy changes.",
+        "Verify offline or immutable recovery copies without mounting them to the suspected host.",
+        "Escalate to incident-response personnel and assess other systems for similar tampering."
+      ],
+      "reference_ids": ["cisa-stopransomware-guide", "cisa-cpg", "nist-ir-8374r1", "nist-800-53r5"]
+    },
+    "defense_tamper": {
+      "severity": "critical",
+      "why_it_matters": "Security-control impairment may allow ransomware or precursor malware to operate without detection.",
+      "immediate_actions": [
+        "Preserve the control-change evidence and identify the initiating process and account.",
+        "Isolate affected systems when authorized.",
+        "Validate EDR, logging, firewall, backup, and monitoring coverage from a trusted system.",
+        "Hunt for precursor malware and earlier compromise activity."
+      ],
+      "reference_ids": ["cisa-stopransomware-guide", "cisa-advisories", "nist-800-61r3", "nist-800-53r5"]
+    },
+    "supported_exfiltration": {
+      "severity": "critical",
+      "why_it_matters": "Ransomware actors may steal data before encryption and use disclosure threats for extortion.",
+      "immediate_actions": [
+        "Preserve network, DNS, process, authentication, and file-access evidence.",
+        "Restrict confirmed malicious destinations through approved network controls.",
+        "Assess legal, privacy, contractual, and breach-notification obligations.",
+        "Coordinate incident reporting through approved organizational leadership."
+      ],
+      "reference_ids": ["cisa-stopransomware-guide", "fbi-cyber", "fbi-ic3-ransomware", "nist-800-61r3"]
+    }
+  },
+  "compliance_mapping": {
+    "NIST CSF 2.0": {
+      "Govern": ["Cybersecurity risk-management strategy and incident roles"],
+      "Identify": ["Asset inventory", "Risk identification"],
+      "Protect": ["Access control", "Backup protection", "Data security"],
+      "Detect": ["Behavioral monitoring", "File activity monitoring", "Adverse event analysis"],
+      "Respond": ["Incident management", "Containment", "Investigation", "Notification"],
+      "Recover": ["Restoration planning", "Restore operations", "Recovery communications"]
+    },
+    "CIS Controls": [
+      "CIS Control 3 Data Protection",
+      "CIS Control 4 Secure Configuration of Enterprise Assets and Software",
+      "CIS Control 5 Account Management",
+      "CIS Control 8 Audit Log Management",
+      "CIS Control 10 Malware Defenses",
+      "CIS Control 11 Data Recovery"
+    ]
+  }
+}

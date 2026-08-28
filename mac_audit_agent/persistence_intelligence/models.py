@@ -40,6 +40,7 @@ class PersistenceItem:
     signed_status: str = "unknown"
     notarization_status: str = "unknown"
     team_id: str = ""
+    developer_identity: str = ""
     bundle_id: str = ""
     source_scanner: str = ""
     first_seen: str = ""
@@ -55,6 +56,10 @@ class PersistenceItem:
     warnings: list[str] = field(default_factory=list)
     recommended_verification: str = ""
     false_positive_notes: str = ""
+    responsible_process: str = ""
+    parent_process: str = ""
+    responsible_user: str = ""
+    analyst_status: str = "open"
 
     @classmethod
     def create(cls, mechanism: str, path: str, *, label: str = "", source_scanner: str = "", **kwargs: Any) -> "PersistenceItem":
@@ -117,6 +122,8 @@ class PersistenceFinding:
     false_positive_notes: str
     mitre_mapping: list[str]
     nist_mapping: list[str]
+    cis_mapping: list[str]
+    cvss_score: float
     source_scanner: str
     created_at: str = field(default_factory=utc_now_iso)
 
@@ -139,7 +146,9 @@ class PersistenceFinding:
             ],
             false_positive_notes=item.false_positive_notes or "Legitimate management tools and developer utilities often use persistence mechanisms.",
             mitre_mapping=list(item.mitre_techniques),
-            nist_mapping=["NIST CSF Detect", "NIST 800-53 SI-4", "NIST 800-53 CM-6"],
+            nist_mapping=["NIST CSF 2.0 DE.CM", "NIST CSF 2.0 RS.AN", "NIST 800-53 SI-4", "NIST 800-53 CM-3", "NIST 800-53 CM-6", "NIST 800-61"],
+            cis_mapping=["CIS Control 2", "CIS Control 4", "CIS Control 8", "CIS Control 13"],
+            cvss_score=round(min(10.0, max(0.0, item.risk_score / 10.0)), 1),
             source_scanner=item.source_scanner,
         )
 

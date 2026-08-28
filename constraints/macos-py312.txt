@@ -1,0 +1,2 @@
+# Validated release packaging toolchain.
+-r ../requirements-build.txt

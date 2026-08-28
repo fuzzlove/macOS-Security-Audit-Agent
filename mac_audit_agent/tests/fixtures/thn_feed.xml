@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>The Hacker News</title>
+    <item>
+      <title>New macOS Malware Uses Backdoor for Credential Theft</title>
+      <link>https://thehackernews.com/2026/07/new-macos-malware.html?utm_source=rss</link>
+      <guid>thn-2026-macos-malware</guid>
+      <pubDate>Sun, 19 Jul 2026 14:30:00 +0000</pubDate>
+      <dc:creator>THN Research</dc:creator>
+      <category>Malware</category><category>Threat Intelligence</category>
+      <description><![CDATA[Researchers describe a <b>new backdoor</b> affecting endpoints. <a href="https://tracker.invalid">Details</a>.]]></description>
+    </item>
+    <item>
+      <title>Supply Chain Campaign Targets Software Packages</title>
+      <link>https://www.thehackernews.com/2026/07/supply-chain-campaign.html</link>
+      <guid>thn-2026-supply-chain</guid>
+      <pubDate>Sat, 18 Jul 2026 09:15:00 -0400</pubDate>
+      <category>Supply Chain</category>
+      <description>Malicious packages were used in a credential stealing campaign.</description>
+    </item>
+    <item>
+      <title>Cloud Security Configuration Guidance</title>
+      <link>https://thehackernews.com/2026/07/cloud-security-guidance.html</link>
+      <guid>thn-2026-cloud</guid>
+      <pubDate>Fri, 17 Jul 2026 12:00:00 +0000</pubDate>
+      <category>Cloud Security</category>
+      <description>Teams received new defensive configuration guidance.</description>
+    </item>
+  </channel>
+</rss>

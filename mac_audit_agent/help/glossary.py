@@ -2,8 +2,15 @@ from __future__ import annotations
 
 from mac_audit_agent.help.topic_models import GlossaryTerm
 
-
 GLOSSARY_TERMS: dict[str, GlossaryTerm] = {
+    "malware": GlossaryTerm("malware", "Software or code intended to harm, disrupt, spy on, or gain unauthorized control.", "Malware is an umbrella term whose classification depends on behavior and evidence, not merely an unfamiliar filename.", "Ransomware and spyware are malware categories.", ["ransomware", "virus", "worm"]),
+    "virus": GlossaryTerm("virus", "Malware that attaches to other content and spreads when that host is run.", "A virus generally requires a host file or program and execution to replicate; it differs from a self-propagating worm.", "An infected document macro may spread when opened.", ["malware", "worm"]),
+    "worm": GlossaryTerm("worm", "Self-propagating malware that can spread between systems.", "A worm automates propagation through reachable services, credentials, messaging, or removable media without needing to attach to a host file.", "A network worm may exploit an exposed service across many hosts.", ["malware", "virus"]),
+    "Trojan horse": GlossaryTerm("Trojan horse", "Software presented as useful or legitimate while concealing harmful behavior.", "Trojan describes deceptive delivery or identity; it does not by itself specify persistence, payload, or propagation.", "A fake utility may install an unwanted backdoor.", ["malware"]),
+    "rootkit": GlossaryTerm("rootkit", "Tools or modifications intended to conceal unauthorized control or artifacts.", "Rootkits may operate in user space, kernel space, firmware, or boot components; a heuristic indicator requires corroboration.", "Hidden process or module inconsistencies may require rootkit investigation.", ["malware"]),
+    "ransomware": GlossaryTerm("ransomware", "Malware that denies access to data or systems and demands payment or leverage.", "Ransomware operations may combine encryption, deletion, exfiltration, credential abuse, and recovery impairment.", "Unexpected high-rate file changes can be a ransomware signal but are not proof alone.", ["malware"]),
+    "supply-chain attack": GlossaryTerm("supply-chain attack", "Compromise introduced through a supplier, dependency, update, build process, or trusted service.", "Supply-chain risk crosses organizational trust boundaries and requires provenance, build, signing, dependency, and deployment evidence.", "A compromised signed update can distribute harmful code through a trusted channel.", ["integrity"]),
+    "manifesto": GlossaryTerm("manifesto", "A public statement of ideas, principles, or intentions.", "A manifesto is historical or cultural source material, not technical evidence, authorization, or an ethical standard by itself.", "A historical computing essay may be studied for context.", []),
     "alert severity levels": GlossaryTerm(
         "alert severity levels",
         "The priority labels MSAA uses to help you decide how quickly to review an event.",
@@ -114,8 +121,23 @@ GLOSSARY_TERMS: dict[str, GlossaryTerm] = {
 GLOSSARY: dict[str, str] = {term: entry.simple_definition for term, entry in GLOSSARY_TERMS.items()}
 GLOSSARY["hash"] = "A fixed-length fingerprint used to detect whether data changed."
 GLOSSARY["notifier"] = "The user-facing MSAA component that displays local alerts."
+GLOSSARY["product licensing"] = "Signed authorization for commercial MSAA features; it does not grant authority to access or change a target system."
+GLOSSARY["activation"] = "Verification and installation of a signed MSAA license, either from an offline document or a configured licensing service."
+GLOSSARY["offline license"] = "An Ed25519-signed license document imported locally without requiring Stripe or an online activation request."
+GLOSSARY["Stripe Checkout"] = "Stripe's hosted payment page; successful payment is confirmed to MSAA by a verified webhook before license fulfillment."
 GLOSSARY["operational health"] = "The condition of MSAA components needed for scanning, monitoring, alerting, settings, storage, and exports."
+GLOSSARY["typosquatting"] = "Use of a mistyped or confusingly similar name that may misdirect users; an existing similar name is not automatically malicious."
+GLOSSARY["unicode confusable"] = "A character or string that can resemble another under some fonts or scripts; UTS #39 screening is an aid, not proof of intent."
+GLOSSARY["rdap"] = "Registration Data Access Protocol, a structured protocol for domain registration data that does not guarantee purchase availability when no object is found."
+GLOSSARY["package normalization"] = "Registry-defined transformation used before comparing package identifiers, such as PyPA collapsing runs of hyphens, underscores, and periods."
 GLOSSARY["alert pipeline"] = "The path from local event collection through severity scoring, storage, and user notification."
+GLOSSARY["egress filtering"] = "Monitoring or restricting traffic leaving a host or network according to an approved policy."
+GLOSSARY["network segmentation"] = "Separating systems or trust zones and controlling traffic permitted between them or to external networks."
+GLOSSARY["firewall policy"] = "Documented rules describing which network traffic is allowed, denied, logged, and reviewed."
+GLOSSARY["ingress testing"] = "Authorized validation of traffic entering a defined host or network boundary from a stated source vantage."
+GLOSSARY["cde segmentation"] = "Controls and evidence used to separate a PCI cardholder data environment from other systems; MSAA does not certify PCI compliance."
+GLOSSARY["nmap xml"] = "Structured XML output produced by Nmap that records scan targets, ports, states, and supporting metadata for review."
+GLOSSARY["cwe"] = "Common Weakness Enumeration, a MITRE-maintained vocabulary for software and hardware weakness types."
 
 
 def get_glossary_entry(term: str) -> GlossaryTerm | None:

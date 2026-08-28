@@ -34,11 +34,11 @@ class ThemeSettingsPanel(QFrame):
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(16)
 
-        title = QLabel("Skins")
-        title.setStyleSheet("font-size: 18px; font-weight: 700; color: #F0F6FC;")
-        subtitle = QLabel("Choose the local control panel appearance.")
+        title = QLabel("Appearance")
+        title.setProperty("textRole", "cardTitle")
+        subtitle = QLabel("Choose an appearance suited to your contrast, glare, and color-vision preferences.")
         subtitle.setWordWrap(True)
-        subtitle.setStyleSheet("color: #9DB0C9;")
+        subtitle.setProperty("textRole", "muted")
         layout.addWidget(title)
         layout.addWidget(subtitle)
 
@@ -49,8 +49,8 @@ class ThemeSettingsPanel(QFrame):
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
 
-        skin_label = QLabel("Skin")
-        skin_label.setStyleSheet("font-weight: 700; color: #D6E4FF;")
+        skin_label = QLabel("Theme")
+        skin_label.setProperty("textRole", "sectionTitle")
         self.theme_combo = QComboBox()
         for name in theme_names():
             self.theme_combo.addItem(name)
@@ -59,7 +59,7 @@ class ThemeSettingsPanel(QFrame):
         self.theme_combo.currentTextChanged.connect(self._update_preview)
 
         contrast_label = QLabel("Contrast")
-        contrast_label.setStyleSheet("font-weight: 700; color: #D6E4FF;")
+        contrast_label.setProperty("textRole", "sectionTitle")
         self.high_contrast = QCheckBox("High contrast")
         self.high_contrast.setMinimumHeight(36)
         self.high_contrast.setToolTip("Increases contrast while preserving severity colors.")
@@ -67,14 +67,14 @@ class ThemeSettingsPanel(QFrame):
 
         self.preview_frame = QFrame()
         self.preview_frame.setObjectName("skinPreviewFrame")
-        self.preview_frame.setMinimumHeight(150)
-        self.preview_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.preview_frame.setMinimumHeight(170)
+        self.preview_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
         preview_layout = QVBoxLayout(self.preview_frame)
         preview_layout.setContentsMargins(14, 14, 14, 14)
         preview_layout.setSpacing(10)
         self.preview_label = QLabel("Preview")
         self.preview_label.setStyleSheet("font-weight: 700;")
-        self.preview_body = QLabel("Severity colors stay distinct across skins.")
+        self.preview_body = QLabel("Severity colors stay distinct across themes.")
         self.preview_body.setWordWrap(True)
         self.swatch_row = QHBoxLayout()
         self.swatch_row.setSpacing(8)
@@ -90,11 +90,11 @@ class ThemeSettingsPanel(QFrame):
         preview_layout.addLayout(self.swatch_row)
         preview_layout.addStretch(1)
 
-        self.apply_button = QPushButton("Apply Skin")
+        self.apply_button = QPushButton("Apply Appearance")
         self.apply_button.setProperty("role", "primary")
         self.apply_button.setMinimumHeight(36)
-        self.apply_button.setMinimumWidth(160)
-        self.apply_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.apply_button.setMinimumWidth(140)
+        self.apply_button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.apply_button.clicked.connect(self._emit_change)
 
         action_row = QHBoxLayout()
@@ -126,9 +126,10 @@ class ThemeSettingsPanel(QFrame):
 
     def _update_preview(self) -> None:
         theme = theme_for_name(self.theme_combo.currentText())
+        self.preview_body.setText(theme.description + " Severity is also communicated with text labels, not color alone.")
         card_background = theme.card_background
         if self.high_contrast.isChecked():
-            card_background = "rgba(18, 18, 18, 255)" if theme.name != "Minimal Light" else "rgba(255, 255, 255, 255)"
+            card_background = "rgba(255, 255, 255, 255)" if theme.is_light else "rgba(18, 18, 18, 255)"
         self.preview_frame.setStyleSheet(
             f"""
             QFrame#skinPreviewFrame {{

@@ -87,7 +87,7 @@ class CMMCReadinessResult:
     not_tested_count: int
     evidence_missing_count: int
     not_applicable_count: int
-    readiness_score: int
+    readiness_score: int | None
     requirements: list[dict[str, Any]]
     domain_summaries: list[dict[str, Any]]
     top_gaps: list[dict[str, Any]]
@@ -109,13 +109,13 @@ def cmmc_requirements() -> list[CMMCRequirement]:
         _req("CMMC-L1-AC-1", 1, "AC", "Access Control", "AC.L1-3.1.1", "Limit system access to authorized users.", ["Examine local user/admin inventory.", "Interview owner for authorization basis."], ["AC-2", "AC-3"], ["local users", "admin users", "guest/disabled account state"], ["scan.admin_persistence"], "examine", "FCI"),
         _req("CMMC-L1-IA-1", 1, "IA", "Identification and Authentication", "IA.L1-3.5.1", "Identify system users and processes acting on behalf of users.", ["Examine account inventory.", "Review authentication posture where observable."], ["IA-2"], ["local users", "login posture"], ["settings.enforcement"], "examine", "FCI"),
         _req("CMMC-L1-SI-1", 1, "SI", "System and Information Integrity", "SI.L1-3.14.1", "Identify, report, and correct information and system flaws in a timely manner.", ["Examine update/vulnerability evidence.", "Review Apple Exposure and integrity findings."], ["SI-2"], ["Apple Exposure Assessment", "integrity check", "CVE/KEV review"], ["scan.apple_exposure", "scan.visibility_integrity"], "examine", "FCI"),
-        _req("CMMC-L2-AU-1", 2, "AU", "Audit and Accountability", "AU.L2-3.3.1", "Create and retain system audit logs and records.", ["Examine monitor events and alert traces.", "Review report/evidence exports."], ["AU-2", "AU-6"], ["monitor events", "alert delivery trace", "report artifacts"], ["alert.delivery_trace", "exports.evidence_package"], "examine", "CUI"),
-        _req("CMMC-L2-CM-1", 2, "CM", "Configuration Management", "CM.L2-3.4.1", "Establish and maintain baseline configurations.", ["Examine baseline drift evidence.", "Review LaunchAgent/Daemon and sharing setting changes."], ["CM-2", "CM-3", "CM-6"], ["baseline drift", "launchd inventory", "sharing settings"], ["scan.baseline_drift", "persistence.workflow"], "examine", "CUI"),
+        _req("CMMC-L2-AU-1", 2, "AU", "Audit and Accountability", "AU.L2-3.3.1", "Create and retain system audit logs and records.", ["Examine monitor events and alert traces.", "Review signature bundle and Codex provenance metadata where present.", "Review report/evidence exports."], ["AU-2", "AU-6"], ["monitor events", "alert delivery trace", "signature bundle", "Codex provenance metadata", "report artifacts"], ["alert.delivery_trace", "integrity.signing", "exports.evidence_package"], "examine", "CUI"),
+        _req("CMMC-L2-CM-1", 2, "CM", "Configuration Management", "CM.L2-3.4.1", "Establish and maintain baseline configurations.", ["Examine baseline drift evidence.", "Review signed integrity manifest and approved change evidence.", "Review LaunchAgent/Daemon and sharing setting changes."], ["CM-2", "CM-3", "CM-6"], ["baseline drift", "dual-YubiKey signed integrity manifest", "launchd inventory", "sharing settings"], ["scan.baseline_drift", "integrity.signing", "persistence.workflow"], "examine", "CUI"),
         _req("CMMC-L2-IR-1", 2, "IR", "Incident Response", "IR.L2-3.6.1", "Establish an operational incident-handling capability.", ["Examine incident response evidence artifacts.", "Manual review of IR plan and roles required."], ["IR-4", "IR-6"], ["live response collection", "security timeline", "evidence snapshots", "incident response plan"], ["alert.bottom_right_rendering", "exports.evidence_package"], "examine", "CUI", ["manual evidence required: incident response plan and roles"]),
         _req("CMMC-L2-MP-1", 2, "MP", "Media Protection", "MP.L2-3.8.7", "Control the use of removable media on system components.", ["Examine USB/external storage observations.", "Manual review of media policy required."], ["MP-7"], ["USB devices", "external storage", "Bluetooth/HID context", "media policy"], ["scan.physical_devices"], "examine", "CUI", ["manual evidence required: media handling policy"]),
         _req("CMMC-L2-RA-1", 2, "RA", "Risk Assessment", "RA.L2-3.11.2", "Scan for vulnerabilities and remediate findings.", ["Examine Apple Exposure, CVE/KEV, and risk scoring evidence.", "Manual review of risk acceptance required."], ["RA-5"], ["Apple Exposure Assessment", "CVE/KEV correlation", "risk scoring"], ["scan.apple_exposure", "core.assessment_builder"], "examine", "CUI"),
         _req("CMMC-L2-SC-1", 2, "SC", "System and Communications Protection", "SC.L2-3.13.1", "Monitor and control communications at system boundaries.", ["Examine listeners, DNS/gateway/VPN/proxy, and firewall posture where collected."], ["SC-7"], ["Network Intelligence", "listener detection", "DNS/gateway/VPN/proxy review"], ["network_intelligence.collectors", "network_intelligence.reports"], "examine", "CUI"),
-        _req("CMMC-L2-SI-2", 2, "SI", "System and Information Integrity", "SI.L2-3.14.6", "Monitor systems to detect attacks and indicators of potential attacks.", ["Examine monitoring coverage, persistence detection, suspicious paths/processes, and alert evidence."], ["SI-4", "SI-7"], ["monitoring coverage", "persistence intelligence", "alert pipeline", "integrity manifest"], ["daemon.heartbeat", "persistence.workflow", "alert.bottom_right_rendering"], "examine", "CUI"),
+        _req("CMMC-L2-SI-2", 2, "SI", "System and Information Integrity", "SI.L2-3.14.6", "Monitor systems to detect attacks and indicators of potential attacks.", ["Examine monitoring coverage, persistence detection, suspicious paths/processes, signed manifest verification, and alert evidence."], ["SI-4", "SI-7"], ["monitoring coverage", "persistence intelligence", "alert pipeline", "canonical integrity manifest", "two-YubiKey quorum status"], ["daemon.heartbeat", "persistence.workflow", "integrity.signing", "alert.bottom_right_rendering"], "examine", "CUI"),
         _req("CMMC-L3-SI-1", 3, "SI", "System and Information Integrity", "SI.L3-3.14.x", "Support enhanced integrity and threat monitoring readiness.", ["Examine advanced integrity and persistence evidence.", "Manual review of enhanced CUI protections required."], ["NIST SP 800-172 SI enhanced requirements"], ["strict integrity verification", "persistence intelligence", "manual enhanced control evidence"], ["scan.visibility_integrity", "persistence.workflow"], "examine", "CUI_high_value", ["manual evidence required for NIST SP 800-172 enhanced practices"]),
     ]
 
@@ -213,12 +213,15 @@ def build_cmmc_readiness(
                 )
             )
     status_counts = {status: sum(1 for item in requirements if item.implementation_status == status) for status in IMPLEMENTATION_STATUSES}
-    score = round((status_counts["met"] + status_counts["partially_met"] * 0.5) / max(1, len(requirements)) * 100)
+    # This legacy endpoint-evidence subset is not a complete official catalog.
+    # A percentage or partial-credit score here would be misleading.
+    score = None
     domain_summaries = _domain_summaries(requirements, evidence_items)
     top_gaps = [item.to_dict() for item in requirements if item.implementation_status in {"evidence_missing", "not_tested", "partially_met"}][:10]
     limitations = [
         "MSAA cannot determine contractual CMMC scope by itself. Scope must be confirmed by the organization, contract requirements, and authorized personnel.",
         "Human/process/policy requirements require manual evidence and are not automatically satisfied by local technical scans.",
+        "This sample local-evidence mapping is catalog-incomplete and cannot produce an official-current CMMC score.",
     ]
     return CMMCReadinessResult(
         result_id=f"cmmc-readiness-{uuid4().hex[:12]}",

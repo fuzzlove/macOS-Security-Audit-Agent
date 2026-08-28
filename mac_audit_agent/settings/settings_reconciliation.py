@@ -30,7 +30,6 @@ class SettingsReconciliationResult:
     mismatches: list[SettingsMismatch] = field(default_factory=list)
     stale_components: list[str] = field(default_factory=list)
     repair_actions: list[str] = field(default_factory=list)
-    safe_to_manual_test: bool = False
     requires_daemon_restart: bool = False
     requires_notifier_restart: bool = False
     requires_reinstall: bool = False
@@ -140,7 +139,6 @@ def reconcile_settings(
         mismatches=mismatches,
         stale_components=stale_components,
         repair_actions=actions or ["No settings sync repair required."],
-        safe_to_manual_test=status in {"synced", "installed_manifest_stale"},
         requires_daemon_restart="runtime" in stale_components,
         requires_notifier_restart="notifier" in stale_components,
         requires_reinstall="installed_manifest" in stale_components and ("runtime" not in stale_components and "notifier" not in stale_components),

@@ -1,2 +1,0 @@
-[console_scripts]
-macos-security-audit-agent = mac_audit_agent.cli:main

@@ -7,13 +7,14 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QApplication, QPushButton
+from PySide6.QtWidgets import QApplication, QPushButton, QSizePolicy
 
 from mac_audit_agent.help.glossary import GLOSSARY
 from mac_audit_agent.help.help_controller import HelpController
 from mac_audit_agent.help.help_registry import get_help_topic, get_related_topics, list_help_topics, search_help_topics
 from mac_audit_agent.help.help_viewer import MISSING_TOPIC_MESSAGE, HelpViewer
 from mac_audit_agent.help.contextual_help import CONTEXT_HELP_TOPICS
+from mac_audit_agent.ui.help_button_style import HELP_MENU_BUTTON_MAX_HEIGHT, HELP_MENU_BUTTON_MAX_WIDTH, HELP_MENU_BUTTON_MIN_HEIGHT
 from mac_audit_agent.ui.main_window import MainWindow
 
 
@@ -102,8 +103,13 @@ def test_main_window_has_single_global_help_menu_entry(tmp_path: Path) -> None:
 
     assert len(global_help_buttons) == 1
     assert global_help_buttons[0] is window.global_help_button
-    assert window.global_help_button.parent() is window.left_nav
-    assert window.left_nav.layout().itemAt(0).widget() is window.global_help_button
+    assert window.global_help_button.parent() is window.application_utility_footer
+    assert window.application_utility_footer.parent() is window.right_content
+    assert window.sidebar_utility_footer.parent() is window.left_nav
+    assert window.left_nav.layout().itemAt(window.left_nav.layout().count() - 1).widget() is window.sidebar_utility_footer
+    assert window.global_help_button.property("navigationRole") == "utility"
+    assert window.global_help_button.property("utilityPlacement") == "bottom_right"
+    assert window.global_help_button.property("isPrimaryNavigation") is False
     assert help_actions == []
     assert "Help" not in menu_titles
     window.close()
@@ -130,7 +136,7 @@ def test_help_controller_reuses_single_help_center_viewer() -> None:
     app.processEvents()
 
 
-def test_global_help_menu_button_is_visible_labeled_accessible_and_left_positioned(tmp_path: Path) -> None:
+def test_global_help_menu_button_is_visible_labeled_accessible_and_right_positioned(tmp_path: Path) -> None:
     app = QApplication.instance() or QApplication([])
     window = MainWindow(tmp_path / "audit.sqlite")
 
@@ -139,15 +145,36 @@ def test_global_help_menu_button_is_visible_labeled_accessible_and_left_position
     assert button.text() == "Help Menu ?"
     assert button.text() != "?"
     assert "Help Menu" in button.text()
-    assert button.toolTip() == (
-        "Open the MSAA Help Center for feature explanations, troubleshooting, "
-        "glossary definitions, and safe response guidance."
-    )
+    assert button.toolTip() == "Open the MSAA Help Menu."
     assert button.accessibleName() == "Help Menu"
-    assert button.accessibleDescription() == "Open the MSAA Help Center"
-    assert button.minimumHeight() >= 34
+    assert button.accessibleDescription() == "Opens the central MSAA Help Menu and Help Center."
+    assert HELP_MENU_BUTTON_MIN_HEIGHT <= button.minimumHeight() <= HELP_MENU_BUTTON_MAX_HEIGHT
+    assert button.maximumHeight() <= HELP_MENU_BUTTON_MAX_HEIGHT
+    assert button.maximumWidth() == HELP_MENU_BUTTON_MAX_WIDTH
     assert button.sizeHint().width() > 80
-    assert window.left_nav.layout().itemAt(0).widget() is button
+    assert button.parent() is window.application_utility_footer
+    assert window.application_utility_footer.property("utilityPlacement") == "bottom_right"
+    assert window.left_nav.layout().itemAt(window.left_nav.layout().count() - 1).widget() is window.sidebar_utility_footer
+    assert window.sidebar.item(window.sidebar.count() - 1).text() == "Support the Author"
+    assert all(window.sidebar.item(row).text() != "Help Menu ?" for row in range(window.sidebar.count()))
+
+    window.close()
+    app.processEvents()
+
+
+def test_global_help_menu_button_is_compact_and_proportional(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(tmp_path / "audit.sqlite")
+    window.show()
+    app.processEvents()
+    button = window.global_help_button
+
+    assert button.sizePolicy().verticalPolicy() == QSizePolicy.Fixed
+    assert button.maximumHeight() <= HELP_MENU_BUTTON_MAX_HEIGHT
+    assert button.minimumHeight() >= HELP_MENU_BUTTON_MIN_HEIGHT
+    assert button.maximumWidth() <= HELP_MENU_BUTTON_MAX_WIDTH
+    assert button.sizeHint().width() <= HELP_MENU_BUTTON_MAX_WIDTH
+    assert button.fontMetrics().horizontalAdvance(button.text()) < button.sizeHint().width()
 
     window.close()
     app.processEvents()

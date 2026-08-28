@@ -6,6 +6,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import threading
@@ -49,6 +50,14 @@ from mac_audit_agent.models import (
 from mac_audit_agent.version import DATABASE_SCHEMA_VERSION
 
 LOGGER = logging.getLogger(__name__)
+SQL_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _sql_identifier(value: str) -> str:
+    """Validate and quote an SQLite identifier; values still use parameters."""
+    if not SQL_IDENTIFIER.fullmatch(value):
+        raise ValueError(f"invalid SQL identifier: {value!r}")
+    return '"' + value + '"'
 SYSTEM_MONITOR_DB_PATH = Path("/Library/Application Support/MacAuditAgent/mac_audit_agent.sqlite3")
 FINDING_FIELD_NAMES = {item.name for item in fields(Finding)}
 FINDING_PROVENANCE_FIELDS = {
@@ -427,12 +436,26 @@ class AuditDatabase:
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
         self._init_schema()
+        # Versioned ingress-segmentation tables share the primary MSAA database
+        # and foreign-key policy rather than creating a competing datastore.
+        from mac_audit_agent.network_segmentation.ingress_storage import migrate as migrate_segmentation
+        migrate_segmentation(self.conn)
+        # Behavioral Telemetry references canonical monitor events and stores
+        # only normalized links, aggregates, baselines, and anomaly evidence.
+        from mac_audit_agent.telemetry.storage import migrate as migrate_telemetry
+        migrate_telemetry(self.conn)
         self._ensure_shared_system_db_permissions()
 
     def close(self) -> None:
         if getattr(self, "_closed", True):
             return
         self._closed = True
+        telemetry_manager = getattr(self, "_behavioral_telemetry_manager", None)
+        if telemetry_manager is not None:
+            try:
+                telemetry_manager.close()
+            except Exception:
+                LOGGER.debug("Unable to stop Behavioral Telemetry manager for %s", self.path, exc_info=True)
         try:
             self.conn.close()
         except Exception:
@@ -465,6 +488,7 @@ class AuditDatabase:
             (self.path, 0o660),
             (self.path.with_suffix(self.path.suffix + "-wal"), 0o660),
             (self.path.with_suffix(self.path.suffix + "-shm"), 0o660),
+            (self.path.with_name(self.path.name + ".audit-integrity.key"), 0o640),
         ]
         for target, mode in targets:
             try:
@@ -1005,6 +1029,16 @@ class AuditDatabase:
                 updated_at TEXT NOT NULL,
                 payload_json TEXT NOT NULL DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS acknowledged_alert_groups (
+                duplicate_group_key TEXT PRIMARY KEY,
+                source_event_id TEXT NOT NULL,
+                acknowledged_at TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT '',
+                evidence_digest TEXT NOT NULL DEFAULT '',
+                duplicate_events_logged INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_background_monitor_events_pending_fifo
+                ON background_monitor_events(notification_sent, timestamp);
             CREATE TABLE IF NOT EXISTS repair_history (
                 repair_id TEXT PRIMARY KEY,
                 timestamp TEXT NOT NULL,
@@ -1277,9 +1311,12 @@ class AuditDatabase:
         )
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
-        columns = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+        table_sql = _sql_identifier(table); column_sql = _sql_identifier(column)
+        if ";" in definition or "--" in definition or not re.fullmatch(r"[A-Za-z0-9_'()\[\] {},.:-]+", definition):
+            raise ValueError("invalid SQL column definition")
+        columns = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table_sql})")}
         if column not in columns:
-            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            self.conn.execute(f"ALTER TABLE {table_sql} ADD COLUMN {column_sql} {definition}")
 
     def record_scan(self, summary: ScanSummary) -> None:
         self.conn.execute(
@@ -1686,6 +1723,21 @@ class AuditDatabase:
             return None
         return payload if isinstance(payload, dict) else None
 
+    def recent_security_assessments(self, limit: int = 10) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT payload_json FROM assessment_history ORDER BY created_at DESC LIMIT ?",
+            (max(1, min(int(limit), 1000)),),
+        ).fetchall()
+        assessments: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                assessments.append(payload)
+        return assessments
+
     def assessment_history(self, limit: int = 20) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             """
@@ -1988,8 +2040,9 @@ class AuditDatabase:
         self.conn.commit()
 
     def _insert_snapshot_rows(self, table: str, scan_id: str, rows: list[tuple[str, dict[str, Any]]]) -> None:
+        table_sql = _sql_identifier(table)
         self.conn.executemany(
-            f"INSERT INTO {table} (scan_id, item_key, payload_json) VALUES (?, ?, ?)",
+            f"INSERT INTO {table_sql} (scan_id, item_key, payload_json) VALUES (?, ?, ?)",
             [(scan_id, key, json.dumps(payload)) for key, payload in rows],
         )
 
@@ -2484,6 +2537,12 @@ class AuditDatabase:
         return results
 
     def record_background_monitor_event(self, event: BackgroundMonitorEvent, dedupe_window_seconds: int = 60) -> bool:
+        event.event_type = self._bounded_event_text(event.event_type, 512)
+        event.source = self._bounded_event_text(event.source, 2_048)
+        event.process_name = self._bounded_event_text(event.process_name, 2_048)
+        event.evidence = self._bounded_event_text(event.evidence, 65_536)
+        event.recommendation = self._bounded_event_text(event.recommendation, 16_384)
+        event.metadata_json = self._bounded_json_text(event.metadata_json or "{}", 131_072)
         duplicate_group_key = self._background_event_duplicate_group_key(event)
         event.duplicate_group_key = event.duplicate_group_key or duplicate_group_key
         event.duplicate_category = event.duplicate_category or "single"
@@ -2491,7 +2550,16 @@ class AuditDatabase:
         event.duplicate_count = max(0, int(getattr(event, "duplicate_count", 0) or 0))
         event.first_seen = event.first_seen or event.timestamp
         event.last_seen = event.last_seen or event.timestamp
-        row = self.conn.execute(
+        resilient_accounted = event.duplicate_category in {
+            "first_occurrence", "severity_escalation", "material_change", "reopened",
+            "threshold_summary", "exact_duplicate_consolidated",
+            "duplicate_burst", "high_volume_duplicate",
+            "periodic_summary", "notification_queue_pressure_log_only",
+            "notification_suppressed_evidence_retained", "storage_quota_degraded_latest_preserved",
+        }
+        row = self.conn.execute("SELECT * FROM background_monitor_events WHERE duplicate_group_key=? ORDER BY timestamp DESC LIMIT 1",(event.duplicate_group_key,)).fetchone()
+        if row is None and not resilient_accounted:
+            row = self.conn.execute(
             """
             SELECT *
             FROM background_monitor_events
@@ -2503,17 +2571,39 @@ class AuditDatabase:
             LIMIT 1
             """,
             (event.event_type, event.process_name, event.pid, event.evidence),
-        ).fetchone()
-        if row and dedupe_window_seconds > 0:
+            ).fetchone()
+        if row and resilient_accounted:
+            self._record_background_event_duplicate(row, event, event.duplicate_group_key)
+            if event.duplicate_category in {"severity_escalation","material_change","reopened","threshold_summary","periodic_summary"}:
+                self.conn.execute("UPDATE background_monitor_events SET notification_sent=0,notification_decision=?,notification_reason=? WHERE event_id=?",(event.duplicate_category,event.duplicate_category,row["event_id"]))
+                self.conn.commit()
+            return False
+        if row and (not bool(row["notification_sent"]) or dedupe_window_seconds > 0):
             try:
                 event_ts = datetime.fromisoformat(event.timestamp)
                 last_ts = datetime.fromisoformat(str(row["timestamp"]))
             except ValueError:
                 event_ts = None
                 last_ts = None
-            if event_ts and last_ts and (event_ts - last_ts).total_seconds() < dedupe_window_seconds:
+            pending_duplicate = dedupe_window_seconds > 0 and not bool(row["notification_sent"])
+            within_window = bool(
+                dedupe_window_seconds > 0
+                and event_ts
+                and last_ts
+                and (event_ts - last_ts).total_seconds() < dedupe_window_seconds
+            )
+            if pending_duplicate or within_window:
                 self._record_background_event_duplicate(row, event, duplicate_group_key)
                 return False
+        acknowledged = self.is_alert_group_acknowledged(duplicate_group_key)
+        if acknowledged:
+            event.notification_sent = True
+            event.notification_decision = "acknowledged_duplicate_log_only"
+            event.notification_reason = "matching evidenced alert was acknowledged"
+            event.last_suppression_reason = "acknowledged_duplicate"
+            event.popup_allowed = False
+            event.visible_alert_shown = False
+            event.duplicate_category = "acknowledged_duplicate"
         self.conn.execute(
             """
             INSERT OR REPLACE INTO background_monitor_events
@@ -2544,7 +2634,7 @@ class AuditDatabase:
                 int(bool(getattr(event, "cooldown_suppressed", False))),
                 str(getattr(event, "last_suppression_reason", "")),
                 event.metadata_json,
-                json.dumps(normalize_event_provenance(event), sort_keys=True),
+                self._bounded_json_text(json.dumps(normalize_event_provenance(event), sort_keys=True), 131_072),
                 event.occurrence_count,
                 event.duplicate_count,
                 event.duplicate_group_key,
@@ -2554,7 +2644,13 @@ class AuditDatabase:
             ),
         )
         self.set_background_monitor_state("last_event_timestamp", event.timestamp)
+        if acknowledged:
+            self.conn.execute(
+                "UPDATE acknowledged_alert_groups SET duplicate_events_logged = duplicate_events_logged + 1 WHERE duplicate_group_key = ?",
+                (duplicate_group_key,),
+            )
         self.conn.commit()
+        self._prune_monitor_event_capacity_if_needed()
         return True
 
     def _background_event_duplicate_group_key(self, event: BackgroundMonitorEvent) -> str:
@@ -2565,14 +2661,124 @@ class AuditDatabase:
             str(event.pid if event.pid is not None else ""),
             str(event.evidence),
         ]
-        return "|".join(parts)
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _bounded_event_text(value: object, maximum_bytes: int) -> str:
+        text = str(value or "")
+        encoded = text.encode("utf-8")
+        if len(encoded) <= maximum_bytes:
+            return text
+        marker = "\n[truncated by MSAA event storage limit]"
+        available = max(0, maximum_bytes - len(marker.encode("utf-8")))
+        return encoded[:available].decode("utf-8", errors="ignore") + marker
+
+    @staticmethod
+    def _bounded_json_text(value: object, maximum_bytes: int) -> str:
+        text = str(value or "{}")
+        encoded = text.encode("utf-8")
+        if len(encoded) <= maximum_bytes:
+            return text
+        return json.dumps(
+            {
+                "storage_truncated": True,
+                "original_bytes": len(encoded),
+                "sha256": hashlib.sha256(encoded).hexdigest(),
+                "preview": encoded[: min(32_768, maximum_bytes // 2)].decode("utf-8", errors="ignore"),
+            },
+            sort_keys=True,
+        )
+
+    def acknowledge_alert_group(self, event_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT event_id, severity, evidence, duplicate_group_key FROM background_monitor_events WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        if row is None or not str(row["evidence"] or "").strip():
+            return False
+        group_key = str(row["duplicate_group_key"] or "")
+        if not group_key:
+            event = self._background_event_from_row(
+                self.conn.execute("SELECT * FROM background_monitor_events WHERE event_id = ?", (event_id,)).fetchone()
+            )
+            group_key = self._background_event_duplicate_group_key(event)
+        evidence_digest = hashlib.sha256(str(row["evidence"]).encode("utf-8")).hexdigest()
+        self.conn.execute(
+            """
+            INSERT INTO acknowledged_alert_groups
+            (duplicate_group_key, source_event_id, acknowledged_at, severity, evidence_digest, duplicate_events_logged)
+            VALUES (?, ?, ?, ?, ?, 0)
+            ON CONFLICT(duplicate_group_key) DO UPDATE SET
+                source_event_id = excluded.source_event_id,
+                acknowledged_at = excluded.acknowledged_at,
+                severity = excluded.severity,
+                evidence_digest = excluded.evidence_digest
+            """,
+            (group_key, event_id, utc_now_iso(), str(row["severity"] or ""), evidence_digest),
+        )
+        self.conn.execute(
+            """
+            UPDATE background_monitor_events
+            SET notification_sent = 1,
+                notification_decision = CASE
+                    WHEN notification_decision IN ('', 'log_only') THEN 'acknowledged'
+                    ELSE notification_decision
+                END,
+                notification_reason = CASE
+                    WHEN notification_reason = '' THEN 'user acknowledged evidenced alert'
+                    ELSE notification_reason
+                END
+            WHERE event_id = ?
+            """,
+            (event_id,),
+        )
+        self.conn.commit()
+        return True
+
+    def is_alert_group_acknowledged(self, duplicate_group_key: str) -> bool:
+        if not duplicate_group_key:
+            return False
+        row = self.conn.execute(
+            "SELECT 1 FROM acknowledged_alert_groups WHERE duplicate_group_key = ?",
+            (duplicate_group_key,),
+        ).fetchone()
+        return row is not None
+
+    def _prune_monitor_event_capacity_if_needed(self, *, maximum_rows: int = 50_000, target_rows: int = 45_000) -> int:
+        row = self.conn.execute("SELECT COUNT(*) AS count FROM background_monitor_events").fetchone()
+        count = int(row["count"] or 0) if row else 0
+        if count <= maximum_rows:
+            return 0
+        remove_count = max(0, count - target_rows)
+        removable = self.conn.execute(
+            """
+            SELECT event_id FROM background_monitor_events
+            WHERE notification_sent = 1
+            ORDER BY timestamp ASC, rowid ASC
+            LIMIT ?
+            """,
+            (remove_count,),
+        ).fetchall()
+        event_ids = [str(item["event_id"]) for item in removable]
+        if not event_ids:
+            self.set_background_monitor_state("event_retention_pressure", f"pending_events_preserved:{count}")
+            return 0
+        placeholders = ",".join("?" for _ in event_ids)
+        self.conn.execute(f"DELETE FROM event_alert_traces WHERE event_id IN ({placeholders})", event_ids)
+        self.conn.execute(f"DELETE FROM alert_delivery_records WHERE event_id IN ({placeholders})", event_ids)
+        self.conn.execute(f"DELETE FROM background_monitor_events WHERE event_id IN ({placeholders})", event_ids)
+        self.conn.commit()
+        self.set_background_monitor_state("event_retention_last_pruned", utc_now_iso())
+        self.set_background_monitor_state("event_retention_last_removed", str(len(event_ids)))
+        return len(event_ids)
 
     def _record_background_event_duplicate(self, row: sqlite3.Row, event: BackgroundMonitorEvent, duplicate_group_key: str) -> None:
+        requested_category = str(event.duplicate_category or "")
         occurrence_count = max(1, safe_int(row["occurrence_count"]) or 1) + 1
         duplicate_count = max(0, safe_int(row["duplicate_count"]) or 0) + 1
         first_seen = str(row["first_seen"] or row["timestamp"] or event.timestamp)
         last_seen = event.timestamp
-        duplicate_category = "duplicate_burst" if duplicate_count < 10 else "high_volume_duplicate"
+        duplicate_category = requested_category if requested_category in {"severity_escalation", "material_change", "reopened", "threshold_summary", "periodic_summary"} else "duplicate_burst" if duplicate_count < 10 else "high_volume_duplicate"
         metadata = {}
         try:
             metadata = json.loads(str(row["metadata_json"] or "{}"))
@@ -2580,6 +2786,13 @@ class AuditDatabase:
             metadata = {}
         if not isinstance(metadata, dict):
             metadata = {}
+        if duplicate_category in {"severity_escalation", "material_change", "reopened"}:
+            try:
+                incoming_metadata = json.loads(str(event.metadata_json or "{}"))
+            except json.JSONDecodeError:
+                incoming_metadata = {}
+            if isinstance(incoming_metadata, dict):
+                metadata.update(incoming_metadata)
         metadata.update(
             {
                 "occurrence_count": occurrence_count,
@@ -2609,7 +2822,11 @@ class AuditDatabase:
                 duplicate_category = ?,
                 first_seen = ?,
                 last_seen = ?,
-                metadata_json = ?
+                metadata_json = ?,
+                severity = CASE WHEN ? IN ('severity_escalation','material_change','reopened') THEN ? ELSE severity END,
+                confidence = CASE WHEN ? IN ('severity_escalation','material_change','reopened') THEN ? ELSE confidence END,
+                evidence = CASE WHEN ? IN ('severity_escalation','material_change','reopened') THEN ? ELSE evidence END,
+                recommendation = CASE WHEN ? IN ('severity_escalation','material_change','reopened') THEN ? ELSE recommendation END
             WHERE event_id = ?
             """,
             (
@@ -2621,6 +2838,14 @@ class AuditDatabase:
                 first_seen,
                 last_seen,
                 event.metadata_json,
+                duplicate_category,
+                event.severity,
+                duplicate_category,
+                event.confidence,
+                duplicate_category,
+                event.evidence,
+                duplicate_category,
+                event.recommendation,
                 str(row["event_id"]),
             ),
         )
@@ -2629,7 +2854,47 @@ class AuditDatabase:
         self.conn.commit()
 
     def record_monitor_event(self, event: BackgroundMonitorEvent, dedupe_window_seconds: int = 300) -> bool:
-        return self.record_background_monitor_event(event, dedupe_window_seconds=dedupe_window_seconds)
+        from mac_audit_agent.alerts.resilient_pipeline import pipeline_for
+
+        # An explicit zero is used by import/replay callers that require every
+        # event row to remain distinct. Do not let the alert pipeline collapse
+        # those records before the storage contract sees the requested policy.
+        if dedupe_window_seconds == 0:
+            stored = self.record_background_monitor_event(event, dedupe_window_seconds=0)
+            self._submit_behavioral_telemetry(event)
+            return stored
+
+        reported_occurrence_count=max(1,int(getattr(event,"occurrence_count",1) or 1))
+        reported_duplicate_category=str(getattr(event,"duplicate_category","") or "")
+        decision = pipeline_for(self).ingest_background_event(event)
+        event.duplicate_group_key = decision.fingerprint
+        event.occurrence_count = max(reported_occurrence_count, decision.occurrence_count, 1)
+        event.duplicate_count = max(reported_occurrence_count-1, decision.occurrence_count - 1, 0)
+        event.duplicate_category = reported_duplicate_category if reported_occurrence_count>1 and reported_duplicate_category not in {"","single"} else decision.disposition
+        if not decision.notify:
+            event.notification_sent = True
+            event.notification_decision = "resilient_event_log_only"
+            event.notification_reason = decision.disposition
+            event.popup_allowed = False
+            event.cooldown_suppressed = True
+            event.last_suppression_reason = decision.disposition
+        # Disable the legacy time-window deduplicator: the resilient ledger has
+        # already durably accounted for this receipt and made the notification
+        # decision. The compatibility row is retained for notifier/UI readers.
+        stored = self.record_background_monitor_event(event, dedupe_window_seconds=0)
+        self._submit_behavioral_telemetry(event)
+        return stored
+
+    def _submit_behavioral_telemetry(self, event: BackgroundMonitorEvent) -> None:
+        """Non-blocking secondary dispatch; canonical security storage wins."""
+        try:
+            from mac_audit_agent.telemetry.manager import manager_for
+
+            manager_for(self).submit_background_event(event)
+        except Exception:
+            # Behavioral analysis degradation must never interrupt primary
+            # detector persistence or alert accounting.
+            LOGGER.debug("Behavioral Telemetry dispatch failed for %s", event.event_id, exc_info=True)
 
     def _background_event_from_row(self, row: sqlite3.Row) -> BackgroundMonitorEvent:
         provenance: dict[str, Any] = {}
@@ -2648,7 +2913,14 @@ class AuditDatabase:
             "duplicate_count",
             "duplicate_group_key",
             "duplicate_category",
+            "correlation_id",
         }
+        from mac_audit_agent.event_correlation import correlation_id_for_event
+
+        correlation_payload = dict(row)
+        correlation_payload.update(provenance)
+        correlation_payload["provenance_json"] = raw_provenance
+        correlation_payload["metadata_json"] = str(row["metadata_json"] or "{}")
         return BackgroundMonitorEvent(
             event_id=str(row["event_id"]),
             timestamp=str(row["timestamp"]),
@@ -2679,6 +2951,7 @@ class AuditDatabase:
             duplicate_category=str(row["duplicate_category"] or "single"),
             first_seen=str(row["first_seen"] or ""),
             last_seen=str(row["last_seen"] or ""),
+            correlation_id=correlation_id_for_event(correlation_payload),
             **{key: value for key, value in provenance.items() if key in EVENT_PROVENANCE_FIELDS and key not in explicit_fields},
         )
 
@@ -2750,7 +3023,13 @@ class AuditDatabase:
             """
             SELECT * FROM background_monitor_events
             WHERE notification_sent = 0
-            ORDER BY timestamp ASC
+            ORDER BY CASE severity
+                WHEN 'critical' THEN 0
+                WHEN 'high' THEN 1
+                WHEN 'medium' THEN 2
+                WHEN 'low' THEN 3
+                ELSE 4
+            END ASC, timestamp ASC, rowid ASC
             LIMIT ?
             """,
             (limit,),
@@ -3039,7 +3318,11 @@ class AuditDatabase:
     def update_event_alert_trace(self, trace_id: str, **updates: Any) -> None:
         if not updates:
             return
-        assignments = ", ".join(f"{key} = ?" for key in updates)
+        allowed_columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(event_alert_traces)")}
+        invalid = set(updates) - allowed_columns
+        if invalid:
+            raise ValueError("invalid event alert trace columns: " + ", ".join(sorted(invalid)))
+        assignments = ", ".join(f"{_sql_identifier(key)} = ?" for key in updates)
         values = [int(bool(value)) if isinstance(value, bool) else value for value in updates.values()]
         values.append(trace_id)
         self.conn.execute(f"UPDATE event_alert_traces SET {assignments} WHERE trace_id = ?", values)
@@ -3704,7 +3987,8 @@ class AuditDatabase:
         return payload
 
     def _load_snapshots(self, scan_id: str, table: str, cls, ignore_null_payload: bool = False):
-        rows = self.conn.execute(f"SELECT payload_json FROM {table} WHERE scan_id = ?", (scan_id,)).fetchall()
+        table_sql = _sql_identifier(table)
+        rows = self.conn.execute(f"SELECT payload_json FROM {table_sql} WHERE scan_id = ?", (scan_id,)).fetchall()
         loaded = []
         for row in rows:
             if row["payload_json"] is None:

@@ -18,8 +18,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from mac_audit_agent.event_correlation import correlation_id_for_event
 from mac_audit_agent.intrusion_correlation import IntrusionCorrelationReport
 from mac_audit_agent.ui.action_state import ActionState, apply_action_state
+from mac_audit_agent.ui.responsive_actions import ResponsiveActionRow
+from mac_audit_agent.ui.rce_investigation_panel import RCEInvestigationPanel
 
 
 def _make_table(headers: list[str]) -> QTableWidget:
@@ -41,8 +44,9 @@ class IntrusionDetectionPanel(QFrame):
     snapshot_requested = Signal()
     export_ai_summary_requested = Signal()
     open_logs_requested = Signal()
+    rce_disposition_requested = Signal(str, str, str)
 
-    def __init__(self, title: str = "Intrusion Detection", subtitle: str = "Correlation, explainability, coverage, and evidence preservation.", parent: QWidget | None = None) -> None:
+    def __init__(self, title: str = "Host IDS", subtitle: str = "Correlation, explainability, coverage, and evidence preservation.", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("intrusionDetectionPanel")
         self.setFrameShape(QFrame.StyledPanel)
@@ -59,10 +63,10 @@ class IntrusionDetectionPanel(QFrame):
         header_row = QHBoxLayout()
         title_block = QVBoxLayout()
         self.title_label = QLabel(title)
-        self.title_label.setStyleSheet("font-size: 18px; font-weight: 700; color: #F0F6FC;")
+        self.title_label.setProperty("textRole", "cardTitle")
         self.subtitle_label = QLabel(subtitle)
         self.subtitle_label.setWordWrap(True)
-        self.subtitle_label.setStyleSheet("color: #9DB0C9;")
+        self.subtitle_label.setProperty("textRole", "muted")
         title_block.addWidget(self.title_label)
         title_block.addWidget(self.subtitle_label)
         header_row.addLayout(title_block)
@@ -71,7 +75,7 @@ class IntrusionDetectionPanel(QFrame):
         self.presence_label = QLabel("User presence: unknown")
         for label in [self.coverage_label, self.presence_label]:
             label.setWordWrap(True)
-            label.setStyleSheet("color: #D6E4FF; font-weight: 700;")
+            label.setProperty("textRole", "sectionTitle")
         status_block = QVBoxLayout()
         status_block.addWidget(self.coverage_label)
         status_block.addWidget(self.presence_label)
@@ -80,32 +84,40 @@ class IntrusionDetectionPanel(QFrame):
 
         self.summary_label = QLabel("No correlated patterns yet.")
         self.summary_label.setWordWrap(True)
-        self.summary_label.setStyleSheet("color: #D6E4FF;")
+        self.summary_label.setProperty("textRole", "muted")
         layout.addWidget(self.summary_label)
+        self.persistence_status_label = QLabel("")
+        self.persistence_status_label.setWordWrap(True)
+        self.persistence_status_label.setProperty("severity", "medium")
+        self.persistence_status_label.setStyleSheet("font-weight: 700;")
+        self.persistence_status_label.hide()
+        layout.addWidget(self.persistence_status_label)
 
-        button_row = QHBoxLayout()
+        button_row = ResponsiveActionRow()
         self.refresh_button = QPushButton("Refresh")
         self.context_button = QPushButton("Show Context")
         self.snapshot_button = QPushButton("Preserve Evidence Snapshot")
         self.ai_summary_button = QPushButton("Export AI Summary")
         self.logs_button = QPushButton("Open Logs")
         for button in [self.refresh_button, self.context_button, self.snapshot_button, self.ai_summary_button, self.logs_button]:
-            button.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
             button.setMinimumHeight(36)
             button.setToolTip(button.text())
-            button_row.addWidget(button)
-        layout.addLayout(button_row)
+            button_row.add_button(button)
+        layout.addWidget(button_row)
 
         self.tabs = QTabWidget()
         self.patterns_tab = QWidget()
         self.timeline_tab = QWidget()
         self.summary_tab = QWidget()
+        self.rce_tab = RCEInvestigationPanel()
         self._build_patterns_tab()
         self._build_timeline_tab()
         self._build_summary_tab()
+        self.tabs.addTab(self.rce_tab, "Suspected RCE")
         self.tabs.addTab(self.patterns_tab, "Patterns")
         self.tabs.addTab(self.timeline_tab, "Flight Recorder")
         self.tabs.addTab(self.summary_tab, "AI Summary")
+        self.rce_tab.disposition_requested.connect(self.rce_disposition_requested.emit)
         layout.addWidget(self.tabs)
 
         self.refresh_button.clicked.connect(self.refresh_requested.emit)
@@ -163,6 +175,15 @@ class IntrusionDetectionPanel(QFrame):
         )
         self._refresh_details()
 
+    def set_persistence_status(self, message: str) -> None:
+        self.persistence_status_label.setText(message)
+        self.persistence_status_label.setVisible(bool(message))
+
+    def set_rce_events(self, events: list[dict[str, Any]]) -> None:
+        self.rce_tab.set_events(events)
+        if events:
+            self.tabs.setCurrentWidget(self.rce_tab)
+
     def _set_patterns(self, patterns: list[dict[str, Any]]) -> None:
         self.patterns_table.setRowCount(0)
         for index, pattern in enumerate(patterns):
@@ -193,7 +214,7 @@ class IntrusionDetectionPanel(QFrame):
                 str(event.get("event_type", "")),
                 str(event.get("severity", "")),
                 str(event.get("evidence", event.get("summary", ""))),
-                str(event.get("correlation_id", "")),
+                correlation_id_for_event(event),
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -227,7 +248,7 @@ class IntrusionDetectionPanel(QFrame):
                 f"Type: {event.get('event_type', '')}",
                 f"Severity: {event.get('severity', '')}",
                 f"Evidence: {event.get('evidence', event.get('summary', ''))}",
-                f"Correlation: {event.get('correlation_id', '')}",
+                f"Correlation: {correlation_id_for_event(event)}",
             ]
             self.details.setPlainText("\n".join(lines))
             apply_action_state(self.context_button, ActionState(enabled=True, visible=True))

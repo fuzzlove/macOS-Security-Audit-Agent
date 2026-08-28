@@ -1,0 +1,30 @@
+{
+  "alerting": {
+    "schema_version": 1,
+    "dedup_window_seconds": 60,
+    "summary_interval_seconds": 300,
+    "resolve_after_seconds": 900,
+    "summary_thresholds": [10, 100, 1000],
+    "ingestion_capacity": 10000,
+    "notification_capacity": 2000,
+    "protected_capacity": 500,
+    "maximum_active_fingerprints": 50000,
+    "state_ttl_seconds": 86400,
+    "maximum_size_mb": 2048,
+    "emergency_reserved_size_mb": 256,
+    "individual_duplicate_retention_limit": 1000,
+    "maximum_event_size_bytes": 262144,
+    "maximum_string_length": 16384,
+    "desktop_notifications_per_minute": 6,
+    "flood_events_per_window": 1000,
+    "source_rate_per_second": 2000,
+    "maximum_source_windows": 4096,
+    "emergency_buffer_capacity": 512,
+    "fallback_audit_maximum_bytes": 1048576,
+    "maximum_suppression_duration_seconds": 86400,
+    "maximum_nesting_depth": 8,
+    "maximum_collection_items": 128,
+    "event_integrity_chain_enabled": true,
+    "source_authentication_enabled": true
+  }
+}

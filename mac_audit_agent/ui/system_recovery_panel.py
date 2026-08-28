@@ -24,91 +24,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-
-RECOVERY_BUTTON_STYLES = {
-    "primary": """
-        QPushButton[recoveryButtonRole="primary"] {
-            background: #1F6FEB;
-            color: #FFFFFF;
-            border: 1px solid #58A6FF;
-            border-radius: 6px;
-            min-height: 36px;
-            padding: 6px 10px;
-            font-size: 12px;
-            font-weight: 600;
-        }
-        QPushButton[recoveryButtonRole="primary"]:hover { background: #256ADF; }
-        QPushButton[recoveryButtonRole="primary"]:pressed { background: #195BB8; }
-        QPushButton[recoveryButtonRole="primary"]:focus { border: 2px solid #F0F6FC; }
-    """,
-    "secondary": """
-        QPushButton[recoveryButtonRole="secondary"] {
-            background: #30363D;
-            color: #F0F6FC;
-            border: 1px solid #8B949E;
-            border-radius: 6px;
-            min-height: 36px;
-            padding: 6px 10px;
-            font-size: 12px;
-            font-weight: 600;
-        }
-        QPushButton[recoveryButtonRole="secondary"]:hover { background: #3A4047; }
-        QPushButton[recoveryButtonRole="secondary"]:pressed { background: #262B31; }
-        QPushButton[recoveryButtonRole="secondary"]:focus { border: 2px solid #F0F6FC; }
-    """,
-    "warning": """
-        QPushButton[recoveryButtonRole="warning"] {
-            background: #9A6700;
-            color: #FFFFFF;
-            border: 1px solid #D29922;
-            border-radius: 6px;
-            min-height: 36px;
-            padding: 6px 10px;
-            font-size: 12px;
-            font-weight: 600;
-        }
-        QPushButton[recoveryButtonRole="warning"]:hover { background: #B07800; }
-        QPushButton[recoveryButtonRole="warning"]:pressed { background: #7F5600; }
-        QPushButton[recoveryButtonRole="warning"]:focus { border: 2px solid #F0F6FC; }
-    """,
-    "urgent": """
-        QPushButton[recoveryButtonRole="urgent"] {
-            background: #7A1F5C;
-            color: #FFFFFF;
-            border: 1px solid #D2A8FF;
-            border-radius: 6px;
-            min-height: 36px;
-            padding: 6px 10px;
-            font-size: 12px;
-            font-weight: 600;
-        }
-        QPushButton[recoveryButtonRole="urgent"]:hover { background: #8A2468; }
-        QPushButton[recoveryButtonRole="urgent"]:pressed { background: #65184B; }
-        QPushButton[recoveryButtonRole="urgent"]:focus { border: 2px solid #F0F6FC; }
-    """,
-    "disabled": """
-        QPushButton:disabled {
-            background: #484F58;
-            color: #8B949E;
-            border: 1px solid #6E7681;
-            border-radius: 6px;
-            min-height: 36px;
-            padding: 6px 10px;
-            font-size: 12px;
-            font-weight: 600;
-        }
-    """,
-}
+from mac_audit_agent.ui.button_factory import create_button
+from mac_audit_agent.ui.button_styles import ButtonVariant
+from mac_audit_agent.ui.responsive_actions import ResponsiveActionRow
 
 
 def make_recovery_button(text: str, tooltip: str, style: str = "primary", min_width: int | None = None) -> QPushButton:
-    button = QPushButton(text)
-    button.setToolTip(tooltip)
-    button.setMinimumHeight(36)
-    button.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Fixed)
+    variant = {
+        "primary": ButtonVariant.PRIMARY.value,
+        "warning": ButtonVariant.WARNING.value,
+        "urgent": ButtonVariant.DESTRUCTIVE_CONFIRM.value,
+    }.get(style, ButtonVariant.SECONDARY.value)
+    button = create_button(text, tooltip=tooltip, variant=variant, min_width=min_width)
     button.setProperty("recoveryButtonRole", style)
     button.setCursor(Qt.PointingHandCursor)
-    button.setStyleSheet(RECOVERY_BUTTON_STYLES.get(style, RECOVERY_BUTTON_STYLES["secondary"]) + RECOVERY_BUTTON_STYLES["disabled"])
     button.setMinimumWidth(max(110, len(text) * 8 + 28) if min_width is None else min_width)
     return button
 
@@ -200,16 +129,16 @@ class SystemRecoveryPanel(QFrame):
         header_row = QHBoxLayout()
         title_block = QVBoxLayout()
         self.title_label = QLabel("System Recovery")
-        self.title_label.setStyleSheet("font-size: 18px; font-weight: 700; color: #F0F6FC;")
+        self.title_label.setProperty("textRole", "cardTitle")
         self.subtitle_label = QLabel("Storage, cleanup, snapshots, performance, and recommendations.")
         self.subtitle_label.setWordWrap(True)
-        self.subtitle_label.setStyleSheet("color: #9DB0C9;")
+        self.subtitle_label.setProperty("textRole", "muted")
         title_block.addWidget(self.title_label)
         title_block.addWidget(self.subtitle_label)
         header_row.addLayout(title_block)
         header_row.addStretch(1)
         self.recovery_state_label = QLabel("Recovery not checked yet")
-        self.recovery_state_label.setStyleSheet("font-size: 14px; font-weight: 700; color: #D6E4FF;")
+        self.recovery_state_label.setProperty("textRole", "sectionTitle")
         header_row.addWidget(self.recovery_state_label)
         layout.addLayout(header_row)
 
@@ -219,12 +148,12 @@ class SystemRecoveryPanel(QFrame):
         self.last_checked_label = QLabel("Last checked: not yet")
         self.cache_age_label = QLabel("Cache age: unknown")
         for label in [self.recovery_score_label, self.space_recovery_label, self.last_checked_label, self.cache_age_label]:
-            label.setStyleSheet("color: #D6E4FF;")
+            label.setProperty("textRole", "muted")
             summary_row.addWidget(label)
         summary_row.addStretch(1)
         layout.addLayout(summary_row)
 
-        toolbar = QHBoxLayout()
+        toolbar = ResponsiveActionRow()
         self.incident_check_button = make_recovery_button("Run Incident Check", "Evaluate cleanup risk before any cleanup operation.", "warning")
         self.snapshot_button = make_recovery_button("Create Evidence Snapshot", "Create a forensic snapshot before cleanup.", "primary")
         self.preview_button = make_recovery_button("Preview Cleanup", "Preview candidate files and estimated space recovery without deleting anything.", "secondary")
@@ -237,8 +166,8 @@ class SystemRecoveryPanel(QFrame):
             self.cleanup_button,
             self.open_snapshots_button,
         ]:
-            toolbar.addWidget(button)
-        layout.addLayout(toolbar)
+            toolbar.add_button(button)
+        layout.addWidget(toolbar)
 
         self.incident_check_button.clicked.connect(self.incident_check_requested.emit)
         self.snapshot_button.clicked.connect(self.snapshot_requested.emit)
@@ -263,35 +192,6 @@ class SystemRecoveryPanel(QFrame):
         self.tabs.addTab(self.performance_tab, "Performance")
         self.tabs.addTab(self.recommendations_tab, "Recommendations")
         layout.addWidget(self.tabs, 1)
-
-        self.setStyleSheet(
-            """
-            QFrame#systemRecoveryPanel {
-                background: rgba(18, 24, 34, 210);
-                border: 1px solid rgba(127, 139, 166, 90);
-                border-radius: 16px;
-            }
-            QTabWidget::pane {
-                border: 1px solid rgba(127, 139, 166, 70);
-                border-radius: 10px;
-            }
-            QTableWidget {
-                background: rgba(10, 14, 24, 110);
-                border: 1px solid rgba(127, 139, 166, 60);
-                border-radius: 8px;
-                color: #ECF4FF;
-            }
-            QTextEdit, QLineEdit {
-                background: rgba(10, 14, 24, 100);
-                border: 1px solid rgba(127, 139, 166, 60);
-                border-radius: 8px;
-                color: #ECF4FF;
-            }
-            QCheckBox {
-                color: #D6E4FF;
-            }
-            """
-        )
 
     def _build_storage_tab(self) -> None:
         layout = QVBoxLayout(self.storage_tab)
@@ -354,7 +254,7 @@ class SystemRecoveryPanel(QFrame):
         layout = QVBoxLayout(self.recommendations_tab)
         self.incident_title_label = QLabel("Incident awareness has not run yet.")
         self.incident_title_label.setWordWrap(True)
-        self.incident_title_label.setStyleSheet("font-weight: 700; color: #F0F6FC;")
+        self.incident_title_label.setProperty("textRole", "sectionTitle")
         layout.addWidget(self.incident_title_label)
         self.incident_reasons = QTextEdit()
         self.incident_reasons.setReadOnly(True)

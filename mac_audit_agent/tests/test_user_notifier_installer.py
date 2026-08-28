@@ -64,10 +64,17 @@ def test_user_notifier_installer_writes_canonical_plist_and_loads_gui_domain(tmp
     assert payload["KeepAlive"] is True
     assert payload["StandardOutPath"].endswith("Library/Logs/MacAuditAgent/user_notifier.stdout.log")
     assert payload["StandardErrorPath"].endswith("Library/Logs/MacAuditAgent/user_notifier.stderr.log")
-    assert payload["EnvironmentVariables"]["PYTHONPATH"].endswith("Library/Application Support/MacAuditAgent/runtime")
+    assert "PYTHONPATH" not in payload["EnvironmentVariables"]
+    assert (installer.runtime_package_dir / "__init__.py").is_file()
+    assert (installer.runtime_package_dir / "user_notifier.py").is_file()
+    assert not any(path.name == "__pycache__" for path in installer.runtime_package_dir.rglob("__pycache__"))
+    assert payload["EnvironmentVariables"]["MAC_AUDIT_AGENT_DB_PATH"] == str(tmp_path / "audit.sqlite")
+    assert payload["EnvironmentVariables"]["MAC_AUDIT_AGENT_ALERT_TRACE_PATH"] == str(tmp_path / "Library" / "Application Support" / "MacAuditAgent" / "alert_receipts.sqlite3")
+    assert not any("homebrew" in argument.lower() for argument in payload["ProgramArguments"])
     assert "gui/" in status.launchctl_domain
     assert ["/bin/launchctl", "bootstrap", status.launchctl_domain, str(installer.plist_path)] in runner.commands
     assert stat.S_IMODE(installer.plist_path.stat().st_mode) == 0o644
+    assert status.heartbeat_db_path == str(tmp_path / "Library" / "Application Support" / "MacAuditAgent" / "alert_receipts.sqlite3")
 
 
 def test_user_notifier_missing_and_broken_status_are_diagnostic(tmp_path: Path) -> None:
@@ -99,6 +106,32 @@ def test_repair_user_notifier_rewrites_broken_plist(tmp_path: Path) -> None:
     assert payload["Label"] == USER_NOTIFIER_LABEL
 
 
+def test_install_reloads_corrected_plist_when_old_job_is_broken(tmp_path: Path) -> None:
+    class PreviouslyBrokenRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.loaded = True
+            self.broken_until_bootout = True
+
+        def __call__(self, command, capture_output=True, text=True):
+            command = list(command)
+            if command[:2] == ["/bin/launchctl", "print"] and self.broken_until_bootout:
+                self.commands.append(command)
+                return Completed(0, "state = exited\nlast exit code = 1\n", "")
+            if command[:2] == ["/bin/launchctl", "bootout"]:
+                self.broken_until_bootout = False
+            return super().__call__(command, capture_output=capture_output, text=text)
+
+    runner = PreviouslyBrokenRunner()
+    installer = UserNotifierInstaller(home=tmp_path, runner=runner, python_executable="/usr/bin/python3")
+
+    status = installer.install_user_notifier(start=True)
+
+    assert status.running is True
+    assert any(command[:2] == ["/bin/launchctl", "bootout"] for command in runner.commands)
+    assert any(command[:2] == ["/bin/launchctl", "bootstrap"] for command in runner.commands)
+
+
 def test_settings_require_user_notifier_when_bottom_right_alerts_enabled(tmp_path: Path) -> None:
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
     settings = load_settings(db)
@@ -126,4 +159,6 @@ def test_loaded_user_notifier_status_updates_diagnostics(tmp_path: Path) -> None
         "user_notifier_running": db.get_background_monitor_state("user_notifier_running", ""),
     })
 
-    assert diagnostics["user_alert_agent"]["deliverable"] is True
+    assert diagnostics["user_alert_agent"]["deliverable"] is False
+    assert diagnostics["user_alert_agent"]["loaded"] is True
+    assert diagnostics["user_alert_agent"]["running"] is True

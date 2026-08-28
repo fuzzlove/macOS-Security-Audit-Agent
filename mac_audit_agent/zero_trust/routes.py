@@ -1,0 +1,37 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class PostureRoute:
+    page: str
+    view_filter: str = ""
+    validation: str = ""
+    explanation: str = ""
+    automatic_method: str = ""
+    manual_steps: tuple[str, ...] = ()
+    evidence_fields: tuple[str, ...] = ()
+
+
+POSTURE_ROUTES: dict[str, PostureRoute] = {
+    "filevault_enabled": PostureRoute("Persistence Intelligence", validation="system_integrity", explanation="Validate FileVault through the system-integrity posture collector.", automatic_method="MSAA reads the current FileVault status and records whether encryption is enabled.", manual_steps=("Open Persistence Intelligence > Rootkit & Advanced Persistence.", "Locate FileVault status and confirm it reports enabled for the current startup disk.", "Compare the displayed observation time with the current assessment."), evidence_fields=("state", "observation time", "collector result")),
+    "secure_boot_verified": PostureRoute("Persistence Intelligence", validation="system_integrity", explanation="Validate Secure Boot and authenticated-root evidence.", automatic_method="MSAA reviews available Secure Boot and authenticated-root posture without changing boot policy.", manual_steps=("Open Persistence Intelligence > Rootkit & Advanced Persistence.", "Review Secure Boot/authenticated-root status and any platform limitation shown.", "Treat unavailable Apple silicon/T2 evidence as unknown, not passing."), evidence_fields=("boot policy", "authenticated root", "platform support")),
+    "sip_enabled": PostureRoute("Persistence Intelligence", validation="system_integrity", explanation="Validate System Integrity Protection with current csrutil evidence.", automatic_method="MSAA obtains current System Integrity Protection status through its system-integrity review.", manual_steps=("Open Persistence Intelligence > Rootkit & Advanced Persistence.", "Locate System Integrity Protection status.", "Confirm the status is enabled and the evidence is current."), evidence_fields=("state", "csrutil-derived status", "observation time")),
+    "firewall_enabled": PostureRoute("Firewall", validation="firewall_status", explanation="Inspect live firewall and MSAA anchor state.", automatic_method="MSAA refreshes the firewall page using its existing status collectors.", manual_steps=("Open Firewall > Status.", "Confirm the macOS application firewall state and review any PF/MSAA anchor limitations separately.", "Review exceptions before concluding the endpoint is protected."), evidence_fields=("application firewall", "PF state", "exceptions")),
+    "unsigned_applications": PostureRoute("Unsigned Software", "Unsigned Only", "software_provenance", "Review every unsigned executable and its signing evidence.", "MSAA runs the existing software-provenance scan and counts unsigned applications.", ("Open Unsigned Software with the Unsigned Only filter.", "Review each path, signing status, hash, and source.", "Document an approval or remediation decision for every item."), ("path", "signature status", "hash", "provenance")),
+    "unknown_developer_applications": PostureRoute("Unsigned Software", "Recommended Review", "software_provenance", "Review unknown, ad hoc, invalid, and unverifiable developer identities.", "MSAA uses the existing provenance assessor to identify developer identities that cannot be validated.", ("Open Unsigned Software with Recommended Review selected.", "Inspect Team ID, signing identifier, notarization, and validation error.", "Do not treat an unknown developer as malicious without supporting evidence."), ("Team ID", "signing identifier", "notarization", "validation error")),
+    "unvalidated_processes": PostureRoute("Unsigned Software", "Running Processes", "software_provenance", "Review currently running process provenance and owning applications.", "MSAA compares running processes with available code-signing and owning-application evidence.", ("Open Unsigned Software with Running Processes selected.", "Review process path, PID, owner, signature, and owning application.", "Investigate unresolved or invalid provenance."), ("PID", "owner", "path", "signature")),
+    "unapproved_persistence_items": PostureRoute("Persistence Intelligence", validation="persistence_scan", explanation="Review unapproved launch, login, scheduled, SSH, and automation persistence.", automatic_method="MSAA runs its registered persistence inventory and flags suspicious or unapproved entries.", manual_steps=("Open Persistence Intelligence > Findings.", "Review each launch, login, scheduled, SSH, and automation entry.", "Compare findings with the approved organizational baseline."), evidence_fields=("location", "owner", "signature", "approval state")),
+    "persistence_scan_complete": PostureRoute("Persistence Intelligence", validation="persistence_scan", explanation="Run the complete registered persistence inventory and coverage audit.", automatic_method="MSAA records whether the registered persistence inventory completed successfully.", manual_steps=("Open Persistence Intelligence.", "Confirm the latest scan completed and review coverage/collector errors.", "Do not accept a partial or failed inventory as complete."), evidence_fields=("completion state", "coverage", "collector errors", "observation time")),
+    "approved_dns": PostureRoute("DNS Configuration Assurance", validation="network_intelligence", explanation="Collect current resolvers and compare them with the client-approved DNS scope.", automatic_method="MSAA refreshes current DNS metadata through Network Intelligence and compares normalized resolver IPs with the configured client-approved list.", manual_steps=("Open DNS Configuration Assurance.", "Collect the current resolver configuration and export the DNS report.", "Have the client validate the resolver addresses and intended scope, then record client validation."), evidence_fields=("observed DNS servers", "approved DNS servers", "client validation", "threat-intelligence provenance", "observation time")),
+    "suspicious_outbound_connections": PostureRoute("Network Intelligence", validation="network_intelligence", explanation="Review suspicious outbound endpoints and owning processes.", automatic_method="MSAA correlates current outbound endpoints with owning-process and risk evidence.", manual_steps=("Open Network Intelligence.", "Review each suspicious destination, port, process, and confidence explanation.", "Confirm expected business use or open an investigation."), evidence_fields=("destination", "port", "process", "risk explanation")),
+    "unvalidated_network_connections": PostureRoute("Network Monitor", validation="network_monitor", explanation="Refresh and review application-owned connections that lack sufficient provenance evidence.", automatic_method="MSAA refreshes application-owned connections and identifies those without sufficient provenance.", manual_steps=("Open Network Monitor.", "Review connections lacking a validated owning application or signature.", "Correlate the PID and path with Unsigned Software before disposition."), evidence_fields=("endpoint", "PID", "application", "signature")),
+}
+
+
+def route_for_signal(signal_id: str) -> PostureRoute:
+    try:
+        return POSTURE_ROUTES[signal_id]
+    except KeyError as exc:
+        raise ValueError(f"No evidence route is registered for posture signal: {signal_id}") from exc

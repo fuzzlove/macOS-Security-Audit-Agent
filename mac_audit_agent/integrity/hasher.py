@@ -1,45 +1,16 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import stat
-from fnmatch import fnmatch
 from pathlib import Path
 from typing import Iterable
+
+from mac_audit_agent.integrity.exclusions import default_excluded_patterns, is_runtime_mutable_path
 
 
 CHUNK_SIZE = 1024 * 1024
 
-DEFAULT_EXCLUDED_PATTERNS = [
-    "*.pyc",
-    "__pycache__/",
-    ".pytest_cache/",
-    ".mypy_cache/",
-    "build/",
-    "dist/",
-    ".git/",
-    "venv/",
-    ".venv/",
-    "logs/",
-    "reports/",
-    "diagnostics/",
-    "snapshots/",
-    "evidence/",
-    "*.sqlite",
-    "*.sqlite3",
-    "*.db",
-    "*.log",
-    "settings.json",
-    "cache/",
-    "apple_exposure_cache/",
-    "user-generated exports/",
-    "packet captures/",
-    "investigation notes/",
-    "case files/",
-    ".DS_Store",
-    "msaa_integrity_manifest.json",
-    "integrity_manifest.json",
-]
+DEFAULT_EXCLUDED_PATTERNS = default_excluded_patterns()
 
 
 def calculate_sha256(path: Path) -> str:
@@ -55,21 +26,7 @@ def normalize_relative_path(path: Path, root: Path) -> str:
 
 
 def is_excluded(relative_path: str, patterns: Iterable[str]) -> bool:
-    normalized = relative_path.replace(os.sep, "/").lstrip("./")
-    parts = normalized.split("/")
-    for pattern in patterns:
-        pattern = pattern.strip()
-        if not pattern:
-            continue
-        directory_pattern = pattern.endswith("/")
-        compact = pattern.rstrip("/")
-        if directory_pattern and compact in parts:
-            return True
-        if fnmatch(normalized, pattern) or fnmatch(Path(normalized).name, pattern):
-            return True
-        if compact and compact in parts and ("/" not in compact and "*" not in compact):
-            return True
-    return False
+    return is_runtime_mutable_path(relative_path, patterns)
 
 
 def iter_integrity_files(root: Path, excluded_patterns: Iterable[str], *, include_symlinks: bool = True) -> list[Path]:

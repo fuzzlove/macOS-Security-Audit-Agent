@@ -10,6 +10,7 @@ from mac_audit_agent.exporters.remediation import get_suggested_fix
 from mac_audit_agent.frameworks.cmmc import build_cmmc_readiness
 from mac_audit_agent.frameworks.cmmc_crosswalk import map_msaa_finding_to_cmmc
 from mac_audit_agent.frameworks.poam import poam_from_cmmc_readiness
+from mac_audit_agent.remediation.recommendation_engine import enrich_finding_with_recommendation
 
 
 SEVERITIES = ["critical", "high", "medium", "low", "info"]
@@ -90,10 +91,12 @@ def _join(values: Any) -> str:
 
 
 def _normalize_finding(item: dict[str, Any], index: int) -> dict[str, Any]:
-    finding = dict(item)
+    finding = enrich_finding_with_recommendation(dict(item))
     finding_id = _finding_id(finding, index)
     advice = get_suggested_fix(finding).to_dict()
     mappings = _mappings(finding)
+    recommended_fix = finding.get("recommended_fix", {}) if isinstance(finding.get("recommended_fix"), dict) else {}
+    poam = recommended_fix.get("poam") if isinstance(recommended_fix, dict) else {}
     finding.update(
         {
             "finding_id": finding_id,
@@ -105,6 +108,20 @@ def _normalize_finding(item: dict[str, Any], index: int) -> dict[str, Any]:
             "evidence_summary": str(finding.get("evidence_summary") or finding.get("evidence") or ""),
             "impact": str(finding.get("impact") or finding.get("why_this_matters") or "Review required to determine operational impact."),
             "suggested_fix": str(finding.get("suggested_fix") or finding.get("recommended_next_steps") or advice["suggested_fix"]),
+            "recommended_fix_summary": str(recommended_fix.get("summary", "")),
+            "immediate_action": str(recommended_fix.get("immediate_action", "")),
+            "recommended_fix_detail": str(recommended_fix.get("recommended_fix", "")),
+            "examine_further": _join(recommended_fix.get("further_examination_steps", [])),
+            "evidence_to_collect": _join(recommended_fix.get("evidence_to_collect", [])),
+            "false_positive_review": _join(recommended_fix.get("false_positive_checks", [])),
+            "source_mappings_text": _join(
+                [
+                    f"{mapping.get('source_type', '')}:{mapping.get('source_id', '')} ({mapping.get('mapping_confidence', '')})"
+                    for mapping in recommended_fix.get("source_mappings", [])
+                    if isinstance(mapping, dict)
+                ]
+            ),
+            "apple_evidence_checklist": _join((recommended_fix.get("apple_context") or {}).get("evidence_needs", [])),
             "validation_step": str(finding.get("validation_step") or advice["validation_step"]),
             "false_positive_notes": str(finding.get("false_positive_notes") or "Confirm ownership, expected behavior, and business need before closing as a false positive."),
             "difficulty": advice["difficulty"],
@@ -117,6 +134,10 @@ def _normalize_finding(item: dict[str, Any], index: int) -> dict[str, Any]:
             "cve": _join(finding.get("cve_ids") or finding.get("cve_refs")),
             "cisa_kev": _join(finding.get("cisa_kev_refs") or finding.get("kev_status")),
             "framework_mappings": mappings,
+            "poam_weakness": str((poam or {}).get("weakness", "")),
+            "poam_affected_asset": str((poam or {}).get("affected_asset", "")),
+            "poam_recommended_fix": str((poam or {}).get("recommended_fix", "")),
+            "poam_validation_method": str((poam or {}).get("validation_method", "")),
         }
     )
     return finding

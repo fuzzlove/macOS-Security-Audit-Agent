@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>PayloadType</key><string>Configuration</string><key>PayloadVersion</key><integer>1</integer>
+<key>PayloadIdentifier</key><string>ORG_IDENTIFIER.msaa.system-extension</string><key>PayloadUUID</key><string>REPLACE_WITH_UUID</string><key>PayloadDisplayName</key><string>MSAA Anti-Ransomware System Extension Approval</string>
+<key>PayloadContent</key><array><dict><key>PayloadType</key><string>com.apple.system-extension-policy</string><key>PayloadVersion</key><integer>1</integer><key>PayloadIdentifier</key><string>ORG_IDENTIFIER.msaa.system-extension.policy</string><key>PayloadUUID</key><string>REPLACE_WITH_POLICY_UUID</string><key>AllowedSystemExtensions</key><dict><key>TEAM_ID</key><array><string>SYSTEM_EXTENSION_BUNDLE_ID</string></array></dict></dict></array>
+</dict></plist>

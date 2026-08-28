@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>mode</key><string>audit</string><key>warn_threshold</key><integer>4</integer><key>block_threshold</key><integer>7</integer>
+  <key>scanner_timeout_ms</key><integer>100</integer><key>maximum_command_bytes</key><integer>131072</integer>
+  <key>maximum_decode_bytes</key><integer>131072</integer><key>maximum_decode_depth</key><integer>2</integer>
+  <key>notifications_enabled</key><true/><key>local_json_log_enabled</key><true/><key>unified_log_enabled</key><true/>
+  <key>generic_proxy_enabled</key><false/><key>exact_hash_allowlist</key><array/><key>disabled_rule_ids</key><array/>
+  <key>configuration_version</key><string>1</string>
+</dict></plist>
